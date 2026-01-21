@@ -1,6 +1,6 @@
 # Deep_Optimization
 
-**Vision_World** is a self-built computer vision toolkit that unifies  
+**Deep_Optimization** is a self-built computer vision toolkit that unifies  
 state-of-the-art training tricks into a clean, extensible engine.  
 It’s designed for **fast prototyping, efficient large-scale training, and easy deployment**.  
 
