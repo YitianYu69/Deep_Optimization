@@ -1,4 +1,4 @@
-# Vision_World 🪐
+# Deep_Optimization
 
 **Vision_World** is a self-built computer vision toolkit that unifies  
 state-of-the-art training tricks into a clean, extensible engine.  
