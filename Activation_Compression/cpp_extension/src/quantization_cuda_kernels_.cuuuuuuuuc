@@ -1,0 +1,296 @@
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
+#include <THC/THCAtomics.cuh>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+#include <mutex>
+
+#define BLOCK_Y_DIM_MAX ((((int64_t)(1)) << 16) - 1)
+#define fmax(a, b) ((a) > (b) ? (a) : (b))
+
+using torch::Tensor;
+
+// ======================================================
+// Compute scaling factors
+// ======================================================
+template <typename scalar_t>
+__global__ void compute_scale_mixed_precision_kernel(
+    const scalar_t* __restrict__ min,
+    const scalar_t* __restrict__ max,
+    scalar_t* __restrict__ scale,
+    const int bits,
+    int64_t N,
+    int64_t num_groups)
+{
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N * num_groups) return;
+    scale[i] = ((scalar_t)((1 << bits) - 1)) / (max[i] - min[i] + (scalar_t)2e-6);
+}
+
+// ======================================================
+// Pack kernel
+// ======================================================
+template <typename scalar_t>
+__global__ void pack_mixed_precision_kernel(
+    const scalar_t* __restrict__ data,
+    const scalar_t* __restrict__ scale,
+    const scalar_t* __restrict__ min,
+    int32_t* __restrict__ packed,
+    const int bits,
+    uint64_t seed,
+    uint64_t offset,
+    int64_t N,
+    int64_t num_groups,
+    int64_t group_size,
+    int64_t block_idx_y_base)
+{
+    extern __shared__ int shared_mem[];
+
+    const int64_t n = blockIdx.y + block_idx_y_base;
+    const int group_id = blockIdx.x;
+    const int d = threadIdx.x;
+    if (n >= N || group_id >= num_groups || d >= group_size)
+        return;
+
+    const int ints_per_group = (group_size * bits + 31) / 32;
+    int* packed_shared = shared_mem;
+    float* cached = reinterpret_cast<float*>(packed_shared + ints_per_group);
+    float& s = cached[0];
+    float& m = cached[1];
+
+    if (threadIdx.x == 0) {
+        s = static_cast<float>(scale[n * num_groups + group_id]);
+        m = static_cast<float>(min[n * num_groups + group_id]);
+    }
+    for (int i = threadIdx.x; i < ints_per_group; i += blockDim.x)
+        packed_shared[i] = 0;
+    __syncthreads();
+
+    // RNG (Philox)
+    int64_t linear_id = ((int64_t)n * num_groups + group_id) * group_size + d;
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, linear_id, offset, &state);
+    const float noise = curand_uniform(&state);
+
+    const int64_t id = linear_id;
+    const float val = static_cast<float>(data[id]);
+    const float qf  = fmaxf((val - m) * s + noise - 0.5f, 0.0f);
+    const int q = __float2int_rn(qf);
+
+    const int offset_bit = d * bits;
+    #pragma unroll
+    for (int i = 0; i < bits; i++) {
+        int bit_val = (q >> i) & 1;
+        atomicOr(&packed_shared[(offset_bit + i) / 32],
+                 bit_val << ((offset_bit + i) % 32));
+    }
+    __syncthreads();
+
+    const int ints_per_group_half = (ints_per_group + 1) / 2;
+    const int64_t global_offset =
+        ((int64_t)n * num_groups + group_id) * ints_per_group / 2;
+    if (threadIdx.x < ints_per_group_half)
+        reinterpret_cast<int2*>(packed)[global_offset + threadIdx.x] =
+            reinterpret_cast<int2*>(packed_shared)[threadIdx.x];
+}
+
+// ======================================================
+// Host launcher
+// ======================================================
+std::pair<Tensor, Tensor> pack_mixed_precision_cuda(
+    Tensor data,
+    Tensor min,
+    Tensor max,
+    int bits,
+    bool stochastic)
+{
+    TORCH_CHECK(data.is_cuda(), "data must be CUDA tensor");
+    TORCH_CHECK(min.is_cuda() && max.is_cuda(),
+                "min/max must be CUDA tensors");
+
+    const int64_t N = data.size(0);
+    const int64_t num_groups = data.size(1);
+    const int64_t group_size = data.size(2);
+    const int64_t ints_per_group = (group_size * bits + 31) / 32;
+
+    auto options_int =
+        torch::TensorOptions().dtype(torch::kInt32).device(data.device());
+    Tensor packed =
+        torch::empty({N * num_groups * ints_per_group}, options_int);
+
+    auto options =
+        torch::TensorOptions().dtype(data.dtype()).device(data.device());
+    Tensor scale = torch::empty({N, num_groups, 1}, options);
+
+    // compute scale
+    int threads = 256;
+    int blocks = (N * num_groups + threads - 1) / threads;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16,
+                                    scale.scalar_type(),
+                                    "compute_scale_mixed_precision", ([&] {
+        compute_scale_mixed_precision_kernel<scalar_t>
+            <<<blocks, threads>>>(
+                min.data_ptr<scalar_t>(), max.data_ptr<scalar_t>(),
+                scale.data_ptr<scalar_t>(), bits, N, num_groups);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }));
+
+    // setup RNG (version adaptive)
+    auto gen = at::check_generator<at::CUDAGeneratorImpl>(
+        at::cuda::detail::getDefaultCUDAGenerator());
+
+    uint64_t seed, offset;
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 3)
+    // safe API
+    auto philox = gen->philox_cuda_state(N * num_groups * group_size);
+    seed = philox.seed_.val;
+    offset = philox.offset_.val;
+#else
+    std::lock_guard<std::mutex> lock(gen->mutex_);
+    std::pair<uint64_t, uint64_t> engine_inputs =
+        gen->philox_engine_inputs(N * num_groups * group_size);
+    seed = engine_inputs.first;
+    offset = engine_inputs.second;
+#endif
+
+    const int64_t logical_block_y_dim = N;
+    for (int64_t block_idx_y_base = 0;
+         block_idx_y_base < logical_block_y_dim;
+         block_idx_y_base += BLOCK_Y_DIM_MAX)
+    {
+        dim3 blocksPerGrid(
+            num_groups,
+            std::min(logical_block_y_dim - block_idx_y_base,
+                     BLOCK_Y_DIM_MAX),
+            1);
+        dim3 threadsPerBlock(group_size, 1, 1);
+        size_t shared_bytes =
+            ints_per_group * sizeof(int32_t) + 2 * sizeof(float);
+
+        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16,
+                                        data.scalar_type(),
+                                        "pack_mixed_precision", ([&] {
+            pack_mixed_precision_kernel<scalar_t>
+                <<<blocksPerGrid, threadsPerBlock, shared_bytes>>>(
+                    data.data_ptr<scalar_t>(),
+                    scale.data_ptr<scalar_t>(),
+                    min.data_ptr<scalar_t>(),
+                    packed.data_ptr<int32_t>(),
+                    bits, seed, offset,
+                    N, num_groups, group_size, block_idx_y_base);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }));
+    }
+
+    return std::make_pair(packed, scale);
+}
+
+
+// ======================================================
+// Unpack kernel (shared-memory cached scale/min)
+// ======================================================
+template <typename scalar_t>
+__global__ void unpack_mixed_precision_kernel(
+    const int32_t* __restrict__ data,
+    const scalar_t* __restrict__ scale,
+    const scalar_t* __restrict__ min,
+    scalar_t* __restrict__ unpacked,
+    const int bits,
+    int64_t N,
+    int64_t num_groups,
+    int64_t group_size,
+    int64_t block_idx_y_base)
+{
+    extern __shared__ float shared_params[];
+    const int64_t n = blockIdx.y + block_idx_y_base;
+    const int group_id = blockIdx.x;
+    const int d = threadIdx.x;
+    if (n >= N || group_id >= num_groups || d >= group_size)
+        return;
+
+    // cache scale/min
+    float& s = shared_params[0];
+    float& m = shared_params[1];
+    if (threadIdx.x == 0) {
+        s = static_cast<float>(scale[n * num_groups + group_id]);
+        m = static_cast<float>(min[n * num_groups + group_id]);
+    }
+    __syncthreads();
+
+    const int64_t id =
+        (n * num_groups + group_id) * group_size + d;
+    const int ints_per_group = (group_size * bits + 31) / 32;
+    const int64_t global_offset =
+        ((int64_t)n * num_groups + group_id) * ints_per_group;
+    const int block_offset = d * bits;
+
+    int val = 0;
+    #pragma unroll
+    for (int i = 0; i < bits; i++) {
+        int idx = global_offset + (block_offset + i) / 32;
+        int bit_pos = (block_offset + i) % 32;
+        val |= (((data[idx] >> bit_pos) & 1) << i);
+    }
+
+
+    unpacked[id] =
+        static_cast<scalar_t>(val / s + m);
+}
+
+// ======================================================
+// Unpack host launcher
+// ======================================================
+Tensor unpack_mixed_precision_cuda(
+    Tensor data,
+    int bits,
+    Tensor scale,
+    Tensor min,
+    int64_t N,
+    int64_t num_groups,
+    int64_t group_size)
+{
+    TORCH_CHECK(data.is_cuda(), "data must be CUDA tensor");
+    TORCH_CHECK(scale.is_cuda(), "scale must be CUDA tensor");
+
+    auto options =
+        torch::TensorOptions().dtype(scale.dtype()).device(data.device());
+    Tensor unpacked =
+        torch::empty({N, num_groups, group_size}, options);
+
+    const int64_t ints_per_group = (group_size * bits + 31) / 32;
+    const int64_t logical_block_y_dim = N;
+
+    for (int64_t block_idx_y_base = 0;
+         block_idx_y_base < logical_block_y_dim;
+         block_idx_y_base += BLOCK_Y_DIM_MAX)
+    {
+        dim3 blocksPerGrid(
+            num_groups,
+            std::min(logical_block_y_dim - block_idx_y_base,
+                     BLOCK_Y_DIM_MAX),
+            1);
+        dim3 threadsPerBlock(group_size, 1, 1);
+        size_t shared_bytes = 2 * sizeof(float);
+
+        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16,
+                                        scale.scalar_type(),
+                                        "unpack_mixed_precision", ([&] {
+            unpack_mixed_precision_kernel<scalar_t>
+                <<<blocksPerGrid, threadsPerBlock, shared_bytes>>>(
+                    data.data_ptr<int32_t>(),
+                    scale.data_ptr<scalar_t>(),
+                    min.data_ptr<scalar_t>(),
+                    unpacked.data_ptr<scalar_t>(),
+                    bits, N, num_groups, group_size,
+                    block_idx_y_base);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }));
+    }
+
+    return unpacked;
+}
+
+

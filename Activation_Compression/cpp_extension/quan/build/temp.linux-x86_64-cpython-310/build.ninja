@@ -1,0 +1,53 @@
+ninja_required_version = 1.3
+cxx = /usr/local/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-11.3.1/gcc-12.3.0-ukkkutsxfl5kpnnaxflpkq2jtliwthfz/bin/g++
+nvcc = /usr/local/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-12.3.0/cuda-12.6.1-fgbhrk26npivybjj65zswagcf4zv6p2n/bin/nvcc
+
+cflags = -Wno-unused-result -Wsign-compare -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/hice1/yyu496/.conda/envs/lib/include -fPIC -O2 -isystem /home/hice1/yyu496/.conda/envs/lib/include -fPIC -I/home/hice1/yyu496/.conda/envs/lib/lib/python3.10/site-packages/torch/include -I/home/hice1/yyu496/.conda/envs/lib/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-12.3.0/cuda-12.6.1-fgbhrk26npivybjj65zswagcf4zv6p2n/include -I/home/hice1/yyu496/.conda/envs/lib/include/python3.10 -c
+post_cflags = -O3 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1018"' -DTORCH_EXTENSION_NAME=quantizer -std=c++17
+cuda_cflags = -I/home/hice1/yyu496/.conda/envs/lib/lib/python3.10/site-packages/torch/include -I/home/hice1/yyu496/.conda/envs/lib/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-12.3.0/cuda-12.6.1-fgbhrk26npivybjj65zswagcf4zv6p2n/include -I/home/hice1/yyu496/.conda/envs/lib/include/python3.10 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 --use_fast_math -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_90a,code=sm_90a -Xcudafe=--diag_suppress=177 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1018"' -DTORCH_EXTENSION_NAME=quantizer -ccbin /usr/local/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-11.3.1/gcc-12.3.0-ukkkutsxfl5kpnnaxflpkq2jtliwthfz/bin/gcc -std=c++17
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+
+
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_1bit_sm80.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_1bit_sm80.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_1bit_sm90.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_1bit_sm90.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_1bit_sm90a.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_1bit_sm90a.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_2bit_sm80.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_2bit_sm80.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_2bit_sm89.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_2bit_sm89.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_2bit_sm90.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_2bit_sm90.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_2bit_sm90a.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_2bit_sm90a.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_4bit_sm80.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_4bit_sm80.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_4bit_sm89.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_4bit_sm89.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_4bit_sm90.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_4bit_sm90.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_4bit_sm90a.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_4bit_sm90a.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_8bit_sm80.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_8bit_sm80.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_8bit_sm89.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_8bit_sm89.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_8bit_sm90.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_8bit_sm90.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_8bit_sm90a.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_8bit_sm90a.cu
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_dispatch.o: compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_dispatch.cpp
+build /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/build/temp.linux-x86_64-cpython-310/quant_pack_launchers.o: cuda_compile /home/hice1/yyu496/kaggle/CW/ACT/cpp_extension/quan/quant_pack_launchers.cu
+
+
+
+
+
+
+
+

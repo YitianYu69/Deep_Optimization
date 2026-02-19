@@ -14,6 +14,10 @@ from Train.log import get_logger
 from Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat, build_cuda_graph_ddp
 from Train.utils_ddp import rank0
 
+from Activation_Compression.controller import Controller
+from Activation_Compression.layers import DOConv1d, DOConv2d
+from Activation_Compression.freq_utils import radial_spectrum_2d, log_huber_loss
+
 import time
 from typing import Union, Callable, Dict, Optional
 
@@ -27,8 +31,10 @@ class Trainer():
                  compile_type: str = None,
                  DS_config: Dict = None,
                  DDP_config: Dict = None,
+                 ACT_config: Dict = None,
                  CUDA_Graph: bool = False,
                  QAT: bool = False,
+                 Freq_loss: bool = False,
                  amp_enable: bool = True,
                  dataloader: DataLoader = None,
                  sub_data_portion: float = 1.0,
@@ -44,9 +50,11 @@ class Trainer():
                  device: Union[str, torch.device] = 'cpu'):
         self.DS_config = DS_config
         self.DDP_config = DDP_config
+        self.ACT_config = ACT_config
         self.CUDA_Graph = CUDA_Graph
         self.amp_enable = amp_enable
         self.QAT = QAT
+        self.Freq_loss = Freq_loss
         self.train_dataloader = dataloader
         self.cri = criterion
         self.opt = optimizer
@@ -75,6 +83,8 @@ class Trainer():
         
         # Check for compile
         if compile_type is not None:
+            assert ACT_config is not None, "Please turn off compile for when ACT is enabled, they are not compatible at the moment!"
+
             fullgraph = False if self.DS_config is not None else True
             model.compile(fullgraph=fullgraph, mode=compile_type)
             if (self.DS_config is not None or self.DDP_config is not None) and compile_type != 'reduce-overhead' and rank0():
@@ -135,6 +145,25 @@ class Trainer():
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return t
+    
+    def _freq_loss_hook(self, model):
+        act_cache = {}
+        def fwd_hook(name):
+            def hook(module, input, output):
+                global act_cache
+                act_cache[name] = output.detach()
+            return hook
+        
+        conv_potential_modules_list = [n for n, m in model.named_modules() if isinstance(m, (nn.Conv2d, nn.Conv1d, DOConv1d, DOConv2d))]
+        target_module_name = conv_potential_modules_list[-1]
+        for name, module in model.named_modules():
+            if name == target_module_name:
+                module.register_forward_hook(fwd_hook(name))
+                if rank0():
+                    logger.info(f"Frequency loss hook registered at module: {name} - {module}")
+                break
+        return act_cache, target_module_name
+
 
     def _wrap_model_to_engine(self, model, wrap_type='raw'):
         if self.DS_config is not None:
@@ -146,6 +175,14 @@ class Trainer():
             if rank0():
                 logger.info("Model Wrap Type: DeepSpeed!")
         elif self.DDP_config is not None:
+            if self.ACT_config is not None:
+                self.act_controller = Controller(model, self.ACT_config, self.train_dataloader, self.cri, test=False)
+                self.act_controller.iterate(criterion=self.cri)
+                self.act_controller.warp_model(graph_mode=True, quantizer=True)
+
+                model = self.act_controller.traced_model
+
+
             if rank0() and self.DDP_config.get('broadcast_buffers', True):
                 logger.info('Please turn off the broadcast_buffers if you used the torch.nn.SyncBatchNorm.convert_sync_batchnorm().')
             if rank0() and self.DDP_config.get('gradient_as_bucket_view', False):
@@ -171,6 +208,8 @@ class Trainer():
             engine.logger = _NoopDDPLogger()
             if rank0():
                 logger.info("Model Wrap Type: DDP")
+            self.act_cache, self.freq_loss_module_name = self._freq_loss_hook(engine.module)
+
         else:
             engine = model
             if rank0():
@@ -197,7 +236,14 @@ class Trainer():
                                     enabled=self.amp_enable and device_type in ['cuda', 'cpu']):
                     logits = self.engine(data)
                     ori_loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
-                    
+
+                    if self.Freq_loss:
+                        model_spectrum1 = radial_spectrum_2d(self.act_cache[self.freq_loss_module_name], num_rad_bins=7, mode='magnitude')
+                        target_spectrum1 = radial_spectrum_2d(data, num_rad_bins=7, mode='magnitude')
+                        freq_loss1 = log_huber_loss(model_spectrum1, target_spectrum1)
+
+                        ori_loss = ori_loss + 1.0 * freq_loss1
+
                     if isinstance(self.engine, nn.parallel.DistributedDataParallel) and self.grad_acc_step > 1:
                         self.engine.require_backward_grad_sync = grad_step
                     loss = ori_loss / self.grad_acc_step
