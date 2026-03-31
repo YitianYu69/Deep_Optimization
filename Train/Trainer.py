@@ -163,7 +163,7 @@ class Trainer():
                 self.act_controller.warp_model(graph_mode=True, quantizer=True)
 
                 model = self.act_controller.traced_model
-
+                logger.info("Model Inner Wrap Type: Activation Compression")
 
             if rank0() and self.DDP_config.get('broadcast_buffers', True):
                 logger.info('Please turn off the broadcast_buffers if you used the torch.nn.SyncBatchNorm.convert_sync_batchnorm().')
@@ -190,6 +190,14 @@ class Trainer():
             engine.logger = _NoopDDPLogger()
             if rank0():
                 logger.info("Model Wrap Type: DDP")
+
+        elif self.ACT_config is not None:
+                self.act_controller = Controller(model, self.ACT_config, self.train_dataloader, self.cri, test=False)
+                self.act_controller.iterate(criterion=self.cri)
+                self.act_controller.warp_model(graph_mode=True, quantizer=True)
+
+                model = self.act_controller.traced_model
+                logger.info("Model Wrap Type: Activation Compression")
 
         else:
             engine = model
