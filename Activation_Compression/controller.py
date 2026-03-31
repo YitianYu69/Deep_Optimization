@@ -6,7 +6,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 from quantizer import Quantizer
-from layers import DOLinear, DOConv1d, DOConv2d, DOConv3d, DODepthPointConv2d, RMSNorm
+from Activation_Compression.modules.layers import DOLinear, DOConv1d, DOConv2d, DOConv3d, DODepthPointConv2d, RMSNorm
 from modules.activations.act_layers import DOReLU_Variance, DOSiLU, DOGELU
 from modules.normalization.normalization_layers import DOBatchNorm2d, DOSyncBatchNorm2d
 from fusion.fusion_utils import fuse_bn_act

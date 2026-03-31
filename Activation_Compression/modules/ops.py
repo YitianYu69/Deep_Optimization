@@ -118,80 +118,6 @@ from typing import Tuple, List
 #     return unpack
 
 
-def h4(x):
-    a,b,c,d = x[...,0],x[...,1],x[...,2],x[...,3]
-    return torch.stack([
-        a+b+c+d,
-        a+b-c-d,
-        a-b+c-d,
-        a-b-c+d
-    ], dim=-1) * 0.5
-
-
-def h4_inv(y):
-    y0,y1,y2,y3 = y[...,0],y[...,1],y[...,2],y[...,3]
-    return torch.stack([
-        y0+y1+y2+y3,
-        y0+y1-y2-y3,
-        y0-y1+y2-y3,
-        y0-y1-y2+y3
-    ], dim=-1) * 0.5
-
-
-def hadamard_auto(x):
-    shp = x.shape
-    B = x.shape[0]
-
-    flat = x.reshape(B, -1).contiguous()
-    F = flat.shape[1]
-
-    pad = (-F) % 4
-
-    if pad:
-        flat = torch.cat(
-            [flat, torch.zeros(B, pad, device=x.device, dtype=x.dtype)],
-            dim=1
-        )
-
-    Fp = flat.shape[1]
-
-    g = flat.reshape(B, Fp // 4, 4)
-    y = h4(g)
-
-    # drop padding before reshaping back
-    y = y.reshape(B, Fp)
-    if pad:
-        y = y[:, :-pad]
-
-    return y.reshape(shp), pad
-
-
-
-
-def hadamard_auto_inv(y, pad):
-    shp = y.shape
-    B = y.shape[0]
-
-    flat = y.reshape(B, -1).contiguous()
-    F = flat.shape[1]
-
-    if pad:
-        flat = torch.cat(
-            [flat, torch.zeros(B, pad, device=y.device, dtype=y.dtype)],
-            dim=1
-        )
-
-    Fp = flat.shape[1]
-
-    g = flat.reshape(B, Fp // 4, 4)
-    x = h4_inv(g)
-
-    x = x.reshape(B, Fp)
-    if pad:
-        x = x[:, :-pad]
-
-    return x.reshape(shp)
-
 
 
 # opt_stream = torch.cuda.Stream()
@@ -212,34 +138,6 @@ class _DOConvnd(Function):
         else:
             weight_compute = weight_master
 
-        # weight_shape = weight_compute.shape
-        # input_shape = input.shape
-        # weight_flat = weight_compute.reshape(weight_shape[1], -1) # C, N
-        # input_flat = input.permute(1, 0, 2, 3).reshape(input_shape[1], -1) # C x M
-        # p = meta[f"{target_name}"]['low_rank_activations'] # C x L
-
-        # low_rank_weight = p.T @ weight_flat # L x N
-        # low_rank_input = p.T @ input_flat # L x M
-        # _input = p @ low_rank_input # C x M
-        # L = low_rank_input.shape[0]
-
-
-        # beta = 0.99
-        # R = input_flat - _input
-        # res = (R * R).sum(dim=0)
-        # idx = torch.topk(res, k=L).indices
-        # Z = R[:, idx]
-
-        # p = (1 - beta) * p + beta * Z
-        # p, _ = torch.linalg.qr(p, mode='reduced')
-        # meta[f"{target_name}"]['low_rank_activations'] = p
-
-
-        # low_rank_input = low_rank_input.view(L, input_shape[0], input_shape[2], input_shape[3]).permute(1, 0, 2, 3) # N x L x H x W
-        # low_rank_weight = low_rank_weight.view(L, weight_shape[0], weight_shape[2], weight_shape[3]).permute(1, 0, 2, 3) # N x L x kH x kW
-        
-        # print(f'Layer: {target_name}, fwd ori input shape: {input.shape}')
-        # print(f'Layer: {target_name}, fwd act_padding: {meta[f"{target_name}"]["act_padding"]}, group_size: {meta[f"{target_name}"]["group_size"]}')
 
         input_l = None
         if meta[f'{target_name}']['DIVISION'] is not None and not meta[f'{target_name}']['pack_only']:
@@ -248,16 +146,9 @@ class _DOConvnd(Function):
             k = min(HEIGHT, WIDTH, meta[f'{target_name}']['DIVISION']['pool_kernel_size'])
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 input_l = F.avg_pool2d(input, k, stride=k, padding=0)
-                # input_l = F.avg_pool2d(low_rank_input, k, stride=k, padding=0)
-                # input_max = F.max_pool2d(input, k, stride=k, padding=0)
-                # input_h = input - F.interpolate(input_l, size=(HEIGHT, WIDTH), scale_factor=None, mode="bilinear", align_corners=False)
-                # input_stored = input_h
-        
-        # input_stored, had_pad = hadamard_auto(input)
-        input_stored = input
-        had_pad = None
 
-        # print(f"Layer:  {target_name}")
+        
+        input_stored = input
         if meta[f'{target_name}']['DIVISION'] is not None:
             q_inputs_tensor, q_inputs_meta, input_l = unified_quantize((input_stored).to(torch.bfloat16), (input_l).to(torch.float8_e4m3fn), target_name, meta, clamp=True, clamp_alpha=clamp_alpha)
         else:
@@ -268,8 +159,7 @@ class _DOConvnd(Function):
         ctx.q_inputs_meta = (q_inputs_meta)
 
         return forward_op(input, weight_compute, bias=None, stride=stride, padding=padding, dilation=dilation, groups=groups)
-        # return forward_op(low_rank_input, low_rank_weight, bias=None, stride=stride, padding=padding, dilation=dilation, groups=groups)
-
+      
     @staticmethod
     @custom_bwd(device_type='cuda')
     def run_backward(ctx, dy, dim, pad_fn):
@@ -289,22 +179,6 @@ class _DOConvnd(Function):
 
 
         input = unified_dequantize(q_inputs_tensor, q_inputs_meta, input_l) # B, C, H, W
-        # low_rank_input = unified_dequantize(q_inputs_tensor, q_inputs_meta, input_l) # B, L, H, W
-        # L = low_rank_input.shape[1]
-        # low_rank_input = low_rank_input.permute(1, 0, 2, 3).reshape(L, -1) # L x M
-        # input = p @ low_rank_input # C x M
-        # input = input.view(input_shape[1], input_shape[0], input_shape[2], input_shape[3]).permute(1, 0, 2, 3) # N x C x H x W
-        
-        # input_shape = input.shape
-        # input_flat = input.permute(1, 0, 2, 3).reshape(input_shape[1], -1) # C x M
-        # p = meta[f"{target_name}"]['low_rank_activations'] # C x L
-        # low_rank_input = p.T @ input_flat # L x M
-        # L = low_rank_input.shape[0]
-        # input = p @ low_rank_input # C x M
-
-        # input = input.view(input_shape[1], input_shape[0], input_shape[2], input_shape[3]).permute(1, 0, 2, 3) # N x C x H x W
-
-
         del q_inputs_tensor, q_inputs_meta, input_l
 
         dx = dx2 = dw = None
@@ -449,9 +323,6 @@ class _DOLinear(Function):
         else:
             weight_compute = weight_master
 
-        # print(f'Layer: {target_name}, fwd ori input shape: {input.shape}')
-        # print(f'Layer: {target_name}, fwd act_padding: {meta[f"{target_name}"]["act_padding"]}, group_size: {meta[f"{target_name}"]["group_size"]}')
-
 
         input_l = None
         if (meta[f'{target_name}']['DIVISION'] is not None and input.ndim != 1 and input.ndim != 2) and not meta[f'{target_name}']['pack_only']:
@@ -460,14 +331,8 @@ class _DOLinear(Function):
             k = min(channel, meta[f'{target_name}']['DIVISION']['pool_kernel_size'])
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 input_l = F.avg_pool1d(input, k, stride=k, padding=0)
-                # input_max = F.max_pool1d(input, k, stride=k, padding=0)
-                # input_h = input - F.interpolate(input_l, size=channel, scale_factor=None, mode="linear", align_corners=False)
-                # input_stored = input_h
-
-
-        # print(f"Layer:  {target_name}")
+          
         input_stored = input
-        # input_stored = input + 0.1 * (F.avg_pool1d(input, kernel_size=3, stride=1, padding=1) - input)
         if input_l is not None and input.ndim != 1 and input.ndim != 2:
             q_inputs_tensor, q_inputs_meta, input_l = unified_quantize(input_stored, (input_l), target_name, meta, clamp=True, clamp_alpha=clamp_alpha)
         else:
@@ -477,16 +342,13 @@ class _DOLinear(Function):
         ctx.q_inputs_meta = q_inputs_meta
         ctx.meta = input.shape, ema_grad_meta, clamp_alpha
         ctx.save_for_backward(weight_master, q_inputs_tensor[0], q_inputs_tensor[1], q_inputs_tensor[2], input_l)
-        # return F.linear(input, weight_compute, None)
-        res = F.linear(input, weight_compute, None)
-        return res
+        return F.linear(input, weight_compute, None)
 
 
     
     @staticmethod
     @custom_bwd(device_type='cuda')
     def backward(ctx, dy):
-        # acc_var = ctx.acc_var
         q_inputs_meta = ctx.q_inputs_meta
         input_shape, ema_grad_meta, clamp_alpha = ctx.meta
         (weight_master, q_inputs_tensor_out, q_inputs_tensor_scaler, q_inputs_tensor_ema_min, input_l) = ctx.saved_tensors
@@ -520,19 +382,6 @@ class _DOLinear(Function):
         # trust_ratio = torch.where(cond, trust_ratio, torch.ones_like(trust_ratio))
         # scaled_lr = ema_grad_meta['lr'] * trust_ratio
         # update = dw.float() + ema_grad_meta['ema_smooth'] * ema_grad_meta['momentum']
-
-        # print("ema_norm", ema_grad_meta['ema_smooth'].norm().item())
-        # if not torch.isfinite(dw).all():
-        #     print("dw has NaN/Inf")
-        # if not torch.isfinite(dx).all():
-        #     print("dx has NaN/Inf")
-        # if not torch.isfinite(w_norm):
-        #     print("w_norm NaN/Inf:", w_norm.item())
-        # if not torch.isfinite(dw_norm):
-        #     print("dw_norm NaN/Inf:", dw_norm.item())
-        # if not torch.isfinite(trust_ratio):
-        #     print("trust_ratio NaN/Inf:", trust_ratio.item())
-        # print("trust_ratio", trust_ratio.item(), "dw_norm", dw_norm.item(), "w_norm", w_norm.item())
 
         # with torch.no_grad():
         #     weight_master.add_(update * -scaled_lr)

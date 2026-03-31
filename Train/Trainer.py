@@ -15,7 +15,7 @@ from Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat
 from Train.utils_ddp import rank0
 
 from Activation_Compression.controller import Controller
-from Activation_Compression.layers import DOConv1d, DOConv2d
+from Activation_Compression.modules.layers import DOConv1d, DOConv2d
 
 import time
 from typing import Union, Callable, Dict, Optional
