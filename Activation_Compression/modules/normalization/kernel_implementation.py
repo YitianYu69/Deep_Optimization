@@ -3,10 +3,10 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 
-@triton.jit
-def softshrink(x, lambd):
-    return tl.where(x > lambd, x - lambd, tl.where(x < -lambd, x + lambd, 0.0))
 
+# ----------------------
+# Batch Norm 2d kernels
+# ----------------------
 
 @triton.jit
 def _bn_fwd_reduce_kernel(
@@ -169,7 +169,6 @@ def bn_fwd_norm_quant_pack_fused_kernel(
     min = tl.min(x_hat, axis=1)
 
     # x_hat = x_hat * tl.sigmoid(x_hat)
-    # x_hat = softshrink(x_hat, 0.7)
     
     # if AVG_ALAM:
         # x_hat = tl.reshape(x_hat, (2, SUB_GROUP, ALAM_BITS))
@@ -479,3 +478,148 @@ def bn_bwd_dx_dequant_unpack_fused_kernel(
 
     dx = (dy - (db / M) - x_hat * (dw / M)) * w * invrstd
     tl.store(dx_ptr, dx.to(tl.bfloat16), mask=mask)
+
+
+
+
+
+
+# ----------------------
+# Layer Norm 2d kernels
+# ----------------------
+
+@triton.jit
+def layer_norm_fwd_kernel(
+    x_ptr, y_ptr, weight_ptr, bias_ptr, x_hat_ptr, rstd_ptr,
+    stride, N, eps,
+    BLOCK_SIZE_N: tl.constexpr,
+
+):
+    row = tl.program_id(0).to(tl.int64)
+
+    x_ptr += row * stride
+    y_ptr += row * stride
+    x_hat_ptr += row * stride
+
+    _mean = tl.zeros([BLOCK_SIZE_N,], dtype=tl.float32)
+    for col_offs in tl.cdiv(N, BLOCK_SIZE_N):
+        offs = col_offs + tl.arange(0, BLOCK_SIZE_N)
+        mask = offs < N
+
+        _x = tl.load(x_ptr + offs, mask=mask, others=0.0).to(tl.float32)
+        _mean += _x
+    mean = tl.sum(_mean, axis=0) / N
+
+    _var = tl.zeros([BLOCK_SIZE_N,], dtype=tl.float32)
+    for col_offs in tl.cdiv(N, BLOCK_SIZE_N):
+        offs = col_offs + tl.arange(0, BLOCK_SIZE_N)
+        mask = offs < N
+
+        _x = tl.load(x_ptr + offs, mask=mask, others=0.0).to(tl.float32)
+        _x = tl.where(mask, _x - mean, 0.0)
+        _var += _x * _x
+    var = tl.sum(_var, axis=0) / N 
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    tl.store(rstd_ptr + row, rstd)
+
+    for col_offs in tl.cdiv(N, BLOCK_SIZE_N):
+        offs = col_offs + tl.arange(0, BLOCK_SIZE_N)
+        mask = offs < N
+
+        x = tl.load(x_ptr + offs, mask=mask, others=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + offs, mask=mask).to(tl.float32)
+        b = tl.load(bias_ptr + offs, mask=mask).to(tl.float32)
+        x_hat = (x - mean) * rstd
+
+        tl.store(x_hat_ptr + offs, x_hat.to(tl.bfloat16), mask=mask)
+
+        y = (x * w) * b
+        tl.store(y_ptr + offs, y.to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
+def layer_norm_bwd_dx_kernel(
+    dx_ptr, dy_ptr, DW_ptr, DB_ptr, x_ptr, w_ptr, x_hat_ptr, rstd_ptr,
+    Lock, stride, N,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE_N)
+    mask = cols < N 
+
+    x_ptr += row * stride
+    dx_ptr += row * stride
+    dy_ptr += row * stride
+    x_hat_ptr += row * stride
+
+    lock_id = row % GROUP_SIZE_M
+    Lock += lock_id
+    Count = Lock + GROUP_SIZE_M
+
+    DW_ptr += lock_id * N + cols
+    DB_ptr += lock_id * N + cols 
+
+    # Load data
+    x = tl.load(x_ptr + cols, mask=mask, others=0.0).to(tl.float32)
+    x_hat = tl.load(x_hat_ptr + cols, mask=mask, others=0.0).to(tl.float32)
+    dy = tl.load(dy_ptr + cols, mask=mask, others=0.0).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=mask).to(tl.float32)
+    rstd = tl.load(rstd_ptr + row).to(tl.float32)
+
+    # compute dx
+    wdy = w * dy
+    wdy = tl.where(mask, wdy, 0.)
+    c1 = tl.sum(x_hat * wdy, axis=0) / N
+    c2 = tl.sum(wdy, axis=0) / N
+    dx = (wdy - x_hat * c1 + c2) * rstd
+
+    tl.store(dx_ptr + cols, dx, mask=mask)
+
+    partial_dw = (dy * x_hat).to(w.dtype)
+    partial_db = (dy).to(w.dtype)
+    while tl.atomic_cas(Lock, 0, 1) == 1:
+        pass
+
+    count = tl.load(Count)
+    if count == 0:
+        tl.atomic_xchg(Count, 1)
+    else:
+        partial_dw += tl.load(DW_ptr, mask=mask, other=0.).to(w.dtype)
+        partial_db += tl.load(DB_ptr, mask=mask, other=0.).to(w.dtype)
+    
+    tl.store(DW_ptr, partial_dw, mask=mask)
+    tl.store(DB_ptr, partial_db, mask=mask)
+
+    tl.debug_barrier()
+
+    tl.atomic_xchg(Lock, 0)
+
+
+
+@triton.jit
+def layer_norm_bwd_dwdb_kernel(
+    DW_ptr, DB_ptr, Final_DW_ptr, Final_DB_ptr,
+    M, N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr
+):
+    pid = tl.program_id(0).to(tl.float32)
+    cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    final_dw = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    final_db = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    for row in tl.cdiv(M, BLOCK_SIZE_M):
+        rows = row + tl.arange(0, BLOCK_SIZE_M)
+        offs = rows[:, None] + cols[None, :]
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+
+        final_dw += tl.load(DW_ptr + offs, mask=mask, other=0.).to(tl.float32)
+        final_db += tl.load(DB_ptr + offs, mask=mask, other=0.).to(tl.float32)
+
+    dw = tl.sum(final_dw, axis=0)
+    db = tl.sum(final_db, axis=0)
+
+    tl.store(Final_DB_ptr + cols, dw, mask=cols < N)
+    tl.store(Final_DB_ptr + cols, db, mask=cols < N)
