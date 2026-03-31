@@ -11,12 +11,11 @@ from torchmetrics import Metric
 import deepspeed
 
 from Train.log import get_logger
-from Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat, build_cuda_graph_ddp
+from Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat
 from Train.utils_ddp import rank0
 
 from Activation_Compression.controller import Controller
 from Activation_Compression.layers import DOConv1d, DOConv2d
-from Activation_Compression.freq_utils import radial_spectrum_2d, log_huber_loss
 
 import time
 from typing import Union, Callable, Dict, Optional
@@ -34,7 +33,6 @@ class Trainer():
                  ACT_config: Dict = None,
                  CUDA_Graph: bool = False,
                  QAT: bool = False,
-                 Freq_loss: bool = False,
                  amp_enable: bool = True,
                  dataloader: DataLoader = None,
                  sub_data_portion: float = 1.0,
@@ -54,7 +52,6 @@ class Trainer():
         self.CUDA_Graph = CUDA_Graph
         self.amp_enable = amp_enable
         self.QAT = QAT
-        self.Freq_loss = Freq_loss
         self.train_dataloader = dataloader
         self.cri = criterion
         self.opt = optimizer
@@ -146,24 +143,6 @@ class Trainer():
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return t
     
-    def _freq_loss_hook(self, model):
-        act_cache = {}
-        def fwd_hook(name):
-            def hook(module, input, output):
-                global act_cache
-                act_cache[name] = output.detach()
-            return hook
-        
-        conv_potential_modules_list = [n for n, m in model.named_modules() if isinstance(m, (nn.Conv2d, nn.Conv1d, DOConv1d, DOConv2d))]
-        target_module_name = conv_potential_modules_list[-1]
-        for name, module in model.named_modules():
-            if name == target_module_name:
-                module.register_forward_hook(fwd_hook(name))
-                if rank0():
-                    logger.info(f"Frequency loss hook registered at module: {name} - {module}")
-                break
-        return act_cache, target_module_name
-
 
     def _wrap_model_to_engine(self, model, wrap_type='raw'):
         if self.DS_config is not None:
@@ -208,7 +187,6 @@ class Trainer():
             engine.logger = _NoopDDPLogger()
             if rank0():
                 logger.info("Model Wrap Type: DDP")
-            self.act_cache, self.freq_loss_module_name = self._freq_loss_hook(engine.module)
 
         else:
             engine = model
@@ -237,12 +215,6 @@ class Trainer():
                     logits = self.engine(data)
                     ori_loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
 
-                    if self.Freq_loss:
-                        model_spectrum1 = radial_spectrum_2d(self.act_cache[self.freq_loss_module_name], num_rad_bins=7, mode='magnitude')
-                        target_spectrum1 = radial_spectrum_2d(data, num_rad_bins=7, mode='magnitude')
-                        freq_loss1 = log_huber_loss(model_spectrum1, target_spectrum1)
-
-                        ori_loss = ori_loss + 1.0 * freq_loss1
 
                     if isinstance(self.engine, nn.parallel.DistributedDataParallel) and self.grad_acc_step > 1:
                         self.engine.require_backward_grad_sync = grad_step
