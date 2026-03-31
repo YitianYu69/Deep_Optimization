@@ -383,6 +383,7 @@ class _DOLinear(Function):
         # scaled_lr = ema_grad_meta['lr'] * trust_ratio
         # update = dw.float() + ema_grad_meta['ema_smooth'] * ema_grad_meta['momentum']
 
+
         # with torch.no_grad():
         #     weight_master.add_(update * -scaled_lr)
 
