@@ -134,6 +134,9 @@ class Trainer():
         return self._training(epoch)
     def valid(self, dataloader):
         return self._validation(dataloader)
+    
+    def getEngine(self):
+        return self.engine
 
     def _is_deepspeed(self):
         return isinstance(self.engine, deepspeed.DeepSpeedEngine)
