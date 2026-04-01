@@ -1,9 +1,13 @@
-from torch.utils.data import DataLoader
+import torch
+from torch.utils.data import DataLoader, random_split, Subset
 from torch.utils.data.distributed import DistributedSampler
+
+
 from timm.data import create_transform
 from torchvision import datasets
+
 from pathlib import Path
-import torch
+
 
 
 class FixedImageDataset(datasets.ImageFolder):
@@ -31,23 +35,41 @@ def get_transform(dtype, image_size):
         auto_augment='rand-m9-n2-mstd0.5' if dtype == 'train' else None
     )
 
-def get_dataloader(root, image_size, batch_size, num_workers, drop_last,
+def get_dataloader(batch_size, num_workers, drop_last,
+                   train_dataset=None, valid_dataset=None, test_dataset=None,
+                   root=None, image_size=None,
+                   split_strategy=None,
                    *, ddp=False, global_rank=None, world_size=None, pin_memory_device=None):
-    root_path = Path(root)
-    train_path = root_path / 'train'
-    valid_path = root_path / 'valid'
 
-    train_transform = get_transform('train', image_size)
-    valid_transform = get_transform('valid', image_size)
+    if root is not None and image_size is not None and split_strategy is not None:
+        root_path = Path(root)
+        train_path = root_path / 'train'
+        valid_path = root_path / 'valid'
 
-    train_dataset = datasets.ImageFolder(train_path, train_transform)
-    cti = train_dataset.class_to_idx
-    valida_dataset = FixedImageDataset(valid_path, valid_transform, cti)
+        train_transform = get_transform('train', image_size)
+        valid_transform = get_transform('valid', image_size)
+
+        train_dataset = datasets.ImageFolder(train_path, train_transform)
+        check_dataset = datasets.ImageFolder(train_path, valid_transform)
+        cti = train_dataset.class_to_idx
+
+        train_len = int(split_strategy[0] * len(train_dataset))
+        valid_len = len(train_dataset) - train_len
+        train_indices, valid_indices = random_split(range(len(train_dataset)), [split_strategy[0], split_strategy[1]])
+
+        train_dataset = Subset(train_dataset, train_indices.indices)
+        valid_dataset = Subset(check_dataset, valid_indices.indices)
+        test_dataset = FixedImageDataset(valid_path, valid_transform, cti)
+    elif train_dataset is not None and valid_dataset is not None and test_dataset is not None:
+        pass
+    else:
+        ValueError("Please eith provide the datases, or the root path")
+
 
     if ddp:
         assert (global_rank is not None and world_size is not None), "Both global rank and world size cannot be None for DDP"
         train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=drop_last, num_replicas=world_size, rank=global_rank)
-        valid_sampler = DistributedSampler(valida_dataset, shuffle=False, drop_last=drop_last, num_replicas=world_size, rank=global_rank)
+        valid_sampler = DistributedSampler(valid_dataset, shuffle=False, drop_last=drop_last, num_replicas=world_size, rank=global_rank)
     else:
         train_sampler, valid_sampler = None, None
     
@@ -66,6 +88,7 @@ def get_dataloader(root, image_size, batch_size, num_workers, drop_last,
 
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, shuffle=train_shuffle, batch_size=batch_size, drop_last=drop_last,
                                   num_workers=num_workers, pin_memory=True, **worker_kwargs, **pin_memory_kwargs)
-    valid_dataloader = DataLoader(valida_dataset, sampler=valid_sampler, shuffle=False, batch_size=batch_size, drop_last=drop_last,
+    valid_dataloader = DataLoader(valid_dataset, sampler=valid_sampler, shuffle=False, batch_size=batch_size, drop_last=drop_last,
                                   num_workers=num_workers, pin_memory=True, **worker_kwargs, **pin_memory_kwargs)
-    return train_dataloader, valid_dataloader
+    test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=512, num_workers=num_workers)
+    return train_dataloader, valid_dataloader, test_dataloader

@@ -137,7 +137,7 @@ class Trainer():
 
 
     def train(self, epoch_idx):
-        assert not (self.train_dataloader is None), "Pls pass the train_dataloader into the Trainer when you declare it first."
+        assert not (self.train_dataloader is None), "Please pass the train_dataloader into the Trainer when you declare it first."
         return self._training(epoch_idx)
     
     def valid(self, dataloader):
