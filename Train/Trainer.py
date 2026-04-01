@@ -70,7 +70,7 @@ class Trainer():
         assert self.DS_config is None and self.DDP_config is None, "Please choose either Deep Speed, or DDP!"
         assert self.DS_config is None and self.ACT_config is None, "Please choose either Deep Speed, or Activation Compression!"
         assert not (self.ACT_config is not None and self.train_dataloader is None), "Please also pass the train_dataloader when ACT is enabled!"
-        
+
 
         if self.QAT:
             model = wrap_model_prepare_qat(model, image_size)
@@ -136,8 +136,10 @@ class Trainer():
             self.engine = self._wrap_model_to_engine(model)
 
 
-    def train(self, epoch):
-        return self._training(epoch)
+    def train(self, epoch_idx):
+        assert not (self.train_dataloader is None), "Pls pass the train_dataloader into the Trainer when you declare it first."
+        return self._training(epoch_idx)
+    
     def valid(self, dataloader):
         return self._validation(dataloader)
     
@@ -294,7 +296,7 @@ class Trainer():
 
 
     def _training(self,
-                 epoch: int):
+                 epoch_idx: int):
         total_loss, data_len = torch.tensor(0.0, dtype=torch.float32, device=self.device), torch.tensor(0, dtype=torch.long, device=self.device)
         computed_metrics = {}
 
@@ -305,7 +307,7 @@ class Trainer():
             v.reset()
 
         if isinstance(self.train_dataloader.sampler, DistributedSampler):
-            self.train_dataloader.sampler.set_epoch(epoch)
+            self.train_dataloader.sampler.set_epoch(epoch_idx)
 
         start_time = time.time()
         for step, (data, target) in enumerate(self.train_dataloader):
