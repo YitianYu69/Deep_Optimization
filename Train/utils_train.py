@@ -180,7 +180,7 @@ def build_CUDA_Graph(model: nn.Module,
     return g_sync, g_no_sync, static_x, cuda_y, logits, ori_loss, compute_stream
 
 
-class setup_criterion(nn.Module):
+class Setup_Criterion(nn.Module):
     def __init__(self, *, label_smoothing=None, criterion_type='default', graph_mode=False,
                  temperature=None, alpha_kd=0.5, amp=None):
         super().__init__()
@@ -279,6 +279,7 @@ def build_metrics(*, metric_lists: List[str],
                   average_type: str,
                   sync: bool,
                   device: Union[str, torch.device] = "cpu",
+                  AUROC_average_type: str = "macro",
                   top_k: int = 1):
     kwargs = dict(task=task, num_classes=num_classes, average=average_type, sync_on_compute=sync, top_k=top_k)
 
@@ -287,7 +288,7 @@ def build_metrics(*, metric_lists: List[str],
         'Recall' : Recall(**kwargs).to(device),
         'Precision' : Precision(**kwargs).to(device),
         'F1Score' : F1Score(**kwargs).to(device),
-        'AUROC' : AUROC(**kwargs).to(device)
+        'AUROC' : AUROC(task=task, num_classes=num_classes, average=AUROC_average_type, sync_on_compute=sync).to(device)
     }
 
     new_metrics = {}

@@ -11,7 +11,7 @@ from torchmetrics import Metric
 import deepspeed
 
 from Train.log import get_logger
-from Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat
+from Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat, Setup_Criterion
 from Train.utils_ddp import rank0
 
 from Activation_Compression.controller import Controller
@@ -37,7 +37,8 @@ class Trainer():
                  dataloader: DataLoader = None,
                  sub_data_portion: float = 1.0,
                  criterion: Union[nn.Module, Callable] = None,
-                 optimizer: Optional[torch.optim.Optimizer] = None,
+                 optimizer_type: Optional[torch.optim.Optimizer] = None,
+                 optimizer_kwargs: Optional[dict] = None,
                  scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None, 
                  scaler: torch.amp.GradScaler = None,
                  metrics: Dict[str, Metric] = None,
@@ -55,7 +56,8 @@ class Trainer():
         self.QAT = QAT
         self.train_dataloader = dataloader
         self.cri = criterion
-        self.opt = optimizer
+        self.opt_type = optimizer_type
+        self.opt_kwargs = optimizer_kwargs
         self.scheduler = scheduler
         self.scaler = scaler
         self.metrics = metrics
@@ -64,6 +66,9 @@ class Trainer():
         self.grad_acc_step = grad_acc_step
         self.device = device.type if isinstance(device, torch.device) else device
         self.teacher_model = teacher_model
+
+        self.cuda_timer_start = torch.cuda.Event(enable_timing=True)
+        self.cuda_timer_end = torch.cuda.Event(enable_timing=True)
 
         # Check confliction
         assert (self.QAT != self.amp_enable) or (not self.QAT and not self.amp_enable), "Please choose either QAT=True, or amp_enable=True!"
@@ -135,16 +140,25 @@ class Trainer():
         else:
             self.engine = self._wrap_model_to_engine(model)
 
+        if self.opt_type is not None and self.opt_kwargs is not None:
+            self.opt = self.opt_type(self.engine.parameters(), **self.opt_kwargs)
+        else:
+            raise ValueError("Please provide a optimizerr class")
+
 
     def train(self, epoch_idx):
         assert not (self.train_dataloader is None), "Please pass the train_dataloader into the Trainer when you declare it first."
+        assert not (self.metrics is None), "Please pass metrics into the Trainer when declare it as a dict."
         return self._training(epoch_idx)
     
     def valid(self, dataloader):
         return self._validation(dataloader)
     
-    def getEngine(self):
+    def get_Engine(self):
         return self.engine
+    
+    def get_Optimizer(self):
+        return self.opt
 
     def _is_deepspeed(self):
         return isinstance(self.engine, deepspeed.DeepSpeedEngine)
@@ -156,6 +170,8 @@ class Trainer():
     
 
     def _wrap_model_to_engine(self, model, wrap_type='raw'):
+        model = model.to(self.device)
+
         if self.DS_config is not None:
             engine, _ = deepspeed.initialize(
                 model=model,
@@ -232,7 +248,13 @@ class Trainer():
                                     dtype=(self.cast_dtype if device_type in ['cuda', 'cpu'] else None),
                                     enabled=self.amp_enable and device_type in ['cuda', 'cpu']):
                     logits = self.engine(data)
-                    ori_loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
+
+                    if isinstance(self.cri, Setup_Criterion):
+                        ori_loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
+                    elif isinstance(self.cri, nn.CrossEntropyLoss):
+                        ori_loss = self.cri(logits, target)
+                    else:
+                        raise TypeError("Current type of the loss function is not support, if you want to support it, please open a issue.")
 
 
                     if isinstance(self.engine, nn.parallel.DistributedDataParallel) and self.grad_acc_step > 1:
@@ -309,12 +331,18 @@ class Trainer():
         if isinstance(self.train_dataloader.sampler, DistributedSampler):
             self.train_dataloader.sampler.set_epoch(epoch_idx)
 
+        cuda_time = 0
         start_time = time.time()
         for step, (data, target) in enumerate(self.train_dataloader):
             data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
             grad_step = ((step + 1) % self.grad_acc_step == 0 or (step + 1) == len(self.train_dataloader))
 
+            self.cuda_timer_start.record()
             logits, loss = self._training_step(data, target, grad_step)
+            self.cuda_timer_end.record()
+
+            torch.cuda.synchronize()
+            cuda_time += self.cuda_timer_start.elapsed_time(self.cuda_timer_end)
             self._update_metrics(logits, target)
         
             total_loss += loss.detach() * data.size(0)
@@ -325,6 +353,8 @@ class Trainer():
         data_len = self._guard_all_reduce_SUM(data_len)
         computed_metrics['Loss'] = total_loss.item() / data_len.item()
         computed_metrics['Time'] = end_time - start_time
+        computed_metrics["Total_Step_Time"] = (cuda_time / 1000)
+        computed_metrics['Throughput'] = len(self.train_dataloader.dataset) / (cuda_time / 1000)
         for k, v in self.metrics.items():
             computed_metrics[k] = v.compute()
         
@@ -347,7 +377,14 @@ class Trainer():
             data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
 
             logits = self.engine(data)
-            loss = self.cri(logits, labels=target, valid=True)
+
+            if isinstance(self.cri, Setup_Criterion):
+                loss = self.cri(logits, labels=target, valid=True)
+            elif isinstance(self.cri, nn.CrossEntropyLoss):
+                loss = self.cri(logits, target)
+            else:
+                raise TypeError("Current type of the loss function is not support, if you want to support it, please open a issue.")
+
 
             self._update_metrics(logits, target)
             total_loss += loss.detach() * data.size(0)
