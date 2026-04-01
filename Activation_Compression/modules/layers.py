@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from torch.nn import Parameter
 
-from modules.ops import _DOLinear, _DOConv1d, _DOConv2d, _DOConv3d, GroupPACTClampFn
+from Activation_Compression.modules.ops import _DOLinear, _DOConv1d, _DOConv2d, _DOConv3d, GroupPACTClampFn
 
 
 class DOLinear(nn.Linear):

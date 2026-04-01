@@ -5,7 +5,6 @@ from torch.autograd import grad
 from torch.utils.data import Subset, DataLoader
 
 import numpy as np
-import cupy as cp
 
 
 

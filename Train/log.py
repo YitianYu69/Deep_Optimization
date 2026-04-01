@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 
 def get_logger(log_dir="logs"):
-    os.makedir(log_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
 
 
     file_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]

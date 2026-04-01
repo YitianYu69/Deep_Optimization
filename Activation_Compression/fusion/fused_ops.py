@@ -3,7 +3,7 @@ from torch import nn
 from torch.autograd import Function
 from torch.amp import custom_fwd, custom_bwd
 
-import triton_kernel.norm_act_fusion.kernel_registration
+import Activation_Compression.triton_kernel.norm_act_fusion.kernel_registration
 
 
 class _DOBatchNormReLU2d(Function):

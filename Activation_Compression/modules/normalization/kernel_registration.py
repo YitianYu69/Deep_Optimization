@@ -3,7 +3,7 @@ from torch.library import triton_op, wrap_triton
 
 from .kernel_implementation import (_bn_fwd_reduce_kernel, _bn_fwd_norm_fused, _bn_bwd_reduce_kernel, _bn_bwd_dx_kernel, 
                                     bn_fwd_norm_quant_pack_fused_kernel, bn_bwd_reduce_dequant_unpack_fused_kernel, bn_bwd_dx_dequant_unpack_fused_kernel)
-from act_triton_kernel import _bits_consts
+from Activation_Compression.act_triton_kernel import _bits_consts
 
 import triton
 

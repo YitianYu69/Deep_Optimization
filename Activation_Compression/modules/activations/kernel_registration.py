@@ -1,4 +1,4 @@
-from modules.tensor_act_reshape_utils import spatical_aware_act_tensor_reshape_back
+from Activation_Compression.modules.tensor_act_reshape_utils import spatical_aware_act_tensor_reshape_back
 import torch 
 from torch.library import triton_op, wrap_triton
 
@@ -7,9 +7,9 @@ from .kernel_implementation import (
     silu_triton, silu_fwd_fused_quan_pack_triton, silu_bwd_fused_dequan_unpack_triton,
     gelu_triton, gelu_fwd_fused_quan_pack_triton, gelu_bwd_fused_dequan_unpack_triton)
 
-from modules.tensor_act_reshape_utils import spatical_aware_act_tensor_reshape, spatical_aware_act_tensor_reshape_back
+from Activation_Compression.modules.tensor_act_reshape_utils import spatical_aware_act_tensor_reshape, spatical_aware_act_tensor_reshape_back
 
-from ACT6.act_triton_kernel import _bits_consts
+from Activation_Compression.act_triton_kernel import _bits_consts
 
 import triton
 

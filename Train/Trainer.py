@@ -46,6 +46,7 @@ class Trainer():
                  grad_acc_step: int = 1,
                  image_size: int = 256,
                  device: Union[str, torch.device] = 'cpu'):
+        
         self.DS_config = DS_config
         self.DDP_config = DDP_config
         self.ACT_config = ACT_config
@@ -64,8 +65,13 @@ class Trainer():
         self.device = device.type if isinstance(device, torch.device) else device
         self.teacher_model = teacher_model
 
-        # Check the QAT and AMP mode confliction
+        # Check confliction
         assert (self.QAT != self.amp_enable) or (not self.QAT and not self.amp_enable), "Please choose either QAT=True, or amp_enable=True!"
+        assert self.DS_config is None and self.DDP_config is None, "Please choose either Deep Speed, or DDP!"
+        assert self.DS_config is None and self.ACT_config is None, "Please choose either Deep Speed, or Activation Compression!"
+        assert not (self.ACT_config is not None and self.train_dataloader is None), "Please also pass the train_dataloader when ACT is enabled!"
+        
+
         if self.QAT:
             model = wrap_model_prepare_qat(model, image_size)
 

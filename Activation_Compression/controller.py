@@ -5,11 +5,11 @@ from torch.fx.passes.shape_prop import ShapeProp
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
-from quantizer import Quantizer
+from Activation_Compression.quantizer import Quantizer
 from Activation_Compression.modules.layers import DOLinear, DOConv1d, DOConv2d, DOConv3d, DODepthPointConv2d, RMSNorm
-from modules.activations.act_layers import DOReLU_Variance, DOSiLU, DOGELU
-from modules.normalization.normalization_layers import DOBatchNorm2d, DOSyncBatchNorm2d
-from fusion.fusion_utils import fuse_bn_act
+from Activation_Compression.modules.activations.act_layers import DOReLU_Variance, DOSiLU, DOGELU
+from Activation_Compression.modules.normalization.normalization_layers import DOBatchNorm2d, DOSyncBatchNorm2d
+from Activation_Compression.fusion.fusion_utils import fuse_bn_act
 
 from torchvision.transforms import v2
 
