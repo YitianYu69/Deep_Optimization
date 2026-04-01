@@ -1,0 +1,4 @@
+[2026-04-01 12:59:44] [INFO] [_builder.py] Loading pretrained weights from Hugging Face hub (timm/vit_large_patch16_224.augreg_in21k_ft_in1k)
+[2026-04-01 12:59:44] [INFO] [_client.py] HTTP Request: HEAD https://huggingface.co/timm/vit_large_patch16_224.augreg_in21k_ft_in1k/resolve/main/model.safetensors "HTTP/1.1 302 Found"
+[2026-04-01 12:59:44] [INFO] [_client.py] HTTP Request: GET https://huggingface.co/api/models/timm/vit_large_patch16_224.augreg_in21k_ft_in1k/xet-read-token/0930ab3308b84cb2ae091a4a80703c459412a4c7 "HTTP/1.1 200 OK"
+[2026-04-01 12:59:53] [INFO] [_hub.py] [timm/vit_large_patch16_224.augreg_in21k_ft_in1k] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors.
