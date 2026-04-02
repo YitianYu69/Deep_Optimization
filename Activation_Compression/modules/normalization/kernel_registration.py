@@ -2,7 +2,8 @@ import torch
 from torch.library import triton_op, wrap_triton
 
 from .kernel_implementation import (_bn_fwd_reduce_kernel, _bn_fwd_norm_fused, _bn_bwd_reduce_kernel, _bn_bwd_dx_kernel, 
-                                    bn_fwd_norm_quant_pack_fused_kernel, bn_bwd_reduce_dequant_unpack_fused_kernel, bn_bwd_dx_dequant_unpack_fused_kernel)
+                                    bn_fwd_norm_quant_pack_fused_kernel, bn_bwd_reduce_dequant_unpack_fused_kernel, bn_bwd_dx_dequant_unpack_fused_kernel,
+                                    layer_norm_fwd_kernel, layer_norm_bwd_dx_kernel, layer_norm_bwd_dwdb_kernel)
 from Activation_Compression.act_triton_kernel import _bits_consts
 
 import triton
@@ -13,6 +14,11 @@ from typing import Tuple, Optional
 
 def _grid_2d(C: int, M: int, BLOCK_M: int):
     return (triton.cdiv(M, BLOCK_M), C)
+
+
+# -------------------------------------------
+# Batch Norm 2d Triton kernel registerations
+# -------------------------------------------
 
 @triton_op("act_lib::bn_fwd_reduce", mutates_args=())
 def bn_fwd_reduce(
@@ -297,3 +303,89 @@ def bn_bwd_dx_dequant_unpack_fused_impl(
     )
 
     return dx
+
+
+
+# -------------------------------------------
+# Layer Norm 2d Triton kernel registerations
+# -------------------------------------------
+
+@triton_op("act_lib::layer_norm_fwd", mutates_args=())
+def layer_norm_fwd_impl(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    
+    y = torch.empty_like(x)
+
+    x_args = x.view(-1, x.shape[-1])
+    M, C = x_args.shape
+    rstd = torch.empty((M,), dtype=torch.float32, device=x.device)
+    x_hat = torch.empty_like(x_args)
+
+    # Less than 64KB per feature: enqueue fused kernel
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(C))
+    if C > BLOCK_SIZE:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+
+    num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
+
+    # kernel
+    wrap_triton(layer_norm_fwd_kernel)[(M,)](
+        x_args, y.view(M, C), weight, bias, x_hat, rstd,
+        x_args.stride(0), C, 1e-8,
+        BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1
+    )
+
+    return y.view_as(x), x_hat, rstd, BLOCK_SIZE, num_warps
+
+
+
+@triton_op("act_lib::layer_norm_bwd_dx", mutates_args=())
+def layer_norm_bwd_dx_impl(
+    dy: torch.Tensor, weight: torch.Tensor, x_hat: torch.Tensor, rstd: torch.Tensor,
+    *,
+    BLOCK_SIZE_C: int, num_warps: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    
+    C = weight.shape[0]
+    GROUP_SIZE_M = 64
+    if C <= 8192: GROUP_SIZE_M = 96
+    if C <= 4096: GROUP_SIZE_M = 128
+    if C <= 1024: GROUP_SIZE_M = 256
+
+    locks = torch.zeros(2 * GROUP_SIZE_M, dtype=torch.int32, device=x_hat.device)
+    _dw = torch.empty((GROUP_SIZE_M, C), dtype=torch.float32, device=x_hat.device)
+    _db = torch.empty((GROUP_SIZE_M, C), dtype=torch.float32, device=x_hat.device)
+    dx = torch.empty_like(x_hat)
+
+    M, C = x_hat.shape
+    wrap_triton(layer_norm_bwd_dx_kernel)[(M,)](
+        dx, dy.view_as(x_hat), _dw, _db,  weight, x_hat, rstd,
+        locks, x_hat.stride(0), C, 
+        BLOCK_SIZE_C=BLOCK_SIZE_C, GROUP_SIZE_M=GROUP_SIZE_M,
+        num_warps=num_warps
+    )
+
+    return dx.view_as(dy), _dw, _db, M, C
+
+
+@triton_op("act_lib::layer_norm_bwd_dwdb", mutates_args=())
+def layer_norm_bwd_dwdb_impl(
+    _dw: torch.Tensor, _db: torch.Tensor,
+    M: int, C: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    dw = torch.empty((C,), dtype=torch.float32, device=_dw.device)
+    db = torch.empty((C,), dtype=torch.float32, device=_dw.device)
+
+    grid = lambda META: triton.cdiv(C, META['BLOCK_SIZE_C'])
+    wrap_triton(layer_norm_bwd_dwdb_kernel)[grid](
+        _dw, _db, dw, db,
+        M, C,
+        BLOCK_SIZE_M=32,
+        BLOCK_SIZE_N=128,
+        num_ctas=1
+    )
+
+    return dw, db

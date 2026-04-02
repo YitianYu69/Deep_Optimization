@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 
-from .normalization_ops import _DOBatchNorm, _DOSyncBatchNorm
+from .normalization_ops import _DOBatchNorm, _DOSyncBatchNorm, _DOLayerNorm
 
        
 class DOBatchNorm2d(nn.BatchNorm2d):
@@ -65,6 +65,9 @@ class DOSyncBatchNorm2d(nn.SyncBatchNorm):
         self.ema_grad_meta = None
 
     def forward(self, x):
+        if not self.training:
+            return super().forward(x)
+
         if not x.is_cuda:
             raise ValueError('SyncBatchNorm expected input tensor to be on GPU')
         
@@ -107,3 +110,22 @@ class DOSyncBatchNorm2d(nn.SyncBatchNorm):
                 input, self.weight, self.bias, self.running_mean, self.running_var,
                 self.eps, exponential_average_factor, process_group, world_size, 
                 self.target_name, self.meta, self.ema_grad_meta)
+        
+
+
+
+
+
+class DOLayerNorm(nn.LayerNorm):
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True, target_name=None, meta={}):
+        super().__init__(normalized_shape, eps, elementwise_affine)
+
+        self.target_name = target_name
+        self.meta = meta 
+
+    def forward(self, x):
+        if self.training:
+            return _DOLayerNorm.apply(x, self.weight, self.bias, self.target_name, self.meta)
+        else:
+            return super().forward(x)
+

@@ -492,7 +492,7 @@ def bn_bwd_dx_dequant_unpack_fused_kernel(
 def layer_norm_fwd_kernel(
     x_ptr, y_ptr, weight_ptr, bias_ptr, x_hat_ptr, rstd_ptr,
     stride, N, eps,
-    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
 
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -501,18 +501,18 @@ def layer_norm_fwd_kernel(
     y_ptr += row * stride
     x_hat_ptr += row * stride
 
-    _mean = tl.zeros([BLOCK_SIZE_N,], dtype=tl.float32)
-    for col_offs in tl.cdiv(N, BLOCK_SIZE_N):
-        offs = col_offs + tl.arange(0, BLOCK_SIZE_N)
+    _mean = tl.zeros([BLOCK_SIZE_C,], dtype=tl.float32)
+    for col_offs in tl.cdiv(N, BLOCK_SIZE_C):
+        offs = col_offs + tl.arange(0, BLOCK_SIZE_C)
         mask = offs < N
 
         _x = tl.load(x_ptr + offs, mask=mask, others=0.0).to(tl.float32)
         _mean += _x
     mean = tl.sum(_mean, axis=0) / N
 
-    _var = tl.zeros([BLOCK_SIZE_N,], dtype=tl.float32)
-    for col_offs in tl.cdiv(N, BLOCK_SIZE_N):
-        offs = col_offs + tl.arange(0, BLOCK_SIZE_N)
+    _var = tl.zeros([BLOCK_SIZE_C,], dtype=tl.float32)
+    for col_offs in tl.cdiv(N, BLOCK_SIZE_C):
+        offs = col_offs + tl.arange(0, BLOCK_SIZE_C)
         mask = offs < N
 
         _x = tl.load(x_ptr + offs, mask=mask, others=0.0).to(tl.float32)
@@ -523,8 +523,8 @@ def layer_norm_fwd_kernel(
 
     tl.store(rstd_ptr + row, rstd)
 
-    for col_offs in tl.cdiv(N, BLOCK_SIZE_N):
-        offs = col_offs + tl.arange(0, BLOCK_SIZE_N)
+    for col_offs in tl.cdiv(N, BLOCK_SIZE_C):
+        offs = col_offs + tl.arange(0, BLOCK_SIZE_C)
         mask = offs < N
 
         x = tl.load(x_ptr + offs, mask=mask, others=0.0).to(tl.float32)
@@ -540,16 +540,15 @@ def layer_norm_fwd_kernel(
 
 @triton.jit
 def layer_norm_bwd_dx_kernel(
-    dx_ptr, dy_ptr, DW_ptr, DB_ptr, x_ptr, w_ptr, x_hat_ptr, rstd_ptr,
+    dx_ptr, dy_ptr, DW_ptr, DB_ptr, w_ptr, x_hat_ptr, rstd_ptr,
     Lock, stride, N,
-    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr
 ):
     row = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, BLOCK_SIZE_N)
+    cols = tl.arange(0, BLOCK_SIZE_C)
     mask = cols < N 
 
-    x_ptr += row * stride
     dx_ptr += row * stride
     dy_ptr += row * stride
     x_hat_ptr += row * stride
@@ -562,7 +561,6 @@ def layer_norm_bwd_dx_kernel(
     DB_ptr += lock_id * N + cols 
 
     # Load data
-    x = tl.load(x_ptr + cols, mask=mask, others=0.0).to(tl.float32)
     x_hat = tl.load(x_hat_ptr + cols, mask=mask, others=0.0).to(tl.float32)
     dy = tl.load(dy_ptr + cols, mask=mask, others=0.0).to(tl.float32)
     w = tl.load(w_ptr + cols, mask=mask).to(tl.float32)
@@ -601,19 +599,19 @@ def layer_norm_bwd_dx_kernel(
 @triton.jit
 def layer_norm_bwd_dwdb_kernel(
     DW_ptr, DB_ptr, Final_DW_ptr, Final_DB_ptr,
-    M, N,
+    M, C,
     BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr
+    BLOCK_SIZE_C: tl.constexpr
 ):
     pid = tl.program_id(0).to(tl.float32)
-    cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    cols = pid * BLOCK_SIZE_C + tl.arange(0, BLOCK_SIZE_C)
 
-    final_dw = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
-    final_db = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    final_dw = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_C], dtype=tl.float32)
+    final_db = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_C], dtype=tl.float32)
     for row in tl.cdiv(M, BLOCK_SIZE_M):
         rows = row + tl.arange(0, BLOCK_SIZE_M)
         offs = rows[:, None] + cols[None, :]
-        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        mask = (rows[:, None] < M) & (cols[None, :] < C)
 
         final_dw += tl.load(DW_ptr + offs, mask=mask, other=0.).to(tl.float32)
         final_db += tl.load(DB_ptr + offs, mask=mask, other=0.).to(tl.float32)
@@ -621,5 +619,5 @@ def layer_norm_bwd_dwdb_kernel(
     dw = tl.sum(final_dw, axis=0)
     db = tl.sum(final_db, axis=0)
 
-    tl.store(Final_DB_ptr + cols, dw, mask=cols < N)
-    tl.store(Final_DB_ptr + cols, db, mask=cols < N)
+    tl.store(Final_DW_ptr + cols, dw, mask=cols < C)
+    tl.store(Final_DB_ptr + cols, db, mask=cols < C)

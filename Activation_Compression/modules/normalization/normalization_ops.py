@@ -177,6 +177,7 @@ class _DOSyncBatchNorm(Function):
     @custom_fwd(device_type='cuda')
     def forward(ctx, input, weight, bias, running_mean, running_var, eps, momentum, process_group, world_size,
                 target_name, meta, ema_grad_meta):
+        ctx.set_materialize_grads(False)
         
         count = torch.empty(1,
                             dtype=running_mean.dtype,
@@ -232,7 +233,7 @@ class _DOSyncBatchNorm(Function):
 
             q_inputs_tensor, q_inputs_meta, input_hat_l = unified_quantize(input_hat, None, target_name, meta, clamp=False, clamp_alpha=0.0)
 
-            # Save only what backward needs (small + stats)
+            # Saved for bwd
             ctx.target_name = target_name
             ctx.q_meta = q_inputs_meta
             ctx.meta = (BLOCK_M, num_warps, num_stages, meta, ema_grad_meta)
@@ -256,6 +257,7 @@ class _DOSyncBatchNorm(Function):
 
             y = y.view(N, C, H, W)
 
+            # Saved for bwd
             ctx.target_name = target_name
             ctx.meta = (BLOCK_M, num_warps, num_stages, meta, ema_grad_meta, avg_alam, alam_bits)
             ctx.save_for_backward(
@@ -338,3 +340,67 @@ class _DOSyncBatchNorm(Function):
             dbeta,   # grad bias
             None, None, None, None, None, None, None, None, None, None
         )
+    
+
+
+
+
+
+
+# -----------
+# Layer Norm
+# -----------
+class _DOLayerNorm(Function):
+    @staticmethod
+    @custom_fwd(device_type='cuda')
+    def forward(ctx, x, weight, bias, target_name, meta):
+        ctx.set_metarialize_grads(False)
+
+        assert x.ndim == 3, "Current this LN only support 3D data"
+
+        # Custom fwd (unfused pass)
+        y, x_hat, rstd, BLOCK_SIZE_C, num_warps = torch.ops.act_lib.layer_norm_fwd(x, weight, bias)
+
+        # Dynamic Activation Compression
+        q_inputs_tensor, q_inputs_meta, input_hat_l = unified_quantize(x_hat, None, target_name, meta, clamp=False, clamp_alpha=0.0)
+
+        # Saved for bwd
+        ctx.target_name = target_name
+        ctx.q_meta = q_inputs_meta
+        ctx.meta = BLOCK_SIZE_C, num_warps
+        ctx.save_for_backward(
+            q_inputs_tensor[0], q_inputs_tensor[1], q_inputs_tensor[2],
+            weight, rstd
+        )
+
+        return y
+    
+    @staticmethod
+    @custom_bwd(device_type='cuda')
+    def backward(ctx, dy):
+        # Take the saved tensors
+        target_name = ctx.target_name
+        q_inputs_meta = ctx.q_meta
+        BLOCK_SIZE_C, num_warps = ctx.meta
+        (q_inputs_tensor_0, q_inputs_tensor_1, q_inputs_tensor_2, weight, rstd) = ctx.saved_tensors
+
+        q_inputs_tensor = (q_inputs_tensor_0, q_inputs_tensor_1, q_inputs_tensor_2)
+
+        # Dynamic Dequantize and Unpack
+        x_hat = unified_dequantize(q_inputs_tensor, q_inputs_meta, None)
+
+        # Bwd for bx
+        dx, _dw, _db, M, C = torch.ops.act_lib(
+            dy, weight, x_hat, rstd,
+            BLOCK_SIZE_C=BLOCK_SIZE_C, num_warps=num_warps
+        )
+
+        # Bwd for dw and db
+        dw, db = torch.ops.act_lib(
+            _dw, _db,
+            M=M, C=C
+        )
+
+        return dx, dw, db, None, None
+
+
