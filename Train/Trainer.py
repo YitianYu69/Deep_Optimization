@@ -45,6 +45,7 @@ class Trainer():
                  ema: Callable = None,
                  num_epochs: int = 200,
                  grad_acc_step: int = 1,
+                 grad_norm_clip: bool = False,
                  image_size: int = 256,
                  device: Union[str, torch.device] = 'cpu'):
         
@@ -64,6 +65,7 @@ class Trainer():
         self.ema = ema
         self.num_epochs = num_epochs
         self.grad_acc_step = grad_acc_step
+        self.grad_norm_clip = grad_norm_clip
         self.device = device.type if isinstance(device, torch.device) else device
         self.teacher_model = teacher_model
 
@@ -242,6 +244,7 @@ class Trainer():
             self.engine.step()
         else:
             # Branch using CUDA Graph or not
+            # Not use
             if not self.CUDA_Graph:
                 device_type = "cuda" if str(self.device).startswith("cuda") else "cpu"
                 with torch.autocast(device_type=device_type, 
@@ -264,6 +267,8 @@ class Trainer():
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+
+            # Use CUDA Graph
             else:
                 if data.shape != self.static_x.shape or target.shape != self.static_y.shape:
                     raise RuntimeError(
@@ -290,12 +295,14 @@ class Trainer():
             if grad_step:
                 if self.amp_enable and self.scaler is not None:
                     self.scaler.unscale_(self.opt)
-                    torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
+                    if self.grad_norm_clip:
+                        torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
                     self.scaler.step(self.opt)
                     self.scaler.update()
                     self.opt.zero_grad(set_to_none=True)
                 else:
-                    torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
+                    if self.grad_norm_clip:
+                        torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
                     self.opt.step()
                     self.opt.zero_grad(set_to_none=True)
 
@@ -339,11 +346,11 @@ class Trainer():
 
             self.cuda_timer_start.record()
             logits, loss = self._training_step(data, target, grad_step)
+            self._update_metrics(logits, target)
             self.cuda_timer_end.record()
 
             torch.cuda.synchronize()
             cuda_time += self.cuda_timer_start.elapsed_time(self.cuda_timer_end)
-            self._update_metrics(logits, target)
         
             total_loss += loss.detach() * data.size(0)
             data_len += len(data)
