@@ -391,7 +391,10 @@ class Trainer():
         for data, target in dataloader:
             data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
 
-            logits = self.engine(data)
+            if self.ema is None:
+                logits = self.engine(data)
+            else:
+                logits = self.ema(data)
 
             if isinstance(self.cri, Setup_Criterion):
                 loss = self.cri(logits, labels=target, valid=True)

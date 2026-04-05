@@ -303,7 +303,8 @@ def build_metrics(*, metric_lists: List[str],
 class EMA():
     def __init__(self,
                  model,
-                 decay = 0.999,
+                 decay = 0.9,
+                 max_decay = 0.999,
                  tau = 2000,
                  device = None,
                  use_fp32_master = True,
@@ -314,6 +315,7 @@ class EMA():
 
         self.ema_model = self._unwrap_model(model)
         self.decay_base = float(decay)
+        self.max_decay = float(max_decay)
         self.tau = int(tau)
         self.device = device
         self.use_fp32_master = use_fp32_master
@@ -383,7 +385,7 @@ class EMA():
         
 
         model = self._unwrap_model(model)
-        c_decay = self._current_decay()
+        c_decay = max(self._current_decay(), self.max_decay)
 
         for n, p, ema_p in self._iter_named_fparameters_with_ema(model):
             if p is None or ema_p is None:
