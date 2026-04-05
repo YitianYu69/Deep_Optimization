@@ -17,6 +17,8 @@ from Train.utils_ddp import rank0
 from Activation_Compression.controller import Controller
 from Activation_Compression.modules.layers import DOConv1d, DOConv2d
 
+from Adversarial_Attack.FGSM import FGSM_attack
+
 import time
 from typing import Union, Callable, Dict, Optional
 
@@ -33,6 +35,7 @@ class Trainer():
                  ACT_config: Dict = None,
                  CUDA_Graph: bool = False,
                  QAT: bool = False,
+                 Adversarial_Attack: Dict = None,
                  amp_enable: bool = True,
                  dataloader: DataLoader = None,
                  sub_data_portion: float = 1.0,
@@ -55,6 +58,7 @@ class Trainer():
         self.CUDA_Graph = CUDA_Graph
         self.amp_enable = amp_enable
         self.QAT = QAT
+        self.Adversarial_Attack = Adversarial_Attack
         self.train_dataloader = dataloader
         self.cri = criterion
         self.opt_type = optimizer_type
@@ -342,6 +346,10 @@ class Trainer():
         start_time = time.time()
         for step, (data, target) in enumerate(self.train_dataloader):
             data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
+
+            if self.Adversarial_Attack is not None:
+                data, target = FGSM_attack(self.engine, self.cri, data, target, device=self.device)
+
             grad_step = ((step + 1) % self.grad_acc_step == 0 or (step + 1) == len(self.train_dataloader))
 
             self.cuda_timer_start.record()
