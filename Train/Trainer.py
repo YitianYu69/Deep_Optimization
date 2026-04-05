@@ -347,7 +347,7 @@ class Trainer():
         for step, (data, target) in enumerate(self.train_dataloader):
             data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
 
-            if self.Adversarial_Attack is not None:
+            if self.Adversarial_Attack is not None and self.Adversarial_Attack.get('Attack_Type', None) == 'FGSM':
                 data, target = FGSM_attack(self.engine, self.cri, data, target, device=self.device)
 
             grad_step = ((step + 1) % self.grad_acc_step == 0 or (step + 1) == len(self.train_dataloader))
