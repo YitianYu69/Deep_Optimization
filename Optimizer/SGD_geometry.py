@@ -65,7 +65,7 @@ class SGD_NS_Overshoot(Optimizer):
                     continue
 
                 grad = p.grad
-                if grad.is_sparse():
+                if grad.is_sparse:
                     continue
 
                 state = self.state[p]
@@ -148,7 +148,7 @@ class SGD_NS_Overshoot(Optimizer):
 
                 grad = p.grad
                 state = self.state[p]
-                if grad.is_sparse():
+                if grad.is_sparse:
                     raise TypeError('Current Optimizer does not support sparse gradient!')
                 
             
