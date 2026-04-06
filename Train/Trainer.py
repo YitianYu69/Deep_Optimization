@@ -157,8 +157,8 @@ class Trainer():
         assert not (self.metrics is None), "Please pass metrics into the Trainer when declare it as a dict."
         return self._training(epoch_idx)
     
-    def valid(self, dataloader):
-        return self._validation(dataloader)
+    def valid(self, dataloader, attack = False):
+        return self._validation(dataloader, attack=attack)
     
     def get_Engine(self):
         return self.engine
@@ -379,7 +379,8 @@ class Trainer():
 
     @torch.no_grad()
     def _validation(self,
-                    dataloader: DataLoader):
+                    dataloader: DataLoader,
+                    attack: bool = False):
         total_loss, data_len = torch.tensor(0.0, dtype=torch.float32, device=self.device), torch.tensor(0, dtype=torch.long, device=self.device)
         computed_metrics = {}
 
@@ -391,7 +392,13 @@ class Trainer():
 
         start_time = time.time()
         for data, target in dataloader:
-            data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
+
+            if not attack:
+                data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
+            else:
+                data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
+                with torch.enable_grad():
+                    data, target = FGSM_attack(self.engine, self.cri, data, target, device=self.device)
 
             if self.ema is None:
                 logits = self.engine(data)
