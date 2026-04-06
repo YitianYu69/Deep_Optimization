@@ -211,7 +211,7 @@ class SGD_NS_Overshoot(Optimizer):
 
                 
                 # ----------------------------------------
-                # 5.0 Apply momentum and nesterov
+                # 6.0 Apply momentum and nesterov
                 # ----------------------------------------  
                 if momentum != 0.0: 
                     if "momentum" not in state:
@@ -230,7 +230,7 @@ class SGD_NS_Overshoot(Optimizer):
 
 
                 # -------------------------------------------
-                # 5.0 Apply directional conditioned overshoot
+                # 7.0 Apply directional conditioned overshoot
                 # -------------------------------------------
                 if overshoot != 0.0 and momentum != 0.0:
                     alignment_gate = self._compute_cosine_similarity(grad, m)
