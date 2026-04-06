@@ -11,7 +11,7 @@ def make_divisible(v, divisor, min_value=None):
         min_value = divisor
 
     new_value = max(min_value, int(v +  (divisor / 2)) // divisor * divisor)
-    if new_value < 0.9 * value:
+    if new_value < 0.9 * min_value:
         new_value += divisor
     return new_value
 
@@ -32,7 +32,7 @@ class h_swish(nn.Module):
         return x * self.sigmoid
 
 class SE(nn.Module):
-    def __init__(self in_planes, reducion=6):
+    def __init__(self, in_planes, reducion=6):
         super().__init__()
         reduced_planes = make_divisible(in_planes // reducion, 8)
 
@@ -56,7 +56,7 @@ class Conv_3x3(nn.Module):
 
         self.block = nn.Sequential(
             nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, bias=False),
-            nn.BatchNorm2d(planes)
+            nn.BatchNorm2d(planes),
             h_swish()
         )
 
@@ -122,15 +122,15 @@ class _MobileNetV3(nn.Module):
         super().__init__()
 
         layers = []
-        first_channels = make_divisible(32 * width_mul)
+        first_channels = make_divisible(32 * width_mul, 8)
         layers += [Conv_3x3(3, first_channels, 2)]
 
         in_planes = 16
         for k, t, c, use_se, use_hs, s in cfgs:
             out_channels = make_divisible(c * width_mul, 8)
             hidden_channels = make_divisible(in_planes * t, 8)
-            layers += [InvertedResidual(in_planes, hidden_channels, out_planes, kernel_size=k, stride=s, use_se=use_se, use_hs=use_hs)]
-            in_planes = out_planes
+            layers += [InvertedResidual(in_planes, hidden_channels, out_channels, kernel_size=k, stride=s, use_se=use_se, use_hs=use_hs)]
+            in_planes = out_channels
         self.features = nn.Sequential(*layers)
         
         self.final_conv = Conv_1x1(in_planes, hidden_channels)
@@ -151,7 +151,7 @@ class _MobileNetV3(nn.Module):
         return self.classifier(x)
 
 
-def MobileNetV3_Large(num_classes, mode):
+def MobileNetV3_Large(num_classes,width_mul, mode):
 
     cfgs = [
         # k, t, c, SE, HS, s 
@@ -171,9 +171,9 @@ def MobileNetV3_Large(num_classes, mode):
         [5,   6, 160, 1, 1, 1],
         [5,   6, 160, 1, 1, 1]
     ]
-    return _MobileNetV3(cfgs, num_classes, mode)
+    return _MobileNetV3(cfgs, num_classes, width_mul=width_mul, mode=mode)
 
-def MobileNetV3_Small(num_classes, mode):
+def MobileNetV3_Small(num_classes, width_mul, mode):
 
     cfgs = [
         # k, t, c, SE, HS, s 
@@ -189,4 +189,4 @@ def MobileNetV3_Small(num_classes, mode):
         [5,    6,  96, 1, 1, 1],
         [5,    6,  96, 1, 1, 1],
     ]
-    return _MobileNetV3(cfgs, num_classes, mode)
+    return _MobileNetV3(cfgs, num_classes, width_mul=width_mul, mode=mode)
