@@ -71,7 +71,7 @@ class SGD_NS_Overshoot(Optimizer):
                 state = self.state[p]
                 ratio = self._compute_trust_ratio(grad, p, 1e-8)
 
-                state['ratio'] = state
+                state['ratio'] = ratio
 
     def _generate_heavy_tailed_noise(self, x, alpha=3.0, complex=False, clamp_value=10.0, eps=1e-8):
         u = torch.rand_like(x)
