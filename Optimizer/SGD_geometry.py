@@ -6,8 +6,8 @@ import torch.linalg as LA
 
 class SGD_NS_Overshoot(Optimizer):
     def __init__(self,
-                 lr,
                  params,
+                 lr,
                  actual_bs,
                  noise_decay_steps,
                  momentum=0.9,
@@ -58,9 +58,9 @@ class SGD_NS_Overshoot(Optimizer):
         return ratio * 1e-3
     
     def _update_param_ratio_status(self):
-        for group in self.param_groups():
+        for group in self.param_groups:
 
-            for p in group['param']:
+            for p in group['params']:
                 if p.grad is None:
                     continue
 
@@ -132,7 +132,7 @@ class SGD_NS_Overshoot(Optimizer):
         if self._global_step <= 1:
             self._update_param_ratio_status()
 
-        for group in self.param_groups():
+        for group in self.param_groups:
             lr = group['lr']
             momentum = group['momentum']
             overshoot = group['overshoot']
@@ -142,7 +142,7 @@ class SGD_NS_Overshoot(Optimizer):
             nesterov = group['nesterov']
             eps = group['eps']
 
-            for p in group['param']:
+            for p in group['params']:
                 if p.grad is None:
                     continue
 
