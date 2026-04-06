@@ -348,7 +348,9 @@ class Trainer():
             data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
 
             if self.Adversarial_Attack is not None and self.Adversarial_Attack.get('Attack_Type', None) == 'FGSM':
-                data, target = FGSM_attack(self.engine, self.cri, data, target, device=self.device)
+                attacked_data, attacked_target = FGSM_attack(self.engine, self.cri, data, target, device=self.device)
+                data = torch.cat([data, attacked_data], dim=0)
+                target = torch.cat([target, attacked_target], dim=0)
 
             grad_step = ((step + 1) % self.grad_acc_step == 0 or (step + 1) == len(self.train_dataloader))
 
@@ -394,7 +396,8 @@ class Trainer():
             if self.ema is None:
                 logits = self.engine(data)
             else:
-                logits = self.ema(data)
+                with self.ema.average_parameters(self.engine):
+                    logits = self.engine(data)
 
             if isinstance(self.cri, Setup_Criterion):
                 loss = self.cri(logits, labels=target, valid=True)

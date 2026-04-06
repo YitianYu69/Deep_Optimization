@@ -385,7 +385,11 @@ class EMA():
         
 
         model = self._unwrap_model(model)
-        c_decay = max(self._current_decay(), self.max_decay)
+        
+        if self.tau != 0.0:
+            c_decay = min(self._current_decay(), self.max_decay)
+        else:
+            c_decay = self._current_decay()
 
         for n, p, ema_p in self._iter_named_fparameters_with_ema(model):
             if p is None or ema_p is None:

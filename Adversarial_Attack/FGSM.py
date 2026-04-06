@@ -1,29 +1,24 @@
 import torch
 
-def FGSM_attack(model, criterion, images, labels, eps=0.007, attack_p=0.5, device='cpu'):
+def FGSM_attack(model, criterion, images, labels, eps=0.007, device='cpu'):
     images = images.detach().to(device).requires_grad_(True)
     labels = labels.to(device)
 
     p = torch.rand((1,), dtype=torch.float32, device=device)
 
-    if p > attack_p:
-        model.eval()
-        with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
-            logits = model(images)
-            loss = criterion(logits, labels)
+    with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
+        logits = model(images)
+        loss = criterion(logits, labels)
 
-            images_grad = torch.autograd.grad(
-                loss,
-                images,
-                grad_outputs=None,
-                retain_graph=False,
-                create_graph=False
-            )[0]
+        images_grad = torch.autograd.grad(
+            loss,
+            images,
+            grad_outputs=None,
+            retain_graph=False,
+            create_graph=False
+        )[0]
 
-            attack_images = images + eps * images_grad.sign()
-            attack_images = attack_images.clamp(0, 1)
-            model.train()
-            return attack_images, labels
-    else:
-        return images, labels
+        attack_images = images + eps * images_grad.sign()
+        attack_images = attack_images.clamp(0, 1).detach()
+        return attack_images, labels
 
