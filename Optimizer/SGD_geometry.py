@@ -69,7 +69,7 @@ class SGD_NS_Overshoot(Optimizer):
                     continue
 
                 state = self.state[p]
-                ratio = self._compute_trust_ratio(grad, p, state['eps'])
+                ratio = self._compute_trust_ratio(grad, p, 1e-8)
 
                 state['ratio'] = state
 
