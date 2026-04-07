@@ -5,11 +5,11 @@ from torch.fx.passes.shape_prop import ShapeProp
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
-from Activation_Compression.quantizer import Quantizer
-from Activation_Compression.modules.layers import DOLinear, DOConv1d, DOConv2d, DOConv3d, DODepthPointConv2d, RMSNorm
-from Activation_Compression.modules.activations.act_layers import DOReLU_Variance, DOSiLU, DOGELU
-from Activation_Compression.modules.normalization.normalization_layers import DOBatchNorm2d, DOSyncBatchNorm2d
-from Activation_Compression.fusion.fusion_utils import fuse_bn_act
+from Deep_Optimization.Activation_Compression.quantizer import Quantizer
+from Deep_Optimization.Activation_Compression.modules import layers
+from Deep_Optimization.Activation_Compression.modules.activations import act_layers
+from Deep_Optimization.Activation_Compression.modules.normalization import normalization_layers as norm_layers
+from Deep_Optimization.Activation_Compression.fusion.fusion_utils import fuse_bn_act
 
 from torchvision.transforms import v2
 
@@ -183,7 +183,7 @@ class Controller():
                     self.meta[f'{target}'].update({'AVG_ALAM' : False})
                     self.meta[f'{target}'].update({'ALAM_BITS' : 0})
 
-                if isinstance(mod, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, DOLinear, DOConv1d, DOConv2d, DOConv3d)):
+                if isinstance(mod, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, layers.DOLinear, layers.DOConv1d, layers.DOConv2d, layers.DOConv3d)):
                     self.meta[f'{target}'].update({'AVG_ALAM' : False})
                     # self.meta[f'{target}'].update({'bits' : 2})
                 # if isinstance(mod, (nn.BatchNorm2d, nn.SyncBatchNorm, DOBatchNorm2d, DOSyncBatchNorm2d)):
@@ -202,7 +202,7 @@ class Controller():
                     self.meta[f'{target}'].update({'DIVISION' : None})
             
                 if isinstance(mod, nn.Linear):
-                    new_mod = DOLinear(
+                    new_mod = layers.DOLinear(
                         mod.in_features,
                         mod.out_features,
                         clamp_alpha=self.layer_clamp,
@@ -210,7 +210,7 @@ class Controller():
                         meta=self.meta
                     )
                 elif isinstance(mod, nn.Conv1d):
-                    new_mod = DOConv1d(
+                    new_mod = layers.DOConv1d(
                         mod.in_channels, mod.out_channels, mod.kernel_size,
                         mod.stride, mod.padding, mod.dilation, mod.groups, mod.padding_mode,
                         clamp_alpha=self.layer_clamp, target_name=target,
@@ -218,33 +218,33 @@ class Controller():
                     )
                 elif isinstance(mod, nn.Conv2d):
                     if self.config['depth_point_conv']:
-                        new_mod = DODepthPointConv2d(mod.in_channels, mod.out_channels, mod.kernel_size,
+                        new_mod = layers.DODepthPointConv2d(mod.in_channels, mod.out_channels, mod.kernel_size,
                                                     mod.stride, mod.padding, mod.dilation, mod.groups, mod.padding_mode,
                                                     acc_var=self.layer_clamp, target_name=target,
                                                     meta=self.meta)
                     else:
-                        new_mod = DOConv2d(
+                        new_mod = layers.DOConv2d(
                             mod.in_channels, mod.out_channels, mod.kernel_size,
                             mod.stride, mod.padding, mod.dilation, mod.groups, mod.padding_mode,
                             clamp_alpha=self.layer_clamp, target_name=target,
                             meta=self.meta
                         )
                 elif isinstance(mod, nn.Conv3d):
-                    new_mod = DOConv3d(
+                    new_mod = layers.DOConv3d(
                         mod.in_channels, mod.out_channels, mod.kernel_size,
                         mod.stride, mod.padding, mod.dilation, mod.groups, mod.padding_mode,
                         clamp_alpha=self.layer_clamp, target_name=target,
                         meta=self.meta
                     )
                 elif isinstance(mod, nn.BatchNorm2d):
-                    new_mod = DOBatchNorm2d(
+                    new_mod = norm_layers.DOBatchNorm2d(
                         mod.num_features, mod.eps, mod.momentum,
                         mod.affine, mod.track_running_stats,
                         target_name=target,
                         meta=self.meta
                     )
                 elif isinstance(mod, nn.SyncBatchNorm):
-                    new_mod = DOSyncBatchNorm2d(
+                    new_mod = norm_layers.DOSyncBatchNorm2d(
                         mod.num_features, mod.eps, mod.momentum,
                         mod.affine, mod.track_running_stats,
                         mod.process_group,
@@ -252,7 +252,7 @@ class Controller():
                         meta=self.meta
                     )
                 elif isinstance(mod, nn.ReLU):
-                    new_mod = DOReLU_Variance(
+                    new_mod = act_layers.DOReLU_Variance(
                         inplace=False,
                         relu=True,
                         relu6=False,
@@ -260,7 +260,7 @@ class Controller():
                         meta=self.meta
                     )
                 elif isinstance(mod, nn.ReLU6):
-                    new_mod = DOReLU_Variance(
+                    new_mod = act_layers.DOReLU_Variance(
                         inplace=False,
                         relu=False,
                         relu6=True,
@@ -268,13 +268,13 @@ class Controller():
                         meta=self.meta
                     )
                 elif isinstance(mod, nn.SiLU):
-                    new_mod = DOSiLU(
+                    new_mod = act_layers.DOSiLU(
                         inplace=False,
                         target_name=target,
                         meta=self.meta
                     )
                 elif isinstance(mod, nn.GELU):
-                    new_mod = DOGELU(
+                    new_mod = act_layers.DOGELU(
                         inplace=False,
                         target_name=target,
                         meta=self.meta
@@ -282,11 +282,11 @@ class Controller():
                 
                 if self.config['rms_norm']:
                     if isinstance(mod, nn.LayerNorm):
-                        new_mod = RMSNorm(
+                        new_mod = layers.RMSNorm(
                             dims=mod.normalized_shape[-1]
                         )
 
-                if not isinstance(new_mod, DODepthPointConv2d) and hasattr(mod, 'weight'):
+                if not isinstance(new_mod, layers.DODepthPointConv2d) and hasattr(mod, 'weight'):
                     with torch.no_grad():
                         new_mod.weight.copy_(mod.weight)
                 

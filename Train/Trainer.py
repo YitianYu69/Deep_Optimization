@@ -78,8 +78,8 @@ class Trainer():
 
         # Check confliction
         assert (self.QAT != self.amp_enable) or (not self.QAT and not self.amp_enable), "Please choose either QAT=True, or amp_enable=True!"
-        assert self.DS_config is None and self.DDP_config is None, "Please choose either Deep Speed, or DDP!"
-        assert self.DS_config is None and self.ACT_config is None, "Please choose either Deep Speed, or Activation Compression!"
+        assert not (self.DS_config is not None and self.DDP_config is not None) , "Please choose either Deep Speed, or DDP!"
+        assert not (self.DS_config is not None and self.ACT_config is not None), "Please choose either Deep Speed, or Activation Compression!"
         assert not (self.ACT_config is not None and self.train_dataloader is None), "Please also pass the train_dataloader when ACT is enabled!"
 
 
@@ -226,7 +226,7 @@ class Trainer():
                 self.act_controller.iterate(criterion=self.cri)
                 self.act_controller.warp_model(graph_mode=True, quantizer=True)
 
-                model = self.act_controller.traced_model
+                engine = self.act_controller.traced_model
                 logger.info("Model Wrap Type: Activation Compression")
 
         else:
