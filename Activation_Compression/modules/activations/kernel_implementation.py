@@ -226,8 +226,8 @@ def silu_fwd_fused_quan_pack_triton(
 
     act = sigmoid + x * sigmoid * (1.0 - sigmoid)
 
-    act = tl.clamp(act, -3, 3)
-    act = libdevice.tanh(act / 0.5) * 0.5
+    # act = tl.clamp(act, -3, 3)
+    # act = libdevice.tanh(act / 0.5) * 0.5
 
     max = tl.max(act, axis=0)
     min = tl.min(act, axis=0)
@@ -516,8 +516,8 @@ def gelu_fwd_fused_quan_pack_triton(
     du_dx = a * (1.0 + 3.0 * b * x2)
     dydx = 0.5 * (1.0 + t) + 0.5 * x * dt * du_dx
 
-    dydx = tl.clamp(dydx, -3.0, 3.0)
-    dydx = libdevice.tanh(dydx / 0.5) * 0.5
+    # dydx = tl.clamp(dydx, -3.0, 3.0)
+    # dydx = libdevice.tanh(dydx / 0.5) * 0.5
 
     max = tl.max(dydx, axis=1)
     min = tl.min(dydx, axis=1)

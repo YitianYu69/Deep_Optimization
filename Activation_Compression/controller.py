@@ -243,7 +243,7 @@ class Controller():
                         target_name=target,
                         meta=self.meta
                     )
-                elif isinstance(mod, nn.SyncBatchNorm):
+                elif isinstance(mod, nn.BatchNorm2d) and self.config.get('SyncBatchNorm', False):
                     new_mod = norm_layers.DOSyncBatchNorm2d(
                         mod.num_features, mod.eps, mod.momentum,
                         mod.affine, mod.track_running_stats,
