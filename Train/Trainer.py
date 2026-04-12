@@ -10,14 +10,14 @@ from torchmetrics import Metric
 
 import deepspeed
 
-from Train.log import get_logger
-from Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat, Setup_Criterion
-from Train.utils_ddp import rank0
+from Deep_Optimization.Train.log import get_logger
+from Deep_Optimization.Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat, Setup_Criterion
+from Deep_Optimization.Train.utils_ddp import rank0, setup_ddp
 
-from Activation_Compression.controller import Controller
-from Activation_Compression.modules.layers import DOConv1d, DOConv2d
+from Deep_Optimization.Activation_Compression.controller import Controller
+from Deep_Optimization.Activation_Compression.modules.layers import DOConv1d, DOConv2d
 
-from Adversarial_Attack.FGSM import FGSM_attack
+from Deep_Optimization.Adversarial_Attack.FGSM import FGSM_attack
 
 import time
 from typing import Union, Callable, Dict, Optional
@@ -193,7 +193,10 @@ class Trainer():
                 self.act_controller.warp_model(graph_mode=True, quantizer=True)
 
                 model = self.act_controller.traced_model
-                logger.info("Model Inner Wrap Type: Activation Compression")
+                if rank0():
+                    logger.info("Model Inner Wrap Type: Activation Compression")
+            else:
+                model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
             if rank0() and self.DDP_config.get('broadcast_buffers', True):
                 logger.info('Please turn off the broadcast_buffers if you used the torch.nn.SyncBatchNorm.convert_sync_batchnorm().')
@@ -212,7 +215,8 @@ class Trainer():
                 model,
                 device_ids=self.DDP_config.get('device_ids'),
                 **ddp_kwargs)
-            # (belt-and-suspenders) replace the logger with a no-op
+            
+            # replace the logger with a no-op
             class _NoopDDPLogger:
                 def set_runtime_stats_and_log(self, *a, **k): pass
                 def set_and_log_parameter(self, *a, **k): pass
@@ -370,7 +374,7 @@ class Trainer():
         data_len = self._guard_all_reduce_SUM(data_len)
         computed_metrics['Loss'] = total_loss.item() / data_len.item()
         computed_metrics['Time'] = end_time - start_time
-        computed_metrics["Total_Step_Time"] = (cuda_time / 1000)
+        computed_metrics['Total_Step_Time'] = (cuda_time / 1000)
         computed_metrics['Throughput'] = len(self.train_dataloader.dataset) / (cuda_time / 1000)
         for k, v in self.metrics.items():
             computed_metrics[k] = v.compute()

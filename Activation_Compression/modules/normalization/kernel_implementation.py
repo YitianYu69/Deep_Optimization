@@ -162,7 +162,7 @@ def bn_fwd_norm_quant_pack_fused_kernel(
 
     x_hat = tl.clamp(x_hat, -3, 3)
 
-    x_hat = libdevice.tanh(x_hat * 0.5) / 0.5
+    # x_hat = libdevice.tanh(x_hat * 0.5) / 0.5
     # x_hat = x_hat * tl.sigmoid(x_hat)
 
     max = tl.max(x_hat, axis=1)

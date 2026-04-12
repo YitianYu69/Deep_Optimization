@@ -55,7 +55,7 @@ def quant_pack_kernel(
     if CLAMP:
         x = tl.clamp(x, -CLAMP_ALPHA, CLAMP_ALPHA)
 
-    x = libdevice.tanh(x / 0.5) * 0.5
+    # x = libdevice.tanh(x / 0.5) * 0.5
 
     xmax = tl.max(x, axis=0)
     xmin = tl.min(x, axis=0)
