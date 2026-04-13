@@ -102,12 +102,9 @@ class DOSyncBatchNorm2d(nn.SyncBatchNorm):
                 exponential_average_factor, self.eps,
                 self.quantizer, self.target_name, self.graph_mode, self.meta, self.ema_grad_meta)
         else:
-            if not self.ddp_gpu_size:
-                raise AttributeError('SyncBatchNorm is only supported within torch.nn.parallel.DistributedDataParallel')
-
             assert self.training
             return _DOSyncBatchNorm.apply(
-                input, self.weight, self.bias, self.running_mean, self.running_var,
+                x, self.weight, self.bias, self.running_mean, self.running_var,
                 self.eps, exponential_average_factor, process_group, world_size, 
                 self.target_name, self.meta, self.ema_grad_meta)
         

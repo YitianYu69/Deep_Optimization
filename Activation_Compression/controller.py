@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.fx as FX
+import torch.nn.functional as F
 from torch.fx.passes.shape_prop import ShapeProp
 from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -60,8 +61,13 @@ class Controller():
 
         self.layer_clamp = 3.0
 
+
+
     def warp_model(self, graph_mode=False, quantizer=False):
         traced_model = FX.symbolic_trace(self.model)
+        transformer = ReplaceFunctionalActivation(traced_model)
+        traced_model = transformer.transform()
+
         named_mods = dict(traced_model.named_modules())
 
         with FakeTensorMode(allow_non_fake_inputs=True):
@@ -237,20 +243,24 @@ class Controller():
                         meta=self.meta
                     )
                 elif isinstance(mod, nn.BatchNorm2d):
+                    if self.config.get('SyncBatchNorm', False):
+                        self.meta[f"sync_{target}"] = self.meta[f'{target}']
+                        self.meta.pop(f"{target}", None)
+
                     new_mod = norm_layers.DOBatchNorm2d(
                         mod.num_features, mod.eps, mod.momentum,
                         mod.affine, mod.track_running_stats,
                         target_name=target,
                         meta=self.meta
                     )
-                elif isinstance(mod, nn.BatchNorm2d) and self.config.get('SyncBatchNorm', False):
-                    new_mod = norm_layers.DOSyncBatchNorm2d(
-                        mod.num_features, mod.eps, mod.momentum,
-                        mod.affine, mod.track_running_stats,
-                        mod.process_group,
-                        target_name=target,
-                        meta=self.meta
-                    )
+                # elif isinstance(mod, nn.BatchNorm2d) and self.config.get('SyncBatchNorm', False):
+                #     new_mod = norm_layers.DOSyncBatchNorm2d(
+                #         mod.num_features, mod.eps, mod.momentum,
+                #         mod.affine, mod.track_running_stats,
+                #         mod.process_group,
+                #         target_name=target,
+                #         meta=self.meta
+                #     )
                 elif isinstance(mod, nn.ReLU):
                     new_mod = act_layers.DOReLU_Variance(
                         inplace=False,
@@ -388,3 +398,29 @@ def compute_activation_size_in_bytes(node):
         numel *= s
     act_size = numel * torch.tensor([], dtype=tm.dtype).element_size()
     return act_size / (1024 ** 2)
+
+
+
+
+class ReplaceFunctionalActivation(FX.Transformer):
+    def __init__(self, module):
+        super().__init__(module)
+        self.counter = 0
+
+    def call_function(self, target, args, kwargs):
+        if target in (F.relu, torch.relu):
+            return self._replace_with_module(nn.ReLU, args, 'relu')
+        elif target in (F.silu,):
+            return self._replace_with_module(nn.SiLU, args, 'silu')
+        elif target in (F.gelu,):
+            return self._replace_with_module(nn.GELU, args, 'gelu')
+        return super().call_function(target, args, kwargs)
+        
+    def _replace_with_module(self, module_cls, args, name):
+        name = f"{name}_{self.counter}"
+        self.counter += 1
+
+        mol = module_cls()
+
+        self.module.add_module(name, mol)
+        return self.call_module(name, args, {})

@@ -16,6 +16,7 @@ from Deep_Optimization.Train.utils_ddp import rank0, setup_ddp
 
 from Deep_Optimization.Activation_Compression.controller import Controller
 from Deep_Optimization.Activation_Compression.modules.layers import DOConv1d, DOConv2d
+from Deep_Optimization.Activation_Compression.modules.normalization.norm_layer_utils import convert_do_sync_batchnorm
 
 from Deep_Optimization.Adversarial_Attack.FGSM import FGSM_attack
 
@@ -193,6 +194,8 @@ class Trainer():
                 self.act_controller.warp_model(graph_mode=True, quantizer=True)
 
                 model = self.act_controller.traced_model
+                if self.ACT_config.get('SyncBatchNorm', False):
+                    model = convert_do_sync_batchnorm(model)
                 if rank0():
                     logger.info("Model Inner Wrap Type: Activation Compression")
             else:
