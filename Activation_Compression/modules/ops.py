@@ -171,7 +171,7 @@ class _DOConvnd(Function):
         if torch.is_autocast_enabled("cuda"):
             target_dtype = torch.get_autocast_dtype("cuda")
             dy = dy.to(target_dtype)
-            weight_compute = weight_master.to(torch.bfloat16)
+            weight_compute = weight_master.to(target_dtype)
         else:
             weight_compute = weight_master
 

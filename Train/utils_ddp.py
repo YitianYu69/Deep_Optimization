@@ -10,7 +10,6 @@ def setup_ddp(rank=None, world_size=None):
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["LOCAL_RANK"] = str(rank)
-        torch.cuda.set_device(rank)
 
 
     dist.init_process_group(
@@ -23,7 +22,7 @@ def setup_ddp(rank=None, world_size=None):
     world_size = dist.get_world_size()
     device = f'cuda:{local_rank}'
 
-    torch.cuda.set_device(device)
+    torch.cuda.set_device(local_rank)
     return local_rank, global_rank, world_size, device
 
 

@@ -30,6 +30,7 @@ class _DOBatchNorm(Function):
         num_stages = 5
         momentum  = exponential_average_factor
 
+        input = input.float()
         N, C, H, W = input.shape
 
         HW = H * W
@@ -53,8 +54,14 @@ class _DOBatchNorm(Function):
                 num_warps=num_warps, num_stages=num_stages
             )
 
+            m = x3.numel() // x3.size(1)   # samples per channel
+            if m > 1:
+                var_unbiased = var * (m / (m - 1))
+            else:
+                var_unbiased = var
+
             running_mean.mul_(1.0 - momentum).add_(mean, alpha=momentum)
-            running_var.mul_(1.0 - momentum).add_(var, alpha=momentum)
+            running_var.mul_(1.0 - momentum).add_(var_unbiased, alpha=momentum)
 
             y = y3.view(N, C, H, W)
 
@@ -82,8 +89,14 @@ class _DOBatchNorm(Function):
                 num_warps=num_warps, num_stages=num_stages 
             )
 
-            running_mean.mul_(1.0 - momentum).add_(mean, alpha=momentum)
-            running_var.mul_(1.0 - momentum).add_(var, alpha=momentum)
+            m = x3.numel() // x3.size(1)   # samples per channel
+            if m > 1:
+                var_unbiased = var * (m / (m - 1))
+            else:
+                var_unbiased = var
+                
+            running_mean.mul_(1.0 - momentum).add_(mean.float(), alpha=momentum)
+            running_var.mul_(1.0 - momentum).add_(var_unbiased.float(), alpha=momentum)
 
             y = y.view(N, C, H, W)
 
@@ -178,6 +191,8 @@ class _DOSyncBatchNorm(Function):
     def forward(ctx, input, weight, bias, running_mean, running_var, eps, momentum, process_group, world_size,
                 target_name, meta, ema_grad_meta):
         ctx.set_materialize_grads(False)
+
+        input = input.float()
         
         count = torch.empty(1,
                             dtype=running_mean.dtype,
