@@ -21,10 +21,11 @@ from Deep_Optimization.Activation_Compression.controller import Controller
 import Deep_Optimization.Activation_Compression.modules.layers  as layers
 from Deep_Optimization.Activation_Compression.modules.normalization.norm_layer_utils import convert_do_sync_batchnorm
 
-from Deep_Optimization.Adversarial_Attack.FGSM import FGSM_attack, PGD_attack
+from Deep_Optimization.Adversarial_Attack.FGSM import FGSM_attack, PGD_attack, TRADES_attack
 from Deep_Optimization.Optimizer.SGD_geometry import SGD_NS_Overshoot, SGD_NS_Overshoot_Noise
 
 import torchattacks
+import torch_dct as dct
 
 import time
 import copy
@@ -44,7 +45,7 @@ class Trainer():
                  CUDA_Graph: bool = False,
                  Trainer_config: Dict = None,
                  QAT: bool = False,
-                 Adversarial_Attack: Dict = None,
+                 Adversarial_Attack: Dict = {},
                  amp_enable: bool = True,
                  dataloader: DataLoader = None,
                  sub_data_portion: float = 1.0,
@@ -93,6 +94,11 @@ class Trainer():
         assert not (self.DS_config is not None and self.ACT_config is not None), "Please choose either Deep Speed, or Activation Compression!"
         assert not (self.ACT_config is not None and self.train_dataloader is None), "Please also pass the train_dataloader when ACT is enabled!"
 
+        if self.Adversarial_Attack:
+            assert 'Attack_Type' in self.Adversarial_Attack, "Please provide Attack_Type inside of the Adversarial_Attack config"
+            assert 'mu' in self.Adversarial_Attack, "Please provide mu inside of the Adversarial_Attack config"
+            assert 'std' in self.Adversarial_Attack, "Please provide mu inside of the Adversarial_Attack config"
+
         if self.Trainer_config.get("Multi_View", False) and self.Adversarial_Attack is None:
             raise ValueError("Current Multi_View only support adversaria attack!")
 
@@ -111,7 +117,7 @@ class Trainer():
         
         # Check for compile
         if compile_type is not None:
-            assert ACT_config is not None, "Please turn off compile for when ACT is enabled, they are not compatible at the moment!"
+            assert ACT_config is None, "Please turn off compile for when ACT is enabled, they are not compatible at the moment!"
 
             fullgraph = False if self.DS_config is not None else True
             model.compile(fullgraph=fullgraph, mode=compile_type)
@@ -175,8 +181,8 @@ class Trainer():
         assert not (self.metrics is None), "Please pass metrics into the Trainer when declare it as a dict."
         return self._training(epoch_idx, turned_on=turned_on, epoch=epoch)
     
-    def valid(self, dataloader, attack = False, rs=False, target_top2=False, PGD=False, num_iters=7, eps=8/255, random_eps=8/255, alpha=10/255, use_auto=False, last_valid=False):
-        return self._validation(dataloader, attack=attack, rs=rs, target_top2=target_top2, PGD=PGD, num_iters=num_iters, eps=eps, random_eps=random_eps, alpha=alpha, use_auto=use_auto, last_valid=last_valid)
+    def valid(self, dataloader, attack = False, rs=False, target_top2=False, PGD=False, num_iters=7, eps=8/255, random_eps=8/255, alpha=10/255, LI=True, num_class=10, use_auto=False, last_valid=False):
+        return self._validation(dataloader, attack=attack, rs=rs, target_top2=target_top2, PGD=PGD, num_iters=num_iters, eps=eps, random_eps=random_eps, alpha=alpha, LI=LI, num_class=num_class, use_auto=use_auto, last_valid=last_valid)
     
     def get_Engine(self):
         return self.engine
@@ -201,10 +207,15 @@ class Trainer():
         
         modules = []
         for m in self.engine.modules():
-            if isinstance(m, (nn.Linear, nn.Conv2d, layers.DOLinear, layers.DOConv2d)):
-                modules.append(m)
+            if isinstance(m, (nn.Conv2d, layers.DOConv2d)):
+                if m.kernel_size[0] == m.kernel_size[1] and m.kernel_size[1] > 1:
+                    modules.append(m)
         
-        modules[-1].register_forward_hook(forward_hook())
+        if modules:
+            modules[-1].register_forward_hook(forward_hook())
+        else:
+            if rank0():
+                logger.info('Apply fwd hook to extract fwd activatin failed')
 
     
     def _wrap_model_to_engine(self, model, wrap_type='raw'):
@@ -300,12 +311,12 @@ class Trainer():
                     EMA_teacher_controller = self.Trainer_config.get("EMA_Teacher", {})
                     ema_logits = None
                     if self.ema is not None and isinstance(self.ema, EMA) and len(EMA_teacher_controller) != 0:
-                        if epoch >= EMA_teacher_controller.get("Start_Epoch", 6):
+                        if epoch >= EMA_teacher_controller.get("Start_Epoch", 6) and (EMA_teacher_controller.get("full_logits", False) or EMA_teacher_controller.get("clean_logits", False)):
                             with torch.no_grad():
                                 with self.ema.average_parameters(self.engine):
                                     ema_logits = self.engine(data)
 
-                        if self.Trainer_config.get("SAM", False):
+                        if self.Trainer_config.get("SAM", {}) and self.Trainer_config.get("SAM", {}).get('turn_on', False):
                             backup = self._sam(step, data, target)
 
                         logits = self.engine(data)
@@ -315,7 +326,7 @@ class Trainer():
                             q = F.softmax(ema_logits.detach(), dim=1)
                             dl_loss = F.kl_div(log_p, q, reduction='batchmean')
                     else:
-                        if self.Trainer_config.get("SAM", False):
+                        if self.Trainer_config.get("SAM", {}) and self.Trainer_config.get("SAM", {}).get('turn_on', False):
                             backup = self._sam(step, data, target)
 
                         logits = self.engine(data)
@@ -324,7 +335,7 @@ class Trainer():
                         ori_loss = self.cri['Train'](logits, labels=target) if self.teacher_model is None else self.cri['Train'](logits, labels=target, teacher_logits=teacher_logits)
                     # elif isinstance(self.cri, nn.CrossEntropyLoss):
                     else:
-                        # ori_loss = self.cri['Train'](logits, target) + soft_margin_loss(logits, target)
+                        # log_logit_stats(logits, labels=target, logger=logger)
                         ori_loss = self.cri['Train'](logits, target)
 
                         if self.Trainer_config.get("Multi_View", False):
@@ -348,6 +359,12 @@ class Trainer():
                             if 'PGD' in attack_types:
                                 view_types.append('PGD')
                                 num_chunks += 1
+                            if 'TRADES' in attack_types:
+                                view_types.append('TRADES')
+                                num_chunks += 1
+                            if self.Trainer_config.get('Freq_View', False):
+                                view_types.append('Freq')
+                                num_chunks += 1
                                 
                             assert logits.size(0) == target.size(0)
                             assert logits.size(0) % num_chunks == 0, (
@@ -356,10 +373,10 @@ class Trainer():
                             )
 
                             logits_chunks = logits.chunk(num_chunks, dim=0)
-                            # target_chunks = target.chunk(num_chunks, dim=0)
+                            target_chunks = target.chunk(num_chunks, dim=0)
 
                             logits_view_map = dict(zip(view_types, logits_chunks))
-                            # target_view_map = dict(zip(view_types, target_chunks))
+                            target_view_map = dict(zip(view_types, target_chunks))
 
                             if ema_logits is not None and EMA_teacher_controller.get("clean_logits", False):
                                 target_ema_logits = ema_logits.chunk(num_chunks, dim=0)
@@ -372,46 +389,96 @@ class Trainer():
                             if "FGSM" in attack_types:
                                 if 'FGSM_Small' in view_types:
                                     attack_key = 'FGSM_Small'
+                                    both = True
                                 else:
                                     attack_key = 'FGSM'
-                                kl1 = F.kl_div(
-                                    F.log_softmax(logits_view_map[attack_key] / T, dim=1),
-                                    F.softmax(kl_clean_logits.detach() / T, dim=1),
-                                    reduction='batchmean'
-                                )
-                                ori_loss += kl1 * (T * T)
+                                    both = False
+                                # kl1 = F.kl_div(
+                                #     F.log_softmax(logits_view_map[attack_key] / T, dim=1),
+                                #     F.softmax(kl_clean_logits.detach() / T, dim=1),
+                                #     reduction='batchmean'
+                                # )
+                                # kl1 = F.kl_div(
+                                #     F.log_softmax(kl_clean_logits / T, dim=1),
+                                #     F.softmax(logits_view_map[attack_key] / T, dim=1),
+                                #     reduction='batchmean'
+                                # )
+                                # ori_loss += kl1 * (T * T)
+                           
                             if "FGSM_RS" in attack_types:
                                 if 'FGSM_RS_Small' in view_types:
                                     attack_key = 'FGSM_RS_Small'
+                                    both = True
                                 else:
                                     attack_key = 'FGSM_RS'
-                                kl2 = F.kl_div(
-                                    F.log_softmax(logits_view_map[attack_key] / T, dim=1),
-                                    F.softmax(kl_clean_logits.detach() / T, dim=1),
-                                    reduction='batchmean'
-                                )
-                                ori_loss += kl2 * (T * T)
+                                    both = False
+                                # kl2 = F.kl_div(
+                                #     F.log_softmax(logits_view_map[attack_key] / T, dim=1),
+                                #     F.softmax(kl_clean_logits.detach() / T, dim=1),
+                                #     reduction='batchmean'
+                                # )
+                                # kl2 = F.kl_div(
+                                #     F.log_softmax(kl_clean_logits / T, dim=1),
+                                #     F.softmax(logits_view_map[attack_key] / T, dim=1),
+                                #     reduction='batchmean'
+                                # )
+                                # ori_loss += kl2 * (T * T)
+                      
                             if "PGD" in attack_types:
+                                # kl3 = F.kl_div(
+                                #     F.log_softmax(logits_view_map['PGD'] / T, dim=1),
+                                #     F.softmax(kl_clean_logits.detach() / T, dim=1),
+                                #     reduction='batchmean'
+                                # )
+
                                 kl3 = F.kl_div(
-                                    F.log_softmax(logits_view_map['PGD'] / T, dim=1),
-                                    F.softmax(kl_clean_logits.detach() / T, dim=1),
+                                    F.log_softmax(kl_clean_logits / T, dim=1),
+                                    F.softmax(logits_view_map['PGD'] / T, dim=1),
                                     reduction='batchmean'
                                 )
+                           
                                 kl_weight = attack_types.get('PGD', {}).get('kl_weight', 1.0)
                                 ori_loss += kl3 * (T * T) * kl_weight
 
+                            if "TRADES" in attack_types:
+                                kl4 = F.kl_div(
+                                    F.log_softmax(logits_view_map['TRADES'] / T, dim=1),
+                                    F.softmax(kl_clean_logits.detach() / T, dim=1),
+                                    reduction='batchmean'
+                                )
+                                beta = attack_types.get('TRADES', {}).get('beta', 1.0)
+                                ori_loss += (kl4 * (T * T)) * beta * (1 / len(kl_clean_logits))
 
+                            if len(self.Trainer_config.get('Soft_Margin_Loss', {})) != 0:
+                                sml_name = self.Trainer_config['Soft_Margin_Loss'].get('logits_name', 'Clean')
+                                ori_loss += top_pred_correction_loss(logits_view_map[sml_name], target_view_map[sml_name], T=1.5)
+                                ori_loss += 1 * soft_margin_loss_V2(logits_view_map[sml_name], target_view_map[sml_name], T=1.5)
+                                ori_loss += 5 * soft_margin_loss_V1(logits_view_map[sml_name], target_view_map[sml_name], T=1.5)
 
                         if self.ema is not None and isinstance(self.ema, EMA) and len(self.Trainer_config.get("EMA_Proximal_Loss", {})) != 0 and epoch >= self.Trainer_config.get("EMA_Proximal_Loss", {}).get("Start_Epoch", 6):
                             rho = self.Trainer_config.get("EMA_Proximal_Loss", {}).get("rho", 5e-4)
 
                             prox = self.ema.prox_term(self.engine)
-                            ori_loss += 0.5 * rho * prox
+                            ori_loss += rho / 2 * prox
 
-                        if len(self.Trainer_config.get("L1_Sparse_Loss", {})) != 0:
+                        if len(self.Trainer_config.get("L1_Sparse_Loss", {})) != 0 and self.l1_act is not None:
                             trust_ratio = self.Trainer_config['L1_Sparse_Loss'].get('trust_ratio', 0.001)
                             l1_s_loss = self.l1_act.abs().mean()
                             ori_loss += trust_ratio * l1_s_loss
+
+                            clean_act, _, _, pgd_act, _ = self.l1_act.chunk(5, dim=0)
+                            freq_loss = freq_match_loss(
+                                feat_clean=clean_act,
+                                feat_adv=pgd_act,
+                                spectrum_mode="amp",
+                                loss_mode="wasserstein",
+                                low=0.0,
+                                high=1.0,
+                                detach_clean=True,
+                            )
+                            ori_loss += freq_loss
+
+
 
 
                         if epoch >= EMA_teacher_controller.get("Start_Epoch", 6) and EMA_teacher_controller.get("full_logits", False):
@@ -459,7 +526,7 @@ class Trainer():
                     if self.grad_norm_clip:
                         torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
 
-                    if self.Trainer_config.get("SAM", False):
+                    if self.Trainer_config.get("SAM", {}) and self.Trainer_config.get("SAM", {}).get('turn_on', False):
                             self._de_sam(backup)
 
                     self.scaler.step(self.opt)
@@ -468,7 +535,7 @@ class Trainer():
                     if self.grad_norm_clip:
                         torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
 
-                    if self.Trainer_config.get("SAM", False):
+                    if self.Trainer_config.get("SAM", {}) and self.Trainer_config.get("SAM", {}).get('turn_on', False):
                         self._de_sam(backup)
 
                     self.opt.step()
@@ -530,15 +597,18 @@ class Trainer():
                     eps = as_tuple(attack_types.get('FGSM', {}).get('eps', 8/255))
                     alpha = as_tuple(attack_types.get('FGSM_RS', {}).get('alpha', 10/255))
                     random_eps = as_tuple(attack_types.get('FGSM_RS', {}).get('random_eps', 8/255))
+                    LI = attack_types.get('LIET', {}).get('LI', False,)
+                    num_class = attack_types.get('LIET', {}).get('num_class', 10)
 
 
                     if both:
                         len_target = len(eps) + len(alpha)
                     else:
                         len_target = max(len(eps), len(alpha))
+                        assert len_target < 2, 'Single view does not suppot multi-attacks, pls turn on Multi_View'
 
                     FGSM_attacked_data_chunks = FGSM_attack(self.engine, self.cri['Valid'], data, target, 
-                                                                  both=both, 
+                                                                  both=both, LI=LI, num_class=num_class,
                                                                   eps=eps, random_eps=random_eps, alpha=alpha,
                                                                   mu=mu,
                                                                   std=std,
@@ -561,6 +631,17 @@ class Trainer():
                                                     )
                 else:
                     PGD_attacked_data_chunks = None
+
+                if "TRADES" in attack_types:
+                    random_eps = attack_types.get('TRADES', {}).get('random_eps', 8/255)
+                    alpha = attack_types.get('TRADES', {}).get('alpha', 2/255)
+                    num_iters = attack_types.get('TRADES', {}).get('num_iters', 7)
+
+                    TRADES_attacked_data_chunks = TRADES_attack(self.engine, data, labels=target,
+                                                                num_iters=num_iters, random_eps=random_eps, alpha=alpha,
+                                                                mu=mu, std=std)
+                else:
+                    TRADES_attacked_data_chunks = None
                 
                 if self.Trainer_config.get("Multi_View", False):
                     data = denorm(data, mu, std)
@@ -578,6 +659,14 @@ class Trainer():
                     if PGD_attacked_data_chunks is not None:
                         temp_data_chunks.append(PGD_attacked_data_chunks)
                         temp_target_chunks.append(target)
+                    if TRADES_attacked_data_chunks is not None:
+                        temp_data_chunks.append(TRADES_attacked_data_chunks)
+                        temp_target_chunks.append(target)
+                    if self.Trainer_config.get('Freq_View', False):
+                        freq_view = generate_freq_view(data, mu, std)
+                        temp_data_chunks.append(freq_view)
+                        temp_target_chunks.append(target)
+
 
                     data = torch.cat(temp_data_chunks, dim=0)
                     data = transforms.Normalize(mu, std)(data)
@@ -589,6 +678,9 @@ class Trainer():
                         data = transforms.Normalize(mu, std)(data)
                     elif PGD_attacked_data_chunks is not None:
                         data = PGD_attacked_data_chunks
+                        data = transforms.Normalize(mu, std)(data)
+                    elif TRADES_attacked_data_chunks is not None:
+                        data = TRADES_attacked_data_chunks
                         data = transforms.Normalize(mu, std)(data)
 
 
@@ -634,6 +726,7 @@ class Trainer():
                     eps: float = 8/255,
                     random_eps: float = 8/255,
                     alpha: float = 10/255,
+                    LI: bool = True, num_class=10,
                     use_auto: bool = False,
                     last_valid: bool = False):
         total_loss, data_len = torch.tensor(0.0, dtype=torch.float32, device=self.device), torch.tensor(0, dtype=torch.long, device=self.device)
@@ -678,7 +771,7 @@ class Trainer():
                                 if not PGD:
                                     data = FGSM_attack(self.engine, self.cri['Valid'], data, target, 
                                                             random_start=rs, mu=mu, std=std,
-                                                            eps=as_tuple(eps), alpha=as_tuple(alpha),
+                                                            eps=as_tuple(eps), alpha=as_tuple(alpha), LI=LI, num_class=num_class,
                                                             target_top2=target_top2,
                                                             device=self.device)
                                 if PGD:
@@ -740,91 +833,73 @@ class Trainer():
             self.opt.move_to_overshoot()
 
         return computed_metrics
+    
 
     def _sam(self, step, data, target):
         if step <= 1:
             return None
-
+        
         logits = self.engine(data)
         loss = self.cri['Train'](logits, target)
         loss.backward()
 
-        rho = 0.1
+        rho = self.Trainer_config.get("SAM", {}).get('rho', 0.05)
+        use_opt = self.Trainer_config.get("SAM", {}).get('use_optim', False)
+        adaptive = self.Trainer_config.get("SAM", {}).get('adaptive', False)
         backup = {}
 
-        # compute grad norm
-        if not isinstance(self.opt, (SGD_NS_Overshoot, SGD_NS_Overshoot_Noise)):
-            grad_norm = torch.norm(
-                torch.stack([
-                    p.grad.norm(p=2)
-                    for p in self.engine.parameters()
-                    if p.grad is not None
-                ])
-            )
-        else:
-            cache_grad = []
+        cache = []
+
+        # Compute grad norm
+        if isinstance(self.opt, (SGD_NS_Overshoot, SGD_NS_Overshoot_Noise)) and use_opt:
+            grad_cache = []
             for group in self.opt.param_groups:
                 for p in group['params']:
                     if p.grad is None:
                         continue
 
-                    grad = self.opt.tiny_max_step(p, momentum=group['momentum'], 
-                                                  dampening=group['dampening'], 
-                                                  rms_beta=group['rms_beta'], 
-                                                  nesterov=group['nesterov'], 
+                    grad = self.opt.tiny_max_step(p,
+                                                  momentum=group['momentum'],
+                                                  dampening=group['dampening'],
+                                                  rms_beta=group['rms_beta'],
+                                                  nesterov=group['nesterov'],
                                                   eps=group['eps'])
-                    
-                    cache_grad.append(grad.norm(p=2))
-            grad_norm = torch.norm(torch.stack(cache_grad))
-
-        # perturb weights
-        if not isinstance(self.opt, (SGD_NS_Overshoot, SGD_NS_Overshoot_Noise)):
-            for name, p in self.engine.named_parameters():
-                if p.grad is None:
-                    continue
-
-                backup[name] = p.data.clone()
-
-                e_w = p.grad / (grad_norm + 1e-12)
-                p.data.add_(rho * e_w)
+                    grad_cache.append(((p.abs() if adaptive else 1.0) * grad).norm(p=2))
+                    cache.append((p, p, grad))
         else:
-            for group in self.opt.param_groups:
-                for p in group['params']:
-                    if p.grad is None:
-                        continue
+            grad_cache = []
+            for p in self.engine.parameters():
+                if p.grad is not None:
+                    grad_cache.append(((p.abs() if adaptive else 1.0) * p.grad).norm(p=2))
+                    cache.append((p, p, p.grad))
 
-                    backup[p] = p.data.clone()
-
-                    grad = self.opt.tiny_max_step(p, momentum=group['momentum'], 
-                                                  dampening=group['dampening'], 
-                                                  rms_beta=group['rms_beta'], 
-                                                  nesterov=group['nesterov'], 
-                                                  eps=group['eps'])
-                    
-                    e_w = grad / (grad_norm + 1e-12)
-                    p.data.add_(rho * e_w)
-
-        self.engine.zero_grad()
+        grad_norm = torch.norm(torch.stack(grad_cache), p=2)
+        grad_cache = None
+        self.engine.zero_grad(set_to_none=True)
+        
+        with torch.no_grad():
+            for key, p, grad in cache:
+                backup[key] = p.data.clone()
+                e_w = rho * (((p.pow(2) if adaptive else 1.0) * grad) / (grad_norm + 1e-8))
+                p.add_(e_w)
 
         return backup
     
+    @torch.no_grad()
     def _de_sam(self, backup):
-        if backup is not None and not isinstance(self.opt, (SGD_NS_Overshoot, SGD_NS_Overshoot_Noise)):
-            for name, p in self.engine.named_parameters():
-                if name in backup:
-                    p.data = backup[name]
+        if backup is None:
+            return 
 
-        if backup is not None and isinstance(self.opt, (SGD_NS_Overshoot, SGD_NS_Overshoot_Noise)):
-            for p in self.engine.parameters():
-                if p in backup:
-                    p.data = backup[p]
+        for p in self.engine.parameters():
+            if p in backup:
+                p.copy_(backup[p])
+            
 
     def get_final_engine(self,):
         self.engine.eval()
 
         if self.ema is None:
             return self.engine
-
 
         # with self.ema.average_parameters(self.engine):
         self.ema.store(self.engine)
@@ -833,6 +908,14 @@ class Trainer():
         self.ema.restore(self.engine)
         return temp_engine
 
+
+def norm(data, mu, std):
+    if not isinstance(mu, torch.Tensor):
+        mu = torch.tensor(mu, device=data.device).view(3, 1, 1)
+    if not isinstance(std, torch.Tensor):
+        std = torch.tensor(std, device=data.device).view(3, 1, 1)
+
+    return (data - mu) / std
     
 
 def denorm(data, mu, std):
@@ -850,14 +933,371 @@ def as_tuple(x):
     return (x,)
 
 
-def soft_margin_loss(logits, target, target_margin=3.0):
-    true_logits = logits.gather(1, target[:, None]).squeeze(1)
+def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True): 
+    prob = F.log_softmax(logits / T, dim=1) 
+    true_prob = prob.gather(1, target[:, None]).squeeze(1) 
+    
+    wrong_prob = prob.clone() 
+    wrong_prob.scatter_(1, target[:, None], value=-1.0) 
+    max_wrong_prob = wrong_prob.max(1).values 
 
-    wrong_logits = logits.clone()
-    wrong_logits.scatter(1, target[:, None], value=1e-9)
-    max_wrong_logits = wrong_logits.max(1).values
+    margin = true_prob - max_wrong_prob
+    gap = target_margin - margin
+    
+    # smooth hinge: approx max(0, target_margin - margin)
+    loss_each = F.softplus(gap)
 
-    margin = true_logits - max_wrong_logits
+    if only_hard:
+        mask = (gap > 0)
+        if mask.any():
+            return loss_each[mask].mean()
+        return logits.sum() * 0.0
+
+    return loss_each.mean()
+
+
+def top_pred_correction_loss(logits, target, T=1.0, beta=10.0):
+    """
+    No-scatter version.
+
+    This mainly affects samples where the top predicted class is not the true class.
+    It does NOT enforce p_true - max_wrong >= margin.
+    """
+
+    prob = F.softmax(logits.float() / T, dim=1)
+
+    true_prob = prob.gather(1, target[:, None]).squeeze(1)
+
+    top_prob, pred = prob.max(dim=1)
+
+    # If correct: margin = 0
+    # If wrong:   margin < 0
+    margin = true_prob - top_prob
+
+    gap = -margin  # only positive when prediction is wrong
+
+    loss_each = F.softplus(beta * gap) / beta
+
+    wrong_mask = pred.ne(target).detach()
+
+    if wrong_mask.any():
+        return loss_each[wrong_mask].mean()
+
+    return logits.sum() * 0.0
+
+def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0):
+    prob = F.log_softmax(logits / T, dim=1)
+
+    true_prob = prob.gather(1, target[:, None]).squeeze(1)
+
+    wrong_prob = prob.clone()
+    # wrong_prob.scatter(1, target[:, None], value=-1.0)
+    max_wrong_prob = wrong_prob.max(1).values
+
+    margin = true_prob - max_wrong_prob
     margin_loss = F.softplus(target_margin - margin)
 
     return margin_loss.mean()
+
+
+def make_low_mid_mask(h, w, ratio=0.6, device='cuda'):
+    fy = torch.fft.fftfreq(h, device=device)
+    fx = torch.fft.fftfreq(w, device=device)
+
+    radius = torch.sqrt(fy ** 2 + fx ** 2)
+    radius = radius / radius.max().clamp_min(1e-8)
+
+    mask = (radius <= ratio)
+    return mask
+
+def generate_freq_view(data, mu, std, sigma=0.1):
+    mu = torch.tensor(mu, device=data.device).view(3,1,1)
+    std = torch.tensor(std, device=data.device).view(3,1,1)
+
+    # data = torch.fft.fft2(data.float(), dim=(-2, -1), norm='ortho')
+    # amp = torch.log1p(data.abs())
+    # phase = torch.angle(data)
+
+    # amp = (amp - amp.mean(dim=(2,3), keepdim=True)) / (amp.std(dim=(2,3), keepdim=True) + 1e-7)
+    # phase = phase / torch.pi
+
+    # data = torch.cat([amp, phase], dim=0)
+
+    data = (data - mu) / std
+    # X = dct.dct_2d(data, norm='ortho')
+
+    # B, C, H, W = X.shape
+    # mask = make_low_mid_mask(H, W, ratio=0.6, device='cuda')
+    # X = X * mask
+    # data = dct.idct_2d(X, norm='ortho')
+
+    noise = torch.randn_like(data) * sigma
+    data = (data + noise).clamp(0, 1)
+
+    return denorm(data, mu, std)
+
+
+def make_radial_freq_mask(
+    h,
+    w,
+    device,
+    low=0.0,
+    high=1.0,
+    return_radius=False,
+):
+    """
+    Create radial mask over FFT frequency coordinates.
+
+    low/high are normalized radius values in [0, 1].
+
+    Returns:
+        mask:   [1, 1, H, W]
+        radius: [H, W] if return_radius=True
+    """
+    assert 0.0 <= low <= 1.0, f"low must be in [0, 1], got {low}"
+    assert 0.0 <= high <= 1.0, f"high must be in [0, 1], got {high}"
+    assert low <= high, f"low must be <= high, got low={low}, high={high}"
+
+    fy = torch.fft.fftfreq(h, device=device).view(h, 1)
+    fx = torch.fft.fftfreq(w, device=device).view(1, w)
+
+    radius = torch.sqrt(fx ** 2 + fy ** 2)
+    radius = radius / radius.max().clamp_min(1e-8)
+
+    mask_2d = (radius >= low) & (radius <= high)
+    mask = mask_2d.float().view(1, 1, h, w)
+
+    if return_radius:
+        return mask, radius, mask_2d
+
+    return mask
+
+
+def _spectrum(feat, mode="log_amp", eps=1e-8):
+    """
+    Convert feature map to frequency spectrum.
+
+    Args:
+        feat: [B, C, H, W]
+
+    mode:
+        "amp"     -> amplitude spectrum
+        "log_amp" -> log amplitude spectrum
+        "power"   -> power spectrum
+    """
+
+    fft = torch.fft.fft2(feat.float(), dim=(-2, -1), norm="ortho")
+    amp = torch.abs(fft)
+
+    if mode == "amp":
+        return amp
+
+    elif mode == "log_amp":
+        return torch.log(amp + eps)
+
+    elif mode == "power":
+        return amp.pow(2)
+
+    else:
+        raise ValueError(f"Unknown spectrum mode: {mode}")
+
+
+def _wasserstein_1d_radial_from_spectrum(
+    spec_adv,
+    spec_clean,
+    radius,
+    mask_2d,
+    eps=1e-8,
+):
+    """
+    Approximate 1D Wasserstein distance over radial frequency order.
+
+    Args:
+        spec_adv:   [B, C, H, W]
+        spec_clean: [B, C, H, W]
+        radius:     [H, W], normalized radial frequency
+        mask_2d:    [H, W], bool mask selecting frequency band
+
+    This is not full 2D optimal transport.
+    It treats spectrum energy as a 1D distribution sorted by radial frequency.
+    """
+
+    B, C, H, W = spec_adv.shape
+
+    spec_adv_flat = spec_adv.reshape(B, C, -1)
+    spec_clean_flat = spec_clean.reshape(B, C, -1)
+
+    radius_flat = radius.reshape(-1)
+    mask_flat = mask_2d.reshape(-1)
+
+    # Select only frequencies inside [low, high].
+    valid_idx = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
+
+    radius_valid = radius_flat[valid_idx]
+    sort_idx = torch.argsort(radius_valid)
+
+    valid_sorted_idx = valid_idx[sort_idx]
+
+    p = spec_adv_flat[..., valid_sorted_idx]
+    q = spec_clean_flat[..., valid_sorted_idx]
+
+    # Wasserstein needs non-negative mass.
+    # amp/power are already non-negative.
+    # For safety, clamp anyway.
+    p = p.clamp_min(0.0) + eps
+    q = q.clamp_min(0.0) + eps
+
+    # Normalize into distributions over selected frequency band.
+    p = p / p.sum(dim=-1, keepdim=True).clamp_min(eps)
+    q = q / q.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+    cdf_p = torch.cumsum(p, dim=-1)
+    cdf_q = torch.cumsum(q, dim=-1)
+
+    return torch.mean(torch.abs(cdf_p - cdf_q))
+
+
+def freq_match_loss(
+    feat_clean,
+    feat_adv,
+    spectrum_mode="log_amp",
+    loss_mode="l1",
+    low=0.0,
+    high=1.0,
+    detach_clean=True,
+    eps=1e-8,
+):
+    """
+    Frequency matching loss between clean and adversarial feature maps.
+
+    Goal:
+        Match adv feature frequency spectrum toward clean feature spectrum.
+
+    Args:
+        feat_clean: [B, C, H, W]
+        feat_adv:   [B, C, H, W]
+
+        spectrum_mode:
+            "amp"
+            "log_amp"
+            "power"
+
+        loss_mode:
+            "l1"
+            "mse"
+            "wasserstein"
+
+        low/high:
+            radial frequency band to match.
+            Example:
+                low=0.0, high=0.35 -> match low/mid frequencies only
+
+        detach_clean:
+            If True, clean feature is treated as target/teacher.
+
+    Returns:
+        scalar loss
+    """
+
+    assert feat_clean.shape == feat_adv.shape, (
+        f"Shape mismatch: clean {feat_clean.shape}, adv {feat_adv.shape}"
+    )
+    assert feat_clean.dim() == 4, (
+        f"Expected [B, C, H, W], got {feat_clean.shape}"
+    )
+
+    if detach_clean:
+        feat_clean = feat_clean.detach()
+
+    B, C, H, W = feat_clean.shape
+
+    spec_clean = _spectrum(feat_clean, mode=spectrum_mode, eps=eps)
+    spec_adv = _spectrum(feat_adv, mode=spectrum_mode, eps=eps)
+
+    mask, radius, mask_2d = make_radial_freq_mask(
+        h=H,
+        w=W,
+        device=feat_clean.device,
+        low=low,
+        high=high,
+        return_radius=True,
+    )
+
+    if loss_mode == "l1":
+        spec_clean = spec_clean * mask
+        spec_adv = spec_adv * mask
+
+        return F.l1_loss(spec_adv, spec_clean)
+
+    elif loss_mode == "mse":
+        spec_clean = spec_clean * mask
+        spec_adv = spec_adv * mask
+
+        return F.mse_loss(spec_adv, spec_clean)
+
+    elif loss_mode == "wasserstein":
+        if spectrum_mode == "log_amp":
+            raise ValueError(
+                "For Wasserstein mode, use spectrum_mode='amp' or 'power', "
+                "because Wasserstein expects non-negative spectrum mass."
+            )
+
+        return _wasserstein_1d_radial_from_spectrum(
+            spec_adv=spec_adv,
+            spec_clean=spec_clean,
+            radius=radius,
+            mask_2d=mask_2d,
+            eps=eps,
+        )
+
+    else:
+        raise ValueError(f"Unknown loss_mode: {loss_mode}")
+    
+
+
+
+@torch.no_grad()
+def log_logit_stats(logits, labels=None, name="logits", logger=None):
+    # Important for AMP/bfloat16/fp16 training
+    logits = logits.detach().float()
+
+    probs = torch.softmax(logits, dim=1)
+
+    norm = logits.norm(p=2, dim=1).float()
+    max_abs = logits.abs().max(dim=1).values.float()
+    conf = probs.max(dim=1).values.float()
+    entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=1).float()
+
+    msg = (
+        f"[{name}] "
+        f"L2 mean={norm.mean().item():.3f}, "
+        f"L2 p95={norm.quantile(0.95).item():.3f}, "
+        f"L2 max={norm.max().item():.3f}, "
+        f"max|logit| mean={max_abs.mean().item():.3f}, "
+        f"max|logit| p95={max_abs.quantile(0.95).item():.3f}, "
+        f"conf mean={conf.mean().item():.4f}, "
+        f"conf p95={conf.quantile(0.95).item():.4f}, "
+        f"entropy mean={entropy.mean().item():.4f}"
+    )
+
+    if labels is not None:
+        labels = labels.detach()
+
+        true_logit = logits.gather(1, labels[:, None]).squeeze(1)
+
+        wrong_logits = logits.clone()
+        wrong_logits.scatter_(1, labels[:, None], float("-inf"))
+        max_wrong_logit = wrong_logits.max(dim=1).values
+
+        margin = (true_logit - max_wrong_logit).float()
+
+        msg += (
+            f", margin mean={margin.mean().item():.3f}, "
+            f"margin p05={margin.quantile(0.05).item():.3f}, "
+            f"margin min={margin.min().item():.3f}"
+        )
+
+    if logger is not None:
+        logger.info(msg)
+    else:
+        print(msg)

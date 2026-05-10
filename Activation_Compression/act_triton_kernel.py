@@ -52,8 +52,8 @@ def quant_pack_kernel(
     # ---- single global load ----
     x = tl.load(x_block_ptr).to(tl.float32)   # [NWORDS * VPW]
 
-    if CLAMP:
-        x = tl.clamp(x, -CLAMP_ALPHA, CLAMP_ALPHA)
+    # if CLAMP:
+    #     x = tl.clamp(x, -CLAMP_ALPHA, CLAMP_ALPHA)
 
     # x = libdevice.tanh(x / 0.5) * 0.5
 
@@ -113,9 +113,9 @@ def quant_pack_kernel(
     # quantize all at once
     qf = (x - xmin) * inv_scale + (0.5 - 1e-6)
 
-    if AVG_ALAM:
-        qf = tl.reshape(qf, (SUB_GROUP, ALAM_BITS))
-        qf = tl.sum(qf, axis=1) / ALAM_BITS
+    # if AVG_ALAM:
+    #     qf = tl.reshape(qf, (SUB_GROUP, ALAM_BITS))
+    #     qf = tl.sum(qf, axis=1) / ALAM_BITS
 
 
     # if AVG_ALAM:
@@ -209,16 +209,16 @@ def dequant_unpack_kernel(
 
     q = ((word[:, None] >> shifts[None, :]) & mask) # [ALAM_NWORDS, VPW]
 
-    if AVG_ALAM:
-        q = tl.reshape(q, (ALAM_NWORDS * VPW,))
-        q = tl.broadcast_to(q[:, None], (SUB_GROUP, ALAM_BITS))
-        q = tl.reshape(q, (SUB_GROUP * ALAM_BITS,))
+    # if AVG_ALAM:
+    #     q = tl.reshape(q, (ALAM_NWORDS * VPW,))
+    #     q = tl.broadcast_to(q[:, None], (SUB_GROUP, ALAM_BITS))
+    #     q = tl.reshape(q, (SUB_GROUP * ALAM_BITS,))
 
-        noise_shape = tl.arange(0, SUB_GROUP * ALAM_BITS)
-        sgd_noise = tl.randn(seed + pid, noise_shape)
-        q += (sgd_noise - 0.5)
-    else:
-        q = q.to(tl.float32)
+    #     noise_shape = tl.arange(0, SUB_GROUP * ALAM_BITS)
+    #     sgd_noise = tl.randn(seed + pid, noise_shape)
+    #     q += (sgd_noise - 0.5)
+    # else:
+    #     q = q.to(tl.float32)
 
     q = q * scale + xmin
 
@@ -392,7 +392,7 @@ def dequant_unpack_triton(packed: torch.Tensor, scale: torch.Tensor, xmin: torch
         num_warps=4,
     )
 
-    return y.view(N, G, group_size)
+    return y.view(N, G, group_size).contiguous()
 
 
 @triton_op("act_lib::pack_triton", mutates_args={})

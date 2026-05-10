@@ -809,35 +809,35 @@ class SGD_NS_Overshoot_Noise(Optimizer):
                 # ----------------------------------------
                 # 6.0 Apply directional conditioned overshoot
                 # ----------------------------------------
-                # if overshoot != 0.0 and momentum != 0.0:
-                #     alignment_gate = self._compute_cosine_similarity(grad, m)
-                #     alignment_gate = alignment_gate / (alignment_gate + 1)
-                #     effective_overshoot = overshoot * alignment_gate
-
-                #     gc = -lr_layer * effective_overshoot / momentum
-                #     mc = -lr_layer * (effective_overshoot - (effective_overshoot / momentum) + 1)
-
-                #     p.add_(grad, alpha=gc)
-                #     p.add_(m, alpha=mc)
-                # else:
-                #     p.add_(m, alpha=-lr_layer)
-                cos = self._compute_cosine_similarity(grad, m)
-
-                if cos > 0:
-                    # aligned → overshoot system
-                    effective_overshoot = overshoot * cos
+                if overshoot != 0.0 and momentum != 0.0:
+                    alignment_gate = self._compute_cosine_similarity(grad, m)
+                    alignment_gate = alignment_gate / (alignment_gate + 1)
+                    effective_overshoot = overshoot * alignment_gate
 
                     gc = -lr_layer * effective_overshoot / momentum
-                    mc = -lr_layer * (effective_overshoot - effective_overshoot / momentum + 1)
+                    mc = -lr_layer * (effective_overshoot - (effective_overshoot / momentum) + 1)
 
                     p.add_(grad, alpha=gc)
                     p.add_(m, alpha=mc)
-                elif cos > -0.3:
-                    # weak conflict → fallback to momentum
-                    p.add_(m, alpha=-lr_layer)
                 else:
-                    # strong conflict → trust gradient
-                    p.add_(grad, alpha=-lr_layer)
+                    p.add_(m, alpha=-lr_layer)
+                # cos = self._compute_cosine_similarity(grad, m)
+
+                # if cos > 0:
+                #     # aligned → overshoot system
+                #     effective_overshoot = overshoot * cos
+
+                #     gc = -lr_layer * effective_overshoot / momentum
+                #     mc = -lr_layer * (effective_overshoot - effective_overshoot / momentum + 1)
+
+                #     p.add_(grad, alpha=gc)
+                #     p.add_(m, alpha=mc)
+                # elif cos > -0.3:
+                #     # weak conflict → fallback to momentum
+                #     p.add_(m, alpha=-lr_layer)
+                # else:
+                #     # strong conflict → trust gradient
+                #     p.add_(grad, alpha=-lr_layer)
 
                 # ----------------------------------------
                 # 7.0 Save previous geometry grad

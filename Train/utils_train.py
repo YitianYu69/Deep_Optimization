@@ -280,7 +280,8 @@ def build_metrics(*, metric_lists: List[str],
                   sync: bool,
                   device: Union[str, torch.device] = "cpu",
                   AUROC_average_type: str = "macro",
-                  top_k: int = 1):
+                  top_k: int = 1,
+                  acc_list: list = ['Accuracy']):
     kwargs = dict(task=task, num_classes=num_classes, average=average_type, sync_on_compute=sync, top_k=top_k)
 
     metrics = {
@@ -292,11 +293,23 @@ def build_metrics(*, metric_lists: List[str],
     }
 
     new_metrics = {}
-    for m in metric_lists:
-        if m not in metrics:
-            raise ValueError(f"Current metric {m} is not supported! Please set it manually!")
-        else:
-            new_metrics[m] = metrics[m]
+    if len(acc_list) == 1:
+        for m in metric_lists:
+            if m not in metrics:
+                raise ValueError(f"Current metric {m} is not supported! Please set it manually!")
+            else:
+                new_metrics[m] = metrics[m]
+    else:
+        metric_lists.remove('Accuracy')
+        acc_list.extend(metric_lists)
+        for m in acc_list:
+            if 'Accuracy' in m:
+                new_metrics[m] = metrics['Accuracy']
+            elif m not in metrics:
+                raise ValueError(f"Current metric {m} is not supported! Please set it manually!")
+            else:
+                new_metrics[m] = metrics[m]
+
     return new_metrics
 
 
@@ -420,7 +433,7 @@ class EMA():
                     )
 
                 # Safer in practice, especially for BN-heavy models:
-                # copy buffers directly instead of EMA-smoothing them.
+                # EMA-smoothing buffers directly instead of copy them.
                 if self._is_bn_stats(n):
                     ema_b.mul_(c_decay).add_(b.detach(), alpha=1 - c_decay)
                 else:

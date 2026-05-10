@@ -36,7 +36,7 @@ def relu_triton(x: torch.Tensor, relu: bool, relu6: bool) -> Tuple[torch.Tensor,
         BLOCK_SIZE=1024
     )
 
-    return y, relu_mask
+    return y.contiguous(), relu_mask
 
 
 @triton_op("act_lib::relu_fwd_fused_pack", mutates_args={})
@@ -48,11 +48,10 @@ def relu_fwd_fused_pack(x: torch.Tensor, relu: bool, relu6: bool, bits: int, gro
 
     input_shape = x.shape
     N = x.shape[0]
-    x2 = x.view(N, -1, group_size)
-    G = x2.shape[1]
 
-    NG = N * G
-    x3 = x2.view(NG, group_size)
+    x3 = x.reshape(-1, group_size)      # [N*G, group_size]
+    G = x3.shape[0] // N
+    NG = x3.shape[0]
 
     y = torch.empty((NG, group_size), dtype=x.dtype, device='cuda')
     packed = torch.empty((NG, NWORDS), dtype=torch.int32, device='cuda')
@@ -69,7 +68,7 @@ def relu_fwd_fused_pack(x: torch.Tensor, relu: bool, relu6: bool, bits: int, gro
         VPW=VPW,
         NWORDS=NWORDS
     )
-    return y.view(*input_shape), packed, N, G
+    return y.view(*input_shape).contiguous(), packed, N, G
 
 @triton_op("act_lib::relu_bwd_fused_unpack", mutates_args={})
 def relu_bwd_fused_unpack(packed: torch.Tensor, dy: torch.Tensor, bits: int, N: int, G: int, group_size: int) -> torch.Tensor:
@@ -78,7 +77,7 @@ def relu_bwd_fused_unpack(packed: torch.Tensor, dy: torch.Tensor, bits: int, N: 
     NWORDS = group_size // VPW
     output_shape = dy.shape
 
-    dy2 = dy.view(-1, group_size)
+    dy2 = dy.reshape(-1, group_size)
     dx = torch.empty((N * G, group_size), dtype=torch.bfloat16, device='cuda')
 
     grid = (NG,)
@@ -91,7 +90,7 @@ def relu_bwd_fused_unpack(packed: torch.Tensor, dy: torch.Tensor, bits: int, N: 
         VPW=VPW,
         NWORDS=NWORDS
     )
-    return dx.view(*output_shape)
+    return dx.view(*output_shape).contiguous()
 
 
 @torch.library.register_fake("act_lib::relu_triton")
@@ -143,7 +142,7 @@ def silu_triton_impl(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         BLOCK_SIZE=1024
     )
 
-    return y, act
+    return y.contiguous(), act
 
 
 @triton_op("act_lib::silu_fwd_quan_pack", mutates_args={})
@@ -195,7 +194,7 @@ def silu_fwd_fused_quan_pack_impl(x: torch.Tensor,
     )
 
     y2 = spatical_aware_act_tensor_reshape_back(y, ori_shape_new, group_size, new_H, new_W, False, spatical_padding_eligibility, spatical_reshape_eligibility, channel_mean)
-    return y2, packed, scale, min, N, G, new_H, new_W, spatical_padding_eligibility, spatical_reshape_eligibility
+    return y2.contiguous(), packed, scale, min, N, G, new_H, new_W, spatical_padding_eligibility, spatical_reshape_eligibility
     # return y.view(*x.shape), packed, scale, min, N, G, 0, 0, False, False
 
 
@@ -234,7 +233,7 @@ def silu_bwd_fused_dequan_unpack_impl(packed: torch.Tensor, dy: torch.Tensor,
     )
 
     dx2 = spatical_aware_act_tensor_reshape_back(dx, output_shape, group_size, new_H, new_W, False, spatical_padding_eligibility, spatical_reshape_eligibility, channel_mean)
-    return dx2
+    return dx2.contiguous()
 
 
 
@@ -256,7 +255,7 @@ def gelu_triton_impl(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         BLOCK_SIZE=1024
     )
 
-    return y, act
+    return y.contiguous(), act
 
 @triton_op("act_lib::gelu_fwd_fused_quan_pack", mutates_args={})
 def gelu_fwd_fused_quan_pack_impl(x: torch.Tensor, bits: int, group_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
@@ -289,7 +288,7 @@ def gelu_fwd_fused_quan_pack_impl(x: torch.Tensor, bits: int, group_size: int) -
         QMAX=QMAX
     )
 
-    return y.view(*input_shape), packed, scale, min, N, G
+    return y.view(*input_shape).contiguous(), packed, scale, min, N, G
 
 
 @triton_op("act_lib::gelu_bwd_fused_dequan_unpack", mutates_args={})
@@ -316,4 +315,4 @@ def gelu_bwd_fused_dequan_unpack_impl(packed: torch.Tensor, dy: torch.Tensor, sc
         NWORDS=NWORDS
     )
 
-    return dx.view(*output_shape)
+    return dx.view(*output_shape).contiguous()

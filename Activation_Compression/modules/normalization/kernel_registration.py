@@ -90,9 +90,9 @@ def bn_fwd_norm(
     )
     
     if not sync:
-        return y, x_hat, mean, var
+        return y.contiguous(), x_hat, mean, var
     else:
-        return y, x_hat, None, None
+        return y.contiguous(), x_hat, None, None
 
 @triton_op("act_lib::bn_fwd_norm_quant_pack_fused", mutates_args={})
 def bn_fwd_norm_quant_pack_fused_impl(
@@ -158,9 +158,9 @@ def bn_fwd_norm_quant_pack_fused_impl(
     )
 
     if not sync:
-        return y, x_hat_packed, scale, min, mean, var
+        return y.contiguous(), x_hat_packed, scale, min, mean, var
     else:
-        return y, x_hat_packed, scale, min, None, None
+        return y.contiguous(), x_hat_packed, scale, min, None, None
 
 
 @triton_op("act_lib::bn_bwd_reduce", mutates_args=())
@@ -191,7 +191,7 @@ def bn_bwd_reduce(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    return dgamma, dbeta
+    return dgamma.contiguous(), dbeta.contiguous()
 
 
 @triton_op("act_lib::bn_bwd_dx", mutates_args=())
@@ -227,7 +227,7 @@ def bn_bwd_dx(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    return dx
+    return dx.contiguous()
 
 
 @triton_op("act_lib::bn_bwd_reduce_dequant_unpack_fused", mutates_args=())
@@ -264,7 +264,7 @@ def bn_bwd_reduce_dequant_unpack_fused_impl(
         AVG_ALAM=avg_alam, ALAM_BITS=alam_bits, ALAM_NWORDS=ALAM_NWORDS, SUB_GROUP=SUB_GROUP
     )
 
-    return DW, DB
+    return DW.contiguous(), DB.contiguous()
 
 
 @triton_op("act_lib::bn_bwd_dx_dequant_unpack_fused", mutates_args=())
@@ -302,7 +302,7 @@ def bn_bwd_dx_dequant_unpack_fused_impl(
         AVG_ALAM=avg_alam, ALAM_BITS=alam_bits, ALAM_NWORDS=ALAM_NWORDS, SUB_GROUP=SUB_GROUP
     )
 
-    return dx
+    return dx.contiguous()
 
 
 
@@ -337,7 +337,7 @@ def layer_norm_fwd_impl(
         BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1
     )
 
-    return y.view_as(x), x_hat, rstd, BLOCK_SIZE, num_warps
+    return y.view_as(x).contiguous(), x_hat, rstd, BLOCK_SIZE, num_warps
 
 
 
@@ -367,7 +367,7 @@ def layer_norm_bwd_dx_impl(
         num_warps=num_warps
     )
 
-    return dx.view_as(dy), _dw, _db, M, C
+    return dx.view_as(dy).contiguous(), _dw, _db, M, C
 
 
 @triton_op("act_lib::layer_norm_bwd_dwdb", mutates_args=())
@@ -388,4 +388,4 @@ def layer_norm_bwd_dwdb_impl(
         num_ctas=1
     )
 
-    return dw, db
+    return dw.contiguous(), db.contiguous()
