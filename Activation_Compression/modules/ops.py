@@ -158,7 +158,7 @@ class _DOConvnd(Function):
         ctx.save_for_backward((weight_master), q_inputs_tensor[0], q_inputs_tensor[1], q_inputs_tensor[2], input_l, learnable_scale)
         ctx.q_inputs_meta = (q_inputs_meta)
 
-        return forward_op(input, weight_compute, bias=None, stride=stride, padding=padding, dilation=dilation, groups=groups)
+        return forward_op(input, weight_compute, bias=None, stride=stride, padding=padding, dilation=dilation, groups=groups).contiguous()
       
     @staticmethod
     @custom_bwd(device_type='cuda')
@@ -176,7 +176,6 @@ class _DOConvnd(Function):
             weight_compute = weight_master
 
         stride, padding, dilation = pad_fn(stride), pad_fn(padding), pad_fn(dilation)
-
 
         input = unified_dequantize(q_inputs_tensor, q_inputs_meta, input_l) # B, C, H, W
         del q_inputs_tensor, q_inputs_meta, input_l

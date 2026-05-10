@@ -379,16 +379,16 @@ def silu_bwd_fused_dequan_unpack_triton(
 
     act = ((packed[:, None] >> shifts[None, :]) & mask) # [ALAM_NWORDS, VPW]
 
-    if AVG_ALAM:
-        act = tl.reshape(act, (ALAM_NWORDS * VPW,))
-        act = tl.broadcast_to(act[:, None], (SUB_GROUP, ALAM_BITS))
-        act = tl.reshape(act, (SUB_GROUP * ALAM_BITS,))
+    # if AVG_ALAM:
+    #     act = tl.reshape(act, (ALAM_NWORDS * VPW,))
+    #     act = tl.broadcast_to(act[:, None], (SUB_GROUP, ALAM_BITS))
+    #     act = tl.reshape(act, (SUB_GROUP * ALAM_BITS,))
 
-        noise_shape = tl.arange(0, SUB_GROUP * ALAM_BITS)
-        sgd_noise = tl.rand(seed + pid, noise_shape)
-        act = act.to(tl.float32) + (sgd_noise - 0.5)
-    else:
-        act = act.to(tl.float32)
+    #     noise_shape = tl.arange(0, SUB_GROUP * ALAM_BITS)
+    #     sgd_noise = tl.rand(seed + pid, noise_shape)
+    #     act = act.to(tl.float32) + (sgd_noise - 0.5)
+    # else:
+    #     act = act.to(tl.float32)
 
     act = act * scale + min
 

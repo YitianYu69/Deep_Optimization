@@ -53,7 +53,7 @@ def compute_radial_prior_power(
     num_bins=64,
     attack=False,
     model=None,
-    cri=None,
+    cri={},
     eps=1e-8,
     mu=torch.tensor((0.5, 0.5, 0.5)).view(3, 1, 1),
     std=torch.tensor((0.5, 0.5, 0.5)).view(3, 1, 1),
@@ -77,7 +77,7 @@ def compute_radial_prior_power(
             images, labels = batch
             images, label = images.to(device), labels.to(device)
 
-            pgd_images = PGD_attack(model, cri, images, label, num_iters=7, random_eps=8/255, alpha=10/255)
+            pgd_images = PGD_attack(model, cri['Valid'], images, label, num_iters=7, random_eps=8/255, alpha=10/255)
             
             images = images * std + mu
             images = torch.cat([images, pgd_images], dim=0)
@@ -134,7 +134,7 @@ def init(
         device: str = 'cuda'
 ):
     if freq_init:
-        radial_prior_power = compute_radial_prior_power(dataloader, device=device, num_batches=num_batches, num_bins=num_bins, attack=attack, model=model, cri=cri['Valid'], mu=mu, std=std)  
+        radial_prior_power = compute_radial_prior_power(dataloader, device=device, num_batches=num_batches, num_bins=num_bins, attack=attack, model=model, cri=cri, mu=mu, std=std)  
         num_layers = compute_num_layers(model)
 
     for i, m in enumerate(model.modules()):

@@ -93,9 +93,9 @@ class Controller():
             if not isinstance(mod, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.BatchNorm2d, nn.SyncBatchNorm, nn.ReLU, nn.SiLU, nn.GELU)):
                 continue
 
-            act_size = compute_activation_size_in_bytes(node)
-            if act_size <= 10:
-                continue
+            # act_size = compute_activation_size_in_bytes(node)
+            # if act_size <= 10:
+            #     continue
             
             
             tensor_meta = assign_tensor_meta(node)
@@ -243,12 +243,13 @@ class Controller():
                         meta=self.meta
                     )
                 elif isinstance(mod, nn.BatchNorm2d):
+                    m = self.config.get('BN_momentum', mod.momentum)
                     if self.config.get('SyncBatchNorm', False):
                         self.meta[f"sync_{target}"] = self.meta[f'{target}']
                         self.meta.pop(f"{target}", None)
 
                     new_mod = norm_layers.DOBatchNorm2d(
-                        mod.num_features, mod.eps, mod.momentum,
+                        mod.num_features, mod.eps, m,
                         mod.affine, mod.track_running_stats,
                         target_name=target,
                         meta=self.meta
