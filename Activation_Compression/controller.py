@@ -6,11 +6,11 @@ from torch.fx.passes.shape_prop import ShapeProp
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
-from Deep_Optimization.Activation_Compression.quantizer import Quantizer
-from Deep_Optimization.Activation_Compression.modules import layers
-from Deep_Optimization.Activation_Compression.modules.activations import act_layers
-from Deep_Optimization.Activation_Compression.modules.normalization import normalization_layers as norm_layers
-from Deep_Optimization.Activation_Compression.fusion.fusion_utils import fuse_bn_act
+from .quantizer import Quantizer
+from .modules import layers
+from .modules.activations import act_layers
+from .modules.normalization import normalization_layers as norm_layers
+from .fusion.fusion_utils import fuse_bn_act
 
 from torchvision.transforms import v2
 

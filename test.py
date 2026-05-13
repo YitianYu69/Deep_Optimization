@@ -254,7 +254,7 @@ def main():
                         'FGSM' : {'eps' : 8/255},
                          'FGSM_RS' : {'alpah' : 10/255},
                          'PGD' : {'steps' : 10, 'alpha' : 2/255, 'kl_weight' : 12.0},
-                        'TRADES' : {'random_eps' : 0.003, 'alpha' : 2/255, 'num_iters' : 10, 'beta' : 12.0},
+                        # 'TRADES' : {'random_eps' : 0.003, 'alpha' : 2/255, 'num_iters' : 10, 'beta' : 5.0},
                          'LIET' : {'LI' : True, 'num_class' : 10},
                         #  'AWP' : AWP_config,
                         },
@@ -418,6 +418,8 @@ def main():
         print_metrics(train_metrics, Train=True)
         
         if rank0():
+            logger.info(f"Floor value: {(-1.0 + 1.0 * torch.tanh(trainer.get_Engine().module.fake_floor.raw).item()):.10f}")
+            # logger.info(f"Floor value: {((trainer.get_Engine().module.fake_floor.raw).item()):.10f}")
             logger.info("Valid:")
         clean_valid_metrics = trainer.valid(valid_dataloader_cifar10)
         print_metrics(clean_valid_metrics, Train=False)

@@ -282,6 +282,10 @@ def build_metrics(*, metric_lists: List[str],
                   AUROC_average_type: str = "macro",
                   top_k: int = 1,
                   acc_list: list = ['Accuracy']):
+    if "Accuracy" in metric_lists and "Accuracy" in acc_list:
+        logger.warning("Please only use Accuracy in one of the lists! The Accuracy inside metric_lists will be removed!")
+        metric_lists.remove('Accuracy')
+
     kwargs = dict(task=task, num_classes=num_classes, average=average_type, sync_on_compute=sync, top_k=top_k)
 
     def make_metric(name: str):
@@ -317,6 +321,7 @@ def build_metrics(*, metric_lists: List[str],
             new_metrics[m] = make_metric(m)
 
     return new_metrics
+
 
 
 class EMA():

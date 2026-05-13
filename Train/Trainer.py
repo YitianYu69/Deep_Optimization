@@ -36,20 +36,6 @@ from typing import Union, Callable, Dict, Optional
 logger = get_logger()
 
 
-
-class LearnableFakeFloor(nn.Module):
-    def __init__(self, init=-1.0, radius=0.5):
-        super().__init__()
-        self.init = float(init)
-        self.radius = float(radius)
-
-        # raw = 0 -> tanh(0) = 0 -> floor = init
-        self.raw = nn.Parameter(torch.zeros(()))
-
-    def forward(self):
-        # bounded floor: [init - radius, init + radius]
-        return self.init + self.radius * torch.tanh(self.raw)
-
 class Trainer():
     def __init__(self, 
                  *,
@@ -160,8 +146,11 @@ class Trainer():
         # If PT2 AMP enabled, auto check the best cast dtype
         # ---------------------------------------------------
         if self.DS_config is None and amp_enable and self.device.startswith('cuda'):
-            major, _ = torch.cuda.get_device_capability(torch.device(device))
-            self.cast_dtype = torch.bfloat16 if major >= 8 and torch.cuda.is_available() else torch.float16
+            major, minor = torch.cuda.get_device_capability(torch.device(device))
+            if major == 7 and minor == 5:
+                self.cast_dtype = torch.bfloat16
+            else:
+                self.cast_dtype = torch.bfloat16 if major >= 8 and torch.cuda.is_available() else torch.float16
 
             if self.cast_dtype == torch.float16 and scaler is None:
                 raise ValueError(f"AMP float16 is enabled, then the scaler cannot be None!")

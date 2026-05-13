@@ -3,8 +3,11 @@ from torch import nn
 from torch.autograd import Function
 from torch.amp import custom_fwd, custom_bwd
 
+<<<<<<< HEAD
 from ..triton_kernel.norm_act_fusion import kernel_registration
 
+=======
+>>>>>>> origin/main
 
 class _DOBatchNormReLU2d(Function):
     @staticmethod
