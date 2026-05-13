@@ -4,7 +4,7 @@ from torch.amp import custom_fwd, custom_bwd
 import torch.distributed as dist
 
 from ..module_utils import unified_quantize, unified_dequantize
-import kernel_registration
+from ..normalization import kernel_registration
 
 class _DOBatchNorm(Function):
     @staticmethod
