@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.fx as fx
 
 from .fused_layers import DOBatchNormReLU2d
-from Activation_Compression.modules.normalization.normalization_layers import DOBatchNorm2d
-from Activation_Compression.modules.activations.act_layers import DOReLU_Variance
+from ..modules.normalization.normalization_layers import DOBatchNorm2d
+from ..modules.activations.act_layers import DOReLU_Variance
 
 import copy
 from typing import Tuple, Iterable, Type, Any, Dict
