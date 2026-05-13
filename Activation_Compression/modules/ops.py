@@ -22,7 +22,6 @@ import operator
 
 from .module_utils import unified_quantize, unified_dequantize
 # import Activation_Compression.cpp_extension as cpp_extension
-import ..act_triton_kernel as act_triton_kernel
 
 from typing import Tuple, List
 
