@@ -4,7 +4,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
 )
 
 import sys
-sys.path.append('/home/hice1/yyu496/kaggle/CW')
+sys.path.insert(0, "/teamspace/studios/this_studio/CW 2")
 
 import torch
 from torch.utils.data import Subset, random_split
@@ -159,20 +159,38 @@ def main():
                                                                                                 global_rank=global_rank,
                                                                                                 world_size=world_size,
                                                                                                 pin_memory_device=device)
+
+    class CIFARResNet18(nn.Module):
+        def __init__(self, num_classes):
+            super().__init__()
+
+            self.model = models.resnet18(weights=None)
+            self.model.conv1 = nn.Conv2d(
+                3, 64, kernel_size=3, stride=1, padding=1, bias=False
+            )
+            self.model.maxpool = nn.Identity()
+            self.model.fc = nn.Linear(self.model.fc.in_features, num_classes)
+
+        def forward(self, x):
+            return self.model(x)
+
+
     num_classes = 10
-    model = models.resnet18(weights=None)
-    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    model.maxpool = nn.Identity()
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    # model = models.resnet18(weights=None)
+    # model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    # model.maxpool = nn.Identity()
+    # model.fc = nn.Linear(model.fc.in_features, num_classes)
     # model = timm.create_model('wide_resnet101_2', pretrained=False, num_classes=num_classes)
     # model = ResNet18_FNet(num_classes=10)
+
+    model = CIFARResNet18(num_classes=num_classes)
 
     # model = models.efficientnet_b0(weights=None)
     # model.features[0][0].stride = (1, 1)
     # model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
      
     # model = load_model('Wong2020Fast', norm='Linf')
-    ema_model = EMA(model, decay=0.995, tau=0, device='cuda', kahan_compensation=True)
+    # ema_model = EMA(model, decay=0.995, tau=0, device='cuda', kahan_compensation=True)
 
 
     # criterion = nn.CrossEntropyLoss()
@@ -208,7 +226,8 @@ def main():
         lr = 1e-4 * 8,
         actual_bs=batch_size * 6,
         noise_decay_steps=20 * len(train_dataloader_cifar10),
-        overshoot=5.0
+        overshoot=5.0,
+        # weight_decay=5e-7,
     )
 
     # Adversarial_Attack_config = {
@@ -220,14 +239,24 @@ def main():
     #     'std' : IMAGENET_STD
     # }
 
+    AWP_config = {
+        'proxy_cls' : CIFARResNet18,
+        'proxy_kwarys' : {'num_classes' : num_classes},
+        'cri' : criterion['Train'],
+        'proxy_opt' : optimizer,
+        'opt_kwargs' : optimizer_kwargs,
+        'device' : 'cuda'
+    }
+
     Adversarial_Attack_config = {
         # 'Attack_Type' : {'PGD' : {'steps' : 3, 'alpha' : 2/255, 'kl_weight' : 12.0}},
         'Attack_Type' : {
                         'FGSM' : {'eps' : 8/255},
                          'FGSM_RS' : {'alpah' : 10/255},
                          'PGD' : {'steps' : 10, 'alpha' : 2/255, 'kl_weight' : 12.0},
-                        'TRADES' : {'random_eps' : 0.003, 'alpha' : 2/255, 'num_iters' : 10, 'beta' : 12.0},
-                         'LIET' : {'LI' : True, 'num_class' : 10}
+                        # 'TRADES' : {'random_eps' : 0.003, 'alpha' : 2/255, 'num_iters' : 10, 'beta' : 5.0},
+                         'LIET' : {'LI' : True, 'num_class' : 10},
+                        #  'AWP' : AWP_config,
                         },
         'KL_temperature' : 1.5,
         'mu' : IMAGENET_MEAN,
@@ -295,7 +324,8 @@ def main():
                       Trainer_config=Trainer_config,
                       dataloader=train_dataloader_cifar10, 
                       metrics=metrics, criterion=criterion, 
-                      ema=ema_model,
+                      ema=EMA,
+                      ema_kwargs=dict(decay=0.995, tau=0, device='cuda', kahan_compensation=True),
                       optimizer_type=optimizer, optimizer_kwargs=optimizer_kwargs,
                       grad_norm_clip=False,
                       device=device)

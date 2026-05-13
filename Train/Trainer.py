@@ -22,16 +22,19 @@ from ..Activation_Compression.modules import layers
 from ..Activation_Compression.modules.normalization.norm_layer_utils import convert_do_sync_batchnorm
 
 from ..Adversarial_Attack.FGSM import FGSM_attack, PGD_attack, TRADES_attack
+from ..Adversarial_Attack.AWP import AWP
 from ..Optimizer.SGD_geometry import SGD_NS_Overshoot, SGD_NS_Overshoot_Noise
 
 import torchattacks
 import torch_dct as dct
 
+import queue
 import time
 import copy
 from typing import Union, Callable, Dict, Optional
 
 logger = get_logger()
+
 
 class Trainer():
     def __init__(self, 
@@ -56,6 +59,7 @@ class Trainer():
                  scaler: torch.amp.GradScaler = None,
                  metrics: Dict[str, Metric] = None,
                  ema: Callable = None,
+                 ema_kwargs: dict = {},
                  num_epochs: int = 200,
                  grad_acc_step: int = 1,
                  grad_norm_clip: bool = False,
@@ -77,15 +81,24 @@ class Trainer():
         self.scheduler = scheduler
         self.scaler = scaler
         self.metrics = metrics
-        self.ema = ema
         self.num_epochs = num_epochs
         self.grad_acc_step = grad_acc_step
         self.grad_norm_clip = grad_norm_clip
         self.device = device.type if isinstance(device, torch.device) else device
         self.teacher_model = teacher_model
 
+        self.awp = None
+
         self.cuda_timer_start = torch.cuda.Event(enable_timing=True)
         self.cuda_timer_end = torch.cuda.Event(enable_timing=True)
+
+        self.is_training = False
+
+        if ema is not None:
+            self._ema = ema
+            self.ema_kwargs = ema_kwargs
+        else:
+            self._ema is None
 
 
         # Check confliction
@@ -130,7 +143,7 @@ class Trainer():
 
 
         # ---------------------------------------------------
-        # If TP2 AMP enabled, auto check the best cast dtype
+        # If PT2 AMP enabled, auto check the best cast dtype
         # ---------------------------------------------------
         if self.DS_config is None and amp_enable and self.device.startswith('cuda'):
             major, minor = torch.cuda.get_device_capability(torch.device(device))
@@ -178,13 +191,21 @@ class Trainer():
             raise ValueError("Please provide a optimizerr class")
         
 
+        self.attack_types = self.Adversarial_Attack.get('Attack_Type', {})
+        if self.Trainer_config.get('Multi_View', False):
+            self.view_types, self.num_chunks = self._compute_views_and_counts()
+
+        
+
 
     def train(self, epoch_idx, turned_on=False, epoch=0):
         assert not (self.train_dataloader is None), "Please pass the train_dataloader into the Trainer when you declare it first."
         assert not (self.metrics is None), "Please pass metrics into the Trainer when declare it as a dict."
+        self.is_training = True
         return self._training(epoch_idx, turned_on=turned_on, epoch=epoch)
     
     def valid(self, dataloader, attack = False, rs=False, target_top2=False, PGD=False, num_iters=7, eps=8/255, random_eps=8/255, alpha=10/255, LI=True, num_class=10, use_auto=False, last_valid=False):
+        self.is_training = False
         return self._validation(dataloader, attack=attack, rs=rs, target_top2=target_top2, PGD=PGD, num_iters=num_iters, eps=eps, random_eps=random_eps, alpha=alpha, LI=LI, num_class=num_class, use_auto=use_auto, last_valid=last_valid)
     
     def get_Engine(self):
@@ -239,12 +260,25 @@ class Trainer():
                 self.act_controller.warp_model(graph_mode=True, quantizer=True)
 
                 model = self.act_controller.traced_model
+
                 if self.ACT_config.get('SyncBatchNorm', False):
                     model = convert_do_sync_batchnorm(model)
                 if rank0():
                     logger.info("Model Inner Wrap Type: Activation Compression")
             else:
                 model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+
+            # apply_parametrizations(model)
+
+
+            if self.Adversarial_Attack.get('Attack_Type', {}) and self.Adversarial_Attack.get('Attack_Type', {}).get('AWP', {}):
+                awp_config = self.Adversarial_Attack.get('Attack_Type', {}).get('AWP', {})
+                self.awp = AWP(**awp_config)
+
+
+            if self._ema is not None:
+                self.ema = self._ema(model, **self.ema_kwargs)
 
             if rank0() and self.DDP_config.get('broadcast_buffers', True):
                 logger.info('Please turn off the broadcast_buffers if you used the torch.nn.SyncBatchNorm.convert_sync_batchnorm().')
@@ -282,10 +316,16 @@ class Trainer():
                 engine = self.act_controller.traced_model
                 logger.info("Model Wrap Type: Activation Compression")
 
+                if self._ema is not None:
+                    self.ema = self._ema(engine, **self.ema_kwargs)
+
         else:
             engine = model
             if rank0():
                 logger.info("Model Wrap Type: Raw")
+
+            if self._ema is not None:
+                self.ema = self._ema(engine, **self.ema_kwargs)
 
         return engine
 
@@ -314,7 +354,7 @@ class Trainer():
                     EMA_teacher_controller = self.Trainer_config.get("EMA_Teacher", {})
                     ema_logits = None
                     if self.ema is not None and isinstance(self.ema, EMA) and len(EMA_teacher_controller) != 0:
-                        if epoch >= EMA_teacher_controller.get("Start_Epoch", 6) and (EMA_teacher_controller.get("full_logits", False) or EMA_teacher_controller.get("clean_logits", False)):
+                        if epoch >= EMA_teacher_controller.get("Start_Epoch", 6) and (EMA_teacher_controller.get("full_logits", False) or EMA_teacher_controller.get("clean_logits", False) or EMA_teacher_controller.get("MOC", False)):
                             with torch.no_grad():
                                 with self.ema.average_parameters(self.engine):
                                     ema_logits = self.engine(data)
@@ -322,7 +362,12 @@ class Trainer():
                         if self.Trainer_config.get("SAM", {}) and self.Trainer_config.get("SAM", {}).get('turn_on', False):
                             backup = self._sam(step, data, target)
 
+                        if self.awp is not None:
+                            self.awp.compute_diff(data, target, self.engine, epoch)
+                            self.awp.perturbate(self.engine)
+
                         logits = self.engine(data)
+
 
                         if ema_logits is not None and EMA_teacher_controller.get("full_logits", False):
                             log_p = F.log_softmax(logits, dim=1)
@@ -331,6 +376,10 @@ class Trainer():
                     else:
                         if self.Trainer_config.get("SAM", {}) and self.Trainer_config.get("SAM", {}).get('turn_on', False):
                             backup = self._sam(step, data, target)
+
+                        if self.awp is not None:
+                            self.awp.compute_diff(data, target, self.engine, epoch)
+                            self.awp.perturbate(self.engine)
 
                         logits = self.engine(data)
 
@@ -341,61 +390,33 @@ class Trainer():
                         # log_logit_stats(logits, labels=target, logger=logger)
                         ori_loss = self.cri['Train'](logits, target)
 
-                        if self.Trainer_config.get("Multi_View", False):
-                            num_chunks = 1
-                            view_types = ['Clean']
-                            attack_types = self.Adversarial_Attack.get('Attack_Type', {})
-                            if 'FGSM' in attack_types:
-                                if len(as_tuple(attack_types['FGSM'].get('eps', 8/255))) == 2:
-                                    num_chunks += 2
-                                    view_types.extend(['FGSM_Small', 'FGSM_Large'])
-                                else:
-                                    view_types.append('FGSM')
-                                    num_chunks += 1
-                            if 'FGSM_RS' in attack_types:
-                                if len(as_tuple(attack_types['FGSM_RS'].get('alpha', 10/255))) == 2:
-                                    num_chunks += 2
-                                    view_types.extend(['FGSM_RS_Small', 'FGSM_RS_Large'])
-                                else:
-                                    view_types.append('FGSM_RS')
-                                    num_chunks += 1
-                            if 'PGD' in attack_types:
-                                view_types.append('PGD')
-                                num_chunks += 1
-                            if 'TRADES' in attack_types:
-                                view_types.append('TRADES')
-                                num_chunks += 1
-                            if self.Trainer_config.get('Freq_View', False):
-                                view_types.append('Freq')
-                                num_chunks += 1
-                                
+
+                        if self.Trainer_config.get("Multi_View", False):                                
                             assert logits.size(0) == target.size(0)
-                            assert logits.size(0) % num_chunks == 0, (
+                            assert logits.size(0) % self.num_chunks == 0, (
                                 f"Bad multiview chunking: logits={logits.size(0)}, "
-                                f"target={target.size(0)}, num_chunks={num_chunks}, views={view_types}"
+                                f"target={target.size(0)}, num_chunks={self.num_chunks}, views={self.view_types}"
                             )
 
-                            logits_chunks = logits.chunk(num_chunks, dim=0)
-                            target_chunks = target.chunk(num_chunks, dim=0)
+                            logits_chunks = logits.chunk(self.num_chunks, dim=0)
+                            target_chunks = target.chunk(self.num_chunks, dim=0)
 
-                            logits_view_map = dict(zip(view_types, logits_chunks))
-                            target_view_map = dict(zip(view_types, target_chunks))
+                            logits_view_map = dict(zip(self.view_types, logits_chunks))
+                            target_view_map = dict(zip(self.view_types, target_chunks))
 
                             if ema_logits is not None and EMA_teacher_controller.get("clean_logits", False):
-                                target_ema_logits = ema_logits.chunk(num_chunks, dim=0)
+                                target_ema_logits = ema_logits.chunk(self.num_chunks, dim=0)
                                 kl_clean_logits = target_ema_logits[0]
                             else:
                                 kl_clean_logits = logits_view_map['Clean']
                             
                             T = float(self.Adversarial_Attack.get("KL_temperature", 1.0))
                             assert T > 0, f"KL_temperature must be > 0, got {T}"
-                            if "FGSM" in attack_types:
-                                if 'FGSM_Small' in view_types:
+                            if "FGSM" in self.attack_types:
+                                if 'FGSM_Small' in self.view_types:
                                     attack_key = 'FGSM_Small'
-                                    both = True
                                 else:
                                     attack_key = 'FGSM'
-                                    both = False
                                 # kl1 = F.kl_div(
                                 #     F.log_softmax(logits_view_map[attack_key] / T, dim=1),
                                 #     F.softmax(kl_clean_logits.detach() / T, dim=1),
@@ -408,13 +429,11 @@ class Trainer():
                                 # )
                                 # ori_loss += kl1 * (T * T)
                            
-                            if "FGSM_RS" in attack_types:
-                                if 'FGSM_RS_Small' in view_types:
+                            if "FGSM_RS" in self.attack_types:
+                                if 'FGSM_RS_Small' in self.view_types:
                                     attack_key = 'FGSM_RS_Small'
-                                    both = True
                                 else:
                                     attack_key = 'FGSM_RS'
-                                    both = False
                                 # kl2 = F.kl_div(
                                 #     F.log_softmax(logits_view_map[attack_key] / T, dim=1),
                                 #     F.softmax(kl_clean_logits.detach() / T, dim=1),
@@ -427,7 +446,7 @@ class Trainer():
                                 # )
                                 # ori_loss += kl2 * (T * T)
                       
-                            if "PGD" in attack_types:
+                            if "PGD" in self.attack_types:
                                 # kl3 = F.kl_div(
                                 #     F.log_softmax(logits_view_map['PGD'] / T, dim=1),
                                 #     F.softmax(kl_clean_logits.detach() / T, dim=1),
@@ -440,23 +459,35 @@ class Trainer():
                                     reduction='batchmean'
                                 )
                            
-                                kl_weight = attack_types.get('PGD', {}).get('kl_weight', 1.0)
+                                kl_weight = self.attack_types.get('PGD', {}).get('kl_weight', 1.0)
                                 ori_loss += kl3 * (T * T) * kl_weight
 
-                            if "TRADES" in attack_types:
+                            if "TRADES" in self.attack_types:
+                                # kl4 = F.kl_div(
+                                #     F.log_softmax(logits_view_map['TRADES'] / T, dim=1),
+                                #     F.softmax(kl_clean_logits.detach() / T, dim=1),
+                                #     reduction='batchmean'
+                                # )
+
                                 kl4 = F.kl_div(
-                                    F.log_softmax(logits_view_map['TRADES'] / T, dim=1),
-                                    F.softmax(kl_clean_logits.detach() / T, dim=1),
+                                    F.log_softmax(kl_clean_logits / T, dim=1),
+                                    F.softmax(logits_view_map['TRADES'] / T, dim=1),
                                     reduction='batchmean'
                                 )
-                                beta = attack_types.get('TRADES', {}).get('beta', 1.0)
-                                ori_loss += (kl4 * (T * T)) * beta * (1 / len(kl_clean_logits))
+                                beta = self.attack_types.get('TRADES', {}).get('beta', 1.0)
+                                ori_loss += (kl4 * (T * T)) * beta
+
+                                clean_margin = margin(logits_view_map['Clean'], target_view_map['Clean'])
+                                trades_margin = margin(logits_view_map['TRADES'], target_view_map['TRADES'])
+
+                                ori_loss += F.smooth_l1_loss(clean_margin, trades_margin)
+
 
                             if len(self.Trainer_config.get('Soft_Margin_Loss', {})) != 0:
                                 sml_name = self.Trainer_config['Soft_Margin_Loss'].get('logits_name', 'Clean')
                                 ori_loss += top_pred_correction_loss(logits_view_map[sml_name], target_view_map[sml_name], T=1.5)
-                                ori_loss += 1 * soft_margin_loss_V2(logits_view_map[sml_name], target_view_map[sml_name], T=1.5)
-                                ori_loss += 5 * soft_margin_loss_V1(logits_view_map[sml_name], target_view_map[sml_name], T=1.5)
+                                ori_loss += 1 * soft_margin_loss_V2(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0)
+                                ori_loss += 5 * soft_margin_loss_V1(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0)
 
                         if self.ema is not None and isinstance(self.ema, EMA) and len(self.Trainer_config.get("EMA_Proximal_Loss", {})) != 0 and epoch >= self.Trainer_config.get("EMA_Proximal_Loss", {}).get("Start_Epoch", 6):
                             rho = self.Trainer_config.get("EMA_Proximal_Loss", {}).get("rho", 5e-4)
@@ -469,20 +500,21 @@ class Trainer():
                             l1_s_loss = self.l1_act.abs().mean()
                             ori_loss += trust_ratio * l1_s_loss
 
-                            clean_act, _, _, pgd_act, _ = self.l1_act.chunk(5, dim=0)
-                            freq_loss = freq_match_loss(
-                                feat_clean=clean_act,
-                                feat_adv=pgd_act,
-                                spectrum_mode="amp",
-                                loss_mode="wasserstein",
-                                low=0.0,
-                                high=1.0,
-                                detach_clean=True,
-                            )
-                            ori_loss += freq_loss
 
+                            if 'PGD' in self.attack_types:
+                                act_chunks = self.l1_act.chunk(self.num_chunks, dim=0)
+                                act_view_map = dict(zip(self.view_types,act_chunks))
 
-
+                                freq_loss = freq_match_loss(
+                                    feat_clean=act_view_map['Clean'],
+                                    feat_adv=act_view_map['PGD'],
+                                    spectrum_mode="amp",
+                                    loss_mode="wasserstein",
+                                    low=0.0,
+                                    high=1.0,
+                                    detach_clean=True,
+                                )
+                                ori_loss += freq_loss
 
                         if epoch >= EMA_teacher_controller.get("Start_Epoch", 6) and EMA_teacher_controller.get("full_logits", False):
                             ori_loss += dl_loss
@@ -543,6 +575,9 @@ class Trainer():
 
                     self.opt.step()
 
+                if self.awp is not None:
+                    self.awp.restore(self.engine)
+
         if self.scheduler is not None:
             self.scheduler.step()
         if self.ema is not None:
@@ -551,14 +586,37 @@ class Trainer():
 
     @torch.no_grad()
     def _update_metrics(self, logits, target):
-        for k, v in self.metrics.items():
-            if k == 'AUROC':
-                if logits.ndim == 1 or (logits.ndim == 2 and logits.size(1) == 1):
-                    v.update(torch.sigmoid(logits), target)
+        if self.Trainer_config.get('Multi_View', False) and self.Trainer_config.get('Multi_Acc', False):
+            logits_chunks = logits.chunk(self.num_chunks, dim=0)
+            target_chunks = target.chunk(self.num_chunks, dim=0)
+
+            logits_view_map = dict(zip(self.view_types, logits_chunks))
+            target_view_map = dict(zip(self.view_types, target_chunks))
+
+            for k, v in self.metrics.items():
+                if k.endswith('_Accuracy'):
+                    key = k.split('_Accuracy')[0]
+                    v.update(logits_view_map[key].argmax(dim=1), target_view_map[key])
+                elif k == 'AUROC':
+                    if logits.ndim == 1 or (logits.ndim == 2 and logits.size(1) == 1):
+                        v.update(torch.sigmoid(logits), target)
+                    else:
+                        v.update(F.softmax(logits, dim=1), target)
                 else:
-                    v.update(F.softmax(logits, dim=1), target)
-            else:
-                v.update(logits.argmax(dim=1), target)
+                    v.update(logits.argmax(dim=1), target)
+
+        else:
+            for k, v in self.metrics.items():
+                if k == 'AUROC':
+                    if logits.ndim == 1 or (logits.ndim == 2 and logits.size(1) == 1):
+                        v.update(torch.sigmoid(logits), target)
+                    else:
+                        v.update(F.softmax(logits, dim=1), target)
+                else:
+                    v.update(logits.argmax(dim=1), target)
+
+
+
 
 
     def _training(self,
@@ -590,18 +648,17 @@ class Trainer():
                 std = self.Adversarial_Attack.get('std', (0.5, 0.5, 0.5))
 
 
-                attack_types = self.Adversarial_Attack.get("Attack_Type", {})
-                if self.Trainer_config.get("Multi_View", False) and "FGSM" in attack_types and "FGSM_RS" in attack_types:
+                if self.Trainer_config.get("Multi_View", False) and "FGSM" in self.attack_types and "FGSM_RS" in self.attack_types:
                     both = True
                 else:
                     both = False
                 
-                if "FGSM" in attack_types or "FGSM_RS" in attack_types:
-                    eps = as_tuple(attack_types.get('FGSM', {}).get('eps', 8/255))
-                    alpha = as_tuple(attack_types.get('FGSM_RS', {}).get('alpha', 10/255))
-                    random_eps = as_tuple(attack_types.get('FGSM_RS', {}).get('random_eps', 8/255))
-                    LI = attack_types.get('LIET', {}).get('LI', False,)
-                    num_class = attack_types.get('LIET', {}).get('num_class', 10)
+                if "FGSM" in self.attack_types or "FGSM_RS" in self.attack_types:
+                    eps = as_tuple(self.attack_types.get('FGSM', {}).get('eps', 8/255))
+                    alpha = as_tuple(self.attack_types.get('FGSM_RS', {}).get('alpha', 10/255))
+                    random_eps = as_tuple(self.attack_types.get('FGSM_RS', {}).get('random_eps', 8/255))
+                    LI = self.attack_types.get('LIET', {}).get('LI', False,)
+                    num_class = self.attack_types.get('LIET', {}).get('num_class', 10)
 
 
                     if both:
@@ -621,28 +678,29 @@ class Trainer():
                     FGSM_attacked_data_chunks = None
                     len_target = 1
                 
-                if "PGD" in attack_types:
-                    random_eps = attack_types.get('PGD', {}).get('random_eps', 8/255)
-                    alpha = attack_types.get('PGD', {}).get('alpha', 2/255)
-                    steps = attack_types.get('PGD', {}).get('steps', 7)
+                if "PGD" in self.attack_types:
+                    random_eps = self.attack_types.get('PGD', {}).get('random_eps', 8/255)
+                    alpha = self.attack_types.get('PGD', {}).get('alpha', 2/255)
+                    steps = self.attack_types.get('PGD', {}).get('steps', 7)
 
                     PGD_attacked_data_chunks = PGD_attack(self.engine, self.cri['Valid'], data, target,
                                                     random_eps=random_eps, alpha=alpha, num_iters=steps,
                                                     mu=mu, std=std,
-                                                    target_top2=False,
+                                                    target_top2=False, valid=False,
                                                     device=self.device
                                                     )
                 else:
                     PGD_attacked_data_chunks = None
 
-                if "TRADES" in attack_types:
-                    random_eps = attack_types.get('TRADES', {}).get('random_eps', 8/255)
-                    alpha = attack_types.get('TRADES', {}).get('alpha', 2/255)
-                    num_iters = attack_types.get('TRADES', {}).get('num_iters', 7)
+                if "TRADES" in self.attack_types:
+                    random_eps = self.attack_types.get('TRADES', {}).get('random_eps', 8/255)
+                    alpha = self.attack_types.get('TRADES', {}).get('alpha', 2/255)
+                    num_iters = self.attack_types.get('TRADES', {}).get('num_iters', 7)
 
                     TRADES_attacked_data_chunks = TRADES_attack(self.engine, data, labels=target,
                                                                 num_iters=num_iters, random_eps=random_eps, alpha=alpha,
-                                                                mu=mu, std=std)
+                                                                mu=mu, std=std,
+                                                                valid=False)
                 else:
                     TRADES_attacked_data_chunks = None
                 
@@ -688,6 +746,21 @@ class Trainer():
 
 
             grad_step = ((step + 1) % self.grad_acc_step == 0 or (step + 1) == len(self.train_dataloader))
+
+            # if epoch > 2:
+            #     # remove_parametrizations(self.engine)
+
+            #     real_model = unwrap_model(self.engine)
+
+            #     old_named_params = named_param_dict(real_model)
+
+            #     # remove_parametrizations(real_model, leave_parametrized=True)
+
+            #     self.opt = remap_optimizer_state_by_name(
+            #         self.opt,
+            #         old_named_params,
+            #         real_model
+            #     )
 
             self.cuda_timer_start.record()
             if self.Adversarial_Attack is not None:
@@ -780,7 +853,7 @@ class Trainer():
                                 if PGD:
                                     data = PGD_attack(self.engine, self.cri['Valid'], data, target, num_iters=num_iters,
                                                             target_top2=target_top2, random_eps=random_eps, 
-                                                            alpha=alpha, mu=mu, std=std,
+                                                            alpha=alpha, mu=mu, std=std, valid=True,
                                                             device=self.device)
                                     
                                 if use_auto:
@@ -800,7 +873,7 @@ class Trainer():
                             if PGD:
                                 data = PGD_attack(self.engine, self.cri['Valid'], data, target, num_iters=num_iters,
                                                         target_top2=target_top2, random_eps=random_eps, 
-                                                        alpha=alpha, mu=mu, std=std,
+                                                        alpha=alpha, mu=mu, std=std, valid=True,
                                                         device=self.device)
                                 
                             if use_auto:
@@ -837,6 +910,37 @@ class Trainer():
 
         return computed_metrics
     
+    def _compute_views_and_counts(self):
+        num_chunks = 1
+        view_types = ['Clean']
+        if self.attack_types:
+            if 'FGSM' in self.attack_types:
+                if len(as_tuple(self.attack_types['FGSM'].get('eps', 8/255))) == 2:
+                    num_chunks += 2
+                    view_types.extend(['FGSM_Small', 'FGSM_Large'])
+                else:
+                    view_types.append('FGSM')
+                    num_chunks += 1
+            if 'FGSM_RS' in self.attack_types:
+                if len(as_tuple(self.attack_types['FGSM_RS'].get('alpha', 10/255))) == 2:
+                    num_chunks += 2
+                    view_types.extend(['FGSM_RS_Small', 'FGSM_RS_Large'])
+                else:
+                    view_types.append('FGSM_RS')
+                    num_chunks += 1
+            if 'PGD' in self.attack_types:
+                view_types.append('PGD')
+                num_chunks += 1
+            if 'TRADES' in self.attack_types:
+                view_types.append('TRADES')
+                num_chunks += 1
+
+        if self.Trainer_config.get('Freq_View', False):
+            view_types.append('Freq')
+            num_chunks += 1
+
+        return view_types, num_chunks
+    
 
     def _sam(self, step, data, target):
         if step <= 1:
@@ -849,6 +953,7 @@ class Trainer():
         rho = self.Trainer_config.get("SAM", {}).get('rho', 0.05)
         use_opt = self.Trainer_config.get("SAM", {}).get('use_optim', False)
         adaptive = self.Trainer_config.get("SAM", {}).get('adaptive', False)
+        norm_only = self.Trainer_config.get("SAM", {}).get('norm_only', False)
         backup = {}
 
         cache = []
@@ -859,6 +964,9 @@ class Trainer():
             for group in self.opt.param_groups:
                 for p in group['params']:
                     if p.grad is None:
+                        continue
+
+                    if norm_only and p.ndim != 1:
                         continue
 
                     grad = self.opt.tiny_max_step(p,
@@ -873,6 +981,9 @@ class Trainer():
             grad_cache = []
             for p in self.engine.parameters():
                 if p.grad is not None:
+                    if norm_only and p.ndim != 1:
+                        continue
+
                     grad_cache.append(((p.abs() if adaptive else 1.0) * p.grad).norm(p=2))
                     cache.append((p, p, p.grad))
 
@@ -936,10 +1047,19 @@ def as_tuple(x):
     return (x,)
 
 
+
+def margin(logits, y):
+    true = logits.gather(1, y[:, None]).squeeze(1)
+    wrong = logits.clone()
+    wrong.scatter_(1, y[:, None], -float("inf"))
+    max_wrong = wrong.max(dim=1).values
+    return true - max_wrong
+
+
 def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True): 
     prob = F.log_softmax(logits / T, dim=1) 
     true_prob = prob.gather(1, target[:, None]).squeeze(1) 
-    
+
     wrong_prob = prob.clone() 
     wrong_prob.scatter_(1, target[:, None], value=-1.0) 
     max_wrong_prob = wrong_prob.max(1).values 
@@ -953,10 +1073,12 @@ def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True
     if only_hard:
         mask = (gap > 0)
         if mask.any():
-            return loss_each[mask].mean()
-        return logits.sum() * 0.0
-
-    return loss_each.mean()
+            loss = loss_each[mask].mean()
+        else:
+            loss = logits.sum() * 0.0
+    else:
+        loss = loss_each.mean()
+    return loss
 
 
 def top_pred_correction_loss(logits, target, T=1.0, beta=10.0):
@@ -994,7 +1116,6 @@ def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0):
     true_prob = prob.gather(1, target[:, None]).squeeze(1)
 
     wrong_prob = prob.clone()
-    # wrong_prob.scatter(1, target[:, None], value=-1.0)
     max_wrong_prob = wrong_prob.max(1).values
 
     margin = true_prob - max_wrong_prob
@@ -1304,3 +1425,65 @@ def log_logit_stats(logits, labels=None, name="logits", logger=None):
         logger.info(msg)
     else:
         print(msg)
+
+
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+
+
+def canonical_param_name(name: str) -> str:
+    return name.replace(".parametrizations.weight.original", ".weight")
+
+
+def named_param_dict(model):
+    model = unwrap_model(model)
+    return {
+        canonical_param_name(name): p
+        for name, p in model.named_parameters()
+    }
+
+
+def remap_optimizer_state_by_name(optimizer, old_named_params, new_model):
+    """
+    old_named_params: dict[canonical_name -> old Parameter]
+    collected BEFORE removing parametrization.
+
+    new_model: model AFTER removing parametrization.
+    """
+
+    new_named_params = named_param_dict(new_model)
+
+    old_to_new = {}
+
+    for name, old_p in old_named_params.items():
+        name = canonical_param_name(name)
+
+        if name not in new_named_params:
+            continue
+
+        new_p = new_named_params[name]
+
+        if old_p.shape != new_p.shape:
+            print(f"Skip shape mismatch: {name}, old={old_p.shape}, new={new_p.shape}")
+            continue
+
+        old_to_new[old_p] = new_p
+
+    # remap optimizer.state keys
+    new_state = {}
+    for old_p, state in optimizer.state.items():
+        new_p = old_to_new.get(old_p, old_p)
+        new_state[new_p] = state
+
+    optimizer.state = new_state
+
+    # remap param_groups
+    for group in optimizer.param_groups:
+        group["params"] = [
+            old_to_new.get(p, p)
+            for p in group["params"]
+        ]
+
+    return optimizer

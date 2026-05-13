@@ -6,6 +6,7 @@ import torch.distributed as dist
 from ..module_utils import unified_quantize, unified_dequantize
 from . import kernel_registration
 
+
 class _DOBatchNorm(Function):
     @staticmethod
     @custom_fwd(device_type="cuda")

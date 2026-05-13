@@ -20,9 +20,9 @@ import triton.language as tl
 from functools import reduce
 import operator
 
-from .module_utils import unified_quantize, unified_dequantize
+from ..modules.module_utils import unified_quantize, unified_dequantize
 # import Activation_Compression.cpp_extension as cpp_extension
-from Deep_Optimization.Activation_Compression import act_triton_kernel
+from .. import act_triton_kernel
 
 from typing import Tuple, List
 
@@ -126,7 +126,7 @@ from typing import Tuple, List
 class _DOConvnd(Function):
     @staticmethod
     @custom_fwd(device_type='cuda')
-    def run_forward(ctx, forward_op, input, weight, learnable_scale, stride=1, padding=0, dilation=1, groups=1,
+    def run_forward(ctx, forward_op, input, weight, stride=1, padding=0, dilation=1, groups=1,
                     clamp_alpha=3.0, target_name=None, meta=None, ema_grad_meta=None):
         weight_master = weight
 
@@ -155,7 +155,7 @@ class _DOConvnd(Function):
             q_inputs_tensor, q_inputs_meta, input_l = unified_quantize((input_stored).to(torch.bfloat16), input_l, target_name, meta, clamp=True, clamp_alpha=clamp_alpha)
             
         ctx.meta = stride, padding, dilation, groups, ema_grad_meta, clamp_alpha
-        ctx.save_for_backward((weight_master), q_inputs_tensor[0], q_inputs_tensor[1], q_inputs_tensor[2], input_l, learnable_scale)
+        ctx.save_for_backward((weight_master), q_inputs_tensor[0], q_inputs_tensor[1], q_inputs_tensor[2], input_l)
         ctx.q_inputs_meta = (q_inputs_meta)
 
         return forward_op(input, weight_compute, bias=None, stride=stride, padding=padding, dilation=dilation, groups=groups).contiguous()
@@ -165,7 +165,7 @@ class _DOConvnd(Function):
     def run_backward(ctx, dy, dim, pad_fn):
         q_inputs_meta = ctx.q_inputs_meta
         stride, padding, dilation, groups, ema_grad_meta, clamp_alpha = ctx.meta
-        (weight_master, q_inputs_tensor_out, q_inputs_tensor_scaler, q_inputs_tensor_ema_min, input_l, learnable_scale) = ctx.saved_tensors
+        (weight_master, q_inputs_tensor_out, q_inputs_tensor_scaler, q_inputs_tensor_ema_min, input_l) = ctx.saved_tensors
         q_inputs_tensor = (q_inputs_tensor_out, q_inputs_tensor_scaler, q_inputs_tensor_ema_min)
 
         if torch.is_autocast_enabled("cuda"):
@@ -263,10 +263,10 @@ class _DOConvnd(Function):
 class _DOConv1d(Function):
     @staticmethod
     @custom_fwd(device_type='cuda')
-    def forward(ctx, input, weight, learnable_scale,
+    def forward(ctx, input, weight,
                 stride=1, padding=0, dilation=1, groups=1,
                 clamp_alpha=3.0, target_name=None, meta=None, ema_grad_meta=None):
-        return _DOConvnd.run_forward(ctx, F.conv1d, input, weight, learnable_scale,
+        return _DOConvnd.run_forward(ctx, F.conv1d, input, weight,
                                      stride=stride, padding=padding, dilation=dilation, groups=groups,
                                      clamp_alpha=clamp_alpha, target_name=target_name, meta=meta, ema_grad_meta=ema_grad_meta
                                      )
@@ -279,10 +279,10 @@ class _DOConv1d(Function):
 class _DOConv2d(Function):
     @staticmethod
     @custom_fwd(device_type='cuda')
-    def forward(ctx, input, weight, learnable_scale,
+    def forward(ctx, input, weight,
                 stride=1, padding=0, dilation=1, groups=1,
                 clamp_alpha=3.0, target_name=None, meta=None, ema_grad_meta=None):
-        return _DOConvnd.run_forward(ctx, F.conv2d,input, weight, learnable_scale,
+        return _DOConvnd.run_forward(ctx, F.conv2d,input, weight,
                                      stride=stride, padding=padding, dilation=dilation, groups=groups,
                                      clamp_alpha=clamp_alpha, target_name=target_name, meta=meta, ema_grad_meta=ema_grad_meta
                                      )
@@ -295,10 +295,10 @@ class _DOConv2d(Function):
 class _DOConv3d(Function):
     @staticmethod
     @custom_fwd(device_type='cuda')
-    def forward(ctx, input, weight, learnable_scale,
+    def forward(ctx, input, weight,
                 stride=1, padding=0, dilation=1, groups=1,
                 clamp_alpha=3.0, target_name=None, meta=None, ema_grad_meta=None):
-        return _DOConvnd.run_forward(ctx, F.conv3d, input, weight, learnable_scale,
+        return _DOConvnd.run_forward(ctx, F.conv3d, input, weight,
                                      stride=stride, padding=padding, dilation=dilation, groups=groups,
                                      clamp_alpha=clamp_alpha, target_name=target_name, meta=meta, ema_grad_meta=ema_grad_meta
                                      )
