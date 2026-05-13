@@ -282,35 +282,46 @@ def build_metrics(*, metric_lists: List[str],
                   AUROC_average_type: str = "macro",
                   top_k: int = 1,
                   acc_list: list = ['Accuracy']):
+    if "Accuracy" in metric_lists and "Accuracy" in acc_list:
+        logger.warning("Please only use Accuracy in one of the lists! The Accuracy inside metric_lists will be removed!")
+        metric_lists.remove('Accuracy')
+
     kwargs = dict(task=task, num_classes=num_classes, average=average_type, sync_on_compute=sync, top_k=top_k)
 
-    metrics = {
-        'Accuracy' : Accuracy(**kwargs).to(device),
-        'Recall' : Recall(**kwargs).to(device),
-        'Precision' : Precision(**kwargs).to(device),
-        'F1Score' : F1Score(**kwargs).to(device),
-        'AUROC' : AUROC(task=task, num_classes=num_classes, average=AUROC_average_type, sync_on_compute=sync).to(device)
-    }
+    def make_metric(name: str):
+        if name.endswith("Accuracy") or name == "Accuracy":
+            return Accuracy(**kwargs).to(device)
+
+        if name == "Recall":
+            return Recall(**kwargs).to(device)
+
+        if name == "Precision":
+            return Precision(**kwargs).to(device)
+
+        if name == "F1Score":
+            return F1Score(**kwargs).to(device)
+
+        if name == "AUROC":
+            return AUROC(
+                task=task,
+                num_classes=num_classes,
+                average=AUROC_average_type,
+                sync_on_compute=sync,
+            ).to(device)
+
+        raise ValueError(f"Current metric {name} is not supported! Please set it manually!")
 
     new_metrics = {}
     if len(acc_list) == 1:
         for m in metric_lists:
-            if m not in metrics:
-                raise ValueError(f"Current metric {m} is not supported! Please set it manually!")
-            else:
-                new_metrics[m] = metrics[m]
+            new_metrics[m] = make_metric(m)
     else:
-        metric_lists.remove('Accuracy')
         acc_list.extend(metric_lists)
         for m in acc_list:
-            if 'Accuracy' in m:
-                new_metrics[m] = metrics['Accuracy']
-            elif m not in metrics:
-                raise ValueError(f"Current metric {m} is not supported! Please set it manually!")
-            else:
-                new_metrics[m] = metrics[m]
+            new_metrics[m] = make_metric(m)
 
     return new_metrics
+
 
 
 class EMA():
