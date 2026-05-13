@@ -20,9 +20,9 @@ import triton.language as tl
 from functools import reduce
 import operator
 
-from Activation_Compression.modules.module_utils import unified_quantize, unified_dequantize
-import Activation_Compression.cpp_extension as cpp_extension
-import Activation_Compression.act_triton_kernel as act_triton_kernel
+from .module_utils import unified_quantize, unified_dequantize
+# import Activation_Compression.cpp_extension as cpp_extension
+import ..act_triton_kernel as act_triton_kernel
 
 from typing import Tuple, List
 
