@@ -11,8 +11,8 @@ from torch.ao.quantization.quantize_fx import fuse_fx, prepare_qat_fx
 
 from torchmetrics import Metric, Accuracy, Recall, Precision, F1Score, AUROC
 
-from Train.log import get_logger
-from Train.utils_ddp import rank0
+from .log import get_logger
+from .utils_ddp import rank0
 from timm.layers import BatchNormAct2d
 
 import math

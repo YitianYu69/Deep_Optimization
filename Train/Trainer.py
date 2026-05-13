@@ -12,17 +12,17 @@ from torchvision import transforms
 import deepspeed
 import torchattacks
 
-from Deep_Optimization.Train.log import get_logger
-from Deep_Optimization.Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat, Setup_Criterion, EMA
-from Deep_Optimization.Train.utils_ddp import rank0, setup_ddp
+from .log import get_logger
+from .utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat, Setup_Criterion, EMA
+from .utils_ddp import rank0, setup_ddp
 
 
-from Deep_Optimization.Activation_Compression.controller import Controller
-import Deep_Optimization.Activation_Compression.modules.layers  as layers
-from Deep_Optimization.Activation_Compression.modules.normalization.norm_layer_utils import convert_do_sync_batchnorm
+from ..Activation_Compression.controller import Controller
+from ..Activation_Compression.modules import layers
+from ..Activation_Compression.modules.normalization.norm_layer_utils import convert_do_sync_batchnorm
 
-from Deep_Optimization.Adversarial_Attack.FGSM import FGSM_attack, PGD_attack, TRADES_attack
-from Deep_Optimization.Optimizer.SGD_geometry import SGD_NS_Overshoot, SGD_NS_Overshoot_Noise
+from ..Adversarial_Attack.FGSM import FGSM_attack, PGD_attack, TRADES_attack
+from ..Optimizer.SGD_geometry import SGD_NS_Overshoot, SGD_NS_Overshoot_Noise
 
 import torchattacks
 import torch_dct as dct
