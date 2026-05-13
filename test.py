@@ -21,13 +21,14 @@ import pickle
 import torchvision.models as models
 from torchvision.transforms import v2
 from torchvision.datasets import ImageFolder
+from torchvision.datasets import CIFAR10
 
 
 from Deep_Optimization.Train.Trainer import Trainer
 from Deep_Optimization.Train.data import get_dataloader
 from Deep_Optimization.Train.utils_train import build_metrics, EMA
 from Deep_Optimization.Train.utils_ddp import setup_ddp, get_ddp_meta, rank0, clean
-from Deep_Optimization.Optimizer.SGD_geometry import SGD_NS_Overshoot, SGD_NS_Overshoot_Noise
+from Deep_Optimization.Optimizer.SGD_geometry import SGD_NS_Overshoot, SGD_NS_Overshoot_Noise, SGD_NS_Overshoot_LANTON
 from Deep_Optimization.Model.CNN.ResNetFreq import ResNet18_FNet
 
 import Deep_Optimization.Activation_Compression.modules.layers as layers
@@ -45,7 +46,7 @@ import torch_dct as dct
 logger = get_logger()
 
 @torch.compile(fullgraph=True)
-def focal_loss(logits, target, gamma=5.0, weight=None):
+def focal_loss(logits, target, gamma=3.0, weight=None):
     ce = F.cross_entropy(
         logits,
         target,
@@ -128,18 +129,21 @@ def main():
         v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
-    cifar10 = ImageFolder(
-        root='/home/hice1/yyu496/scratch/data/cifar10_resized/train',
-        transform=transform_train
-    )
-    test_cifar10 = ImageFolder(
-        root='/home/hice1/yyu496/scratch/data/cifar10_resized/test',
-        transform=checker_transform
-    )
-    clean_cifar10 = ImageFolder(
-        root='/home/hice1/yyu496/scratch/data/cifar10_resized/train',
-        transform=checker_transform
-    )
+    # cifar10 = ImageFolder(
+    #     root='/home/hice1/yyu496/scratch/data/cifar10_resized/train',
+    #     transform=transform_train
+    # )
+    # test_cifar10 = ImageFolder(
+    #     root='/home/hice1/yyu496/scratch/data/cifar10_resized/test',
+    #     transform=checker_transform
+    # )
+    # clean_cifar10 = ImageFolder(
+    #     root='/home/hice1/yyu496/scratch/data/cifar10_resized/train',
+    #     transform=checker_transform
+    # )
+    cifar10 = CIFAR10(root="./data", train=True, download=True, transform=transform_train)
+    clean_cifar10 = CIFAR10(root="./data", train=True, download=True, transform=checker_transform)
+    test_cifar10 = CIFAR10(root="./data", train=False, download=True, transform=checker_transform)
 
     train_cifar10_indices, valid_cifar10_indices = dataset_sample_for_split(cifar10, train_fraction=0.8, generator=g)
     train_dataset_cifar10 = Subset(cifar10, train_cifar10_indices.indices)
@@ -156,26 +160,26 @@ def main():
                                                                                                 world_size=world_size,
                                                                                                 pin_memory_device=device)
     num_classes = 10
-    # model = models.resnet18(weights=None)
-    # model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    # model.maxpool = nn.Identity()
-    # model.fc = nn.Linear(model.fc.in_features, num_classes)
+    model = models.resnet18(weights=None)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.maxpool = nn.Identity()
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
     # model = timm.create_model('wide_resnet101_2', pretrained=False, num_classes=num_classes)
-    model = ResNet18_FNet(num_classes=10)
+    # model = ResNet18_FNet(num_classes=10)
 
     # model = models.efficientnet_b0(weights=None)
     # model.features[0][0].stride = (1, 1)
     # model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
      
     # model = load_model('Wong2020Fast', norm='Linf')
-    ema_model = EMA(model, decay=0.9, tau=0, device='cuda', kahan_compensation=True)
+    ema_model = EMA(model, decay=0.995, tau=0, device='cuda', kahan_compensation=True)
 
 
     # criterion = nn.CrossEntropyLoss()
-    # criterion = {"Train" : focal_loss,
-    #              'Valid' : nn.CrossEntropyLoss()}
-    criterion = {"Train" : nn.CrossEntropyLoss(),
+    criterion = {"Train" : focal_loss,
                  'Valid' : nn.CrossEntropyLoss()}
+    # criterion = {"Train" : nn.CrossEntropyLoss(),
+    #              'Valid' : nn.CrossEntropyLoss()}
 
 
 
@@ -188,9 +192,9 @@ def main():
 
     # optimizer = SGD_NS_Overshoot_Noise
     # optimizer_kwargs = dict(
-    #     lr = 1e-3 * 8,
-    #     actual_bs=batch_size * 4,
-    #     noise_decay_steps=20 * len(train_dataloader_cifar10),
+    #     lr = 1e-4 * 8,
+    #     actual_bs=batch_size * 6,
+    #     noise_decay_steps=30 * len(train_dataloader_cifar10),
     #     overshoot=5.0,
     #     layer_noise_beta=0.99,
     #     layer_noise_alpha=1.0,
@@ -202,7 +206,7 @@ def main():
     optimizer = SGD_NS_Overshoot
     optimizer_kwargs = dict(
         lr = 1e-4 * 8,
-        actual_bs=batch_size * 5,
+        actual_bs=batch_size * 6,
         noise_decay_steps=20 * len(train_dataloader_cifar10),
         overshoot=5.0
     )
@@ -222,7 +226,7 @@ def main():
                         'FGSM' : {'eps' : 8/255},
                          'FGSM_RS' : {'alpah' : 10/255},
                          'PGD' : {'steps' : 10, 'alpha' : 2/255, 'kl_weight' : 12.0},
-                        # 'TRADES' : {'random_eps' : 0.003, 'alpha' : 2/255, 'num_iters' : 10, 'beta' : 5.0},
+                        'TRADES' : {'random_eps' : 0.003, 'alpha' : 2/255, 'num_iters' : 10, 'beta' : 12.0},
                          'LIET' : {'LI' : True, 'num_class' : 10}
                         },
         'KL_temperature' : 1.5,
@@ -234,21 +238,23 @@ def main():
         'L1_Sparse_Loss' : {'trust_ratio' : 0.007},
         'Soft_Margin_Loss' : {'logits_name' : 'Clean'},
         'EMA_Proximal_Loss' : {"Start_Epoch" : 6, 'rho' : 5e-4},
-        'EMA_Teacher' : {'Start_Epoch' : 6, 'full_logits' : False, 'clean_logits' : False},
+        'EMA_Teacher' : {'Start_Epoch' : 6, 'full_logits' : False, 'clean_logits' : False, 'MOC' : False},
         'Multi_View' : True,
         'Freq_View' : True,
-        'SAM' : {'turn_on' : False, 'rho' : 0.1, 'use_optim' : False, 'adaptive' : True},
+        'SAM' : {'turn_on' : True, 'rho' : 0.05, 'use_optim' : False, 'adaptive' : True, 'norm_only' : True},
         'Multi_Acc' : True,
     }
 
-    metric_list = ['Accuracy', 'AUROC']
-    # acc_list = ['Clean_Accuracy', 'FGSM_Accuracy', 'FGSM_RS_Accuracy', 'PGD_Accuracy']
+    metric_list = ['AUROC']
+    # acc_list = ['Accuracy', 'Clean_Accuracy', 'FGSM_Accuracy', 'FGSM_RS_Accuracy', 'PGD_Accuracy', 'Freq_Accuracy']
+    # acc_list = ['Accuracy', 'Clean_Accuracy', 'TRADES_Accuracy', 'Freq_Accuracy']
+    acc_list = ['Accuracy', 'Clean_Accuracy', 'FGSM_Accuracy', 'FGSM_RS_Accuracy', 'PGD_Accuracy', 'TRADES_Accuracy', 'Freq_Accuracy']
     metrics = build_metrics(metric_lists=metric_list, 
                             task='multiclass', 
                             num_classes=num_classes, 
                             average_type='micro', 
                             sync=True,
-                            # acc_list=acc_list,
+                            acc_list=acc_list,
                             device=device)
 
     DIVISION = None
@@ -257,11 +263,11 @@ def main():
         'analyze' : False,
         'auto_precision': None,
         'DIVISION' : DIVISION,
-        'BN_momentum' : 0.01,
+        'BN_momentum' : 0.05,
         'AVG_ALAM' : False,
         "AVG_ALAM_BTS" : 4,
         "group_size": 256,
-        'batch_size' : batch_size * 5,
+        'batch_size' : batch_size * 6,
         'fp8' : False,
         'depth_point_conv' : False,
         'rms_norm' : False,
@@ -352,7 +358,11 @@ def main():
 
         for k, v in metrics.items():
             if rank0():
-                logger.info(f"{pre_fx}{k}: {v}")
+                if trainer.is_training:
+                    logger.info(f"{pre_fx}{k}: {v}")
+                else:
+                    if not k.endswith('_Accuracy'):
+                        logger.info(f"{pre_fx}{k}: {v}")
 
 
 
@@ -376,7 +386,10 @@ def main():
 
         train_metrics = trainer.train(epoch, turned_on=turned_on, epoch=epoch)
         print_metrics(train_metrics, Train=True)
+        
         if rank0():
+            logger.info(f"Floor value: {(-1.0 + 1.0 * torch.tanh(trainer.get_Engine().module.fake_floor.raw).item()):.10f}")
+            # logger.info(f"Floor value: {((trainer.get_Engine().module.fake_floor.raw).item()):.10f}")
             logger.info("Valid:")
         clean_valid_metrics = trainer.valid(valid_dataloader_cifar10)
         print_metrics(clean_valid_metrics, Train=False)
@@ -395,19 +408,19 @@ def main():
         #         'Valid_Acc' : valid_acc
         #     }, f)
 
-        # valid_metrics = trainer.valid(valid_dataloader_cifar10, attack=True, eps=8/255, LI=True, num_class=num_classes)
-        # print_metrics(valid_metrics, Train=False, Attack=True)
-        # valid_metrics = trainer.valid(valid_dataloader_cifar10, attack=True, rs=True, alpha=10/255, LI=True, num_class=num_classes)
-        # print_metrics(valid_metrics, Train=False, Attack=True, rs=True)
+        valid_metrics = trainer.valid(valid_dataloader_cifar10, attack=True, eps=8/255, LI=True, num_class=num_classes)
+        print_metrics(valid_metrics, Train=False, Attack=True)
+        valid_metrics = trainer.valid(valid_dataloader_cifar10, attack=True, rs=True, alpha=10/255, LI=True, num_class=num_classes)
+        print_metrics(valid_metrics, Train=False, Attack=True, rs=True)
 
-        # pgd_valid_metrics = trainer.valid(valid_dataloader_cifar10, attack=True, PGD=True, target_top2=False, num_iters=50, random_eps=8/255, alpha=2/255, last_valid=not (epoch % threshold == 0))
-        # print_metrics(pgd_valid_metrics, Train=False, Attack=True, target_top2=False, PGD=True, steps=50)
+        pgd_valid_metrics = trainer.valid(valid_dataloader_cifar10, attack=True, PGD=True, target_top2=False, num_iters=50, random_eps=8/255, alpha=2/255, last_valid=not (epoch % threshold == 0))
+        print_metrics(pgd_valid_metrics, Train=False, Attack=True, target_top2=False, PGD=True, steps=50)
 
 
-        # if epoch % threshold == 0:
-        #     logger.info("PGD real robust test (100 steps): ")
-        #     valid_metrics = trainer.valid(valid_dataloader_cifar10, attack=True, target_top2=False, PGD=True, num_iters=100, random_eps=8/255,  alpha=2/255, last_valid=(epoch % threshold == 0))
-        #     print_metrics(valid_metrics, Train=False, Attack=True, target_top2=False, PGD=True, steps=100)
+        if epoch % threshold == 0:
+            logger.info("PGD real robust test (100 steps): ")
+            valid_metrics = trainer.valid(valid_dataloader_cifar10, attack=True, target_top2=False, PGD=True, num_iters=100, random_eps=8/255,  alpha=2/255, last_valid=(epoch % threshold == 0))
+            print_metrics(valid_metrics, Train=False, Attack=True, target_top2=False, PGD=True, steps=100)
 
 
         # if clean_valid_metrics['Accuracy'] > max_clean_acc and pgd_valid_metrics['Accuracy'] > max_pgd_acc:
