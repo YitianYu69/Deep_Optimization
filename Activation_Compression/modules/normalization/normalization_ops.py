@@ -3,8 +3,8 @@ from torch.autograd import Function
 from torch.amp import custom_fwd, custom_bwd
 import torch.distributed as dist
 
-from Activation_Compression.modules.module_utils import unified_quantize, unified_dequantize
-import Activation_Compression.modules.normalization.kernel_registration
+from ..module_utils import unified_quantize, unified_dequantize
+from . import kernel_registration
 
 
 class _DOBatchNorm(Function):

@@ -5,14 +5,14 @@ from torch.utils.data import DataLoader
 
 from torchvision.transforms import v2
 
-from Deep_Optimization.Initialization.freq_init_specialized import spectral_shape_init_specialized
-from Deep_Optimization.Initialization.freq_init import spectral_shape_init
-from Deep_Optimization.Initialization.Fully_Identity_init import idinit_conv2d_patch_, idinit_linear_
-from Deep_Optimization.Initialization.ZerO_init import init_ZerO_convolution, init_ZerO_linear
+from .freq_init_specialized import spectral_shape_init_specialized
+from .freq_init import spectral_shape_init
+from .Fully_Identity_init import idinit_conv2d_patch_, idinit_linear_
+from .ZerO_init import init_ZerO_convolution, init_ZerO_linear
 
-import Deep_Optimization.Activation_Compression.modules.layers as layers
+from ..Activation_Compression.modules import layers
 
-from Deep_Optimization.Adversarial_Attack.FGSM import PGD_attack, FGSM_attack
+from ..Adversarial_Attack.FGSM import PGD_attack, FGSM_attack
 
 
 def _radial_grid(h, w, device):

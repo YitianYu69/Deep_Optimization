@@ -4,8 +4,8 @@ from torch.autograd import Function
 from torch.amp import custom_fwd, custom_bwd
 from torch.library import triton_op, wrap_triton
 
-from Activation_Compression.modules.module_utils import unified_quantize, unified_dequantize
-import Activation_Compression.modules.activations.kernel_registration
+from ..module_utils import unified_quantize, unified_dequantize
+from . import kernel_registration
 
 import triton
 import triton.language as tl

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from torch.nn import Parameter
 
-from Activation_Compression.modules.ops import _DOLinear, _DOConv1d, _DOConv2d, _DOConv3d, GroupPACTClampFn
+from .ops import _DOLinear, _DOConv1d, _DOConv2d, _DOConv3d, GroupPACTClampFn
 
 
 class DOLinear(nn.Linear):
@@ -50,16 +50,15 @@ class DOConv1d(nn.Conv1d):
         #     'ema_smooth' : torch.torch.zeros_like(self.weight, device='cuda')
         # }
         self.ema_grad_meta = None
-        self.learnable_scale =  nn.Parameter(torch.ones((1,), dtype=torch.bfloat16) * 3.0)
 
     def forward(self, x):
         if self.training:
             if self.padding_mode != 'zeros':
                 return _DOConv1d(F.pad(x, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                   self.weight, self.learnable_scale,
+                                   self.weight,
                                    self.stride, self.padding, self.dilation, self.groups,
                                    self.clamp_alpha, self.target_name, self.meta, self.ema_grad_meta)
-            return _DOConv1d.apply(x, self.weight, self.learnable_scale,
+            return _DOConv1d.apply(x, self.weight,
                                      self.stride, self.padding, self.dilation, self.groups,
                                      self.clamp_alpha, self.target_name, self.meta, self.ema_grad_meta)
         else:
@@ -85,16 +84,15 @@ class DOConv2d(nn.Conv2d):
         #     'ema_smooth' : torch.torch.zeros_like(self.weight, device='cuda')
         # }
         self.ema_grad_meta = None
-        self.learnable_scale =  nn.Parameter(torch.ones((1,), dtype=torch.bfloat16) * 3.0)
 
     def forward(self, x):
         if self.training:
             if self.padding_mode != 'zeros':
                 return _DOConv2d.apply(F.pad(x, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                        self.weight, self.learnable_scale,
+                                        self.weight,
                                         self.stride, self.padding, self.dilation, self.groups,
                                         self.clamp_alpha, self.target_name, self.meta, self.ema_grad_meta)
-            return _DOConv2d.apply(x, self.weight, self.learnable_scale,
+            return _DOConv2d.apply(x, self.weight,
                                     self.stride, self.padding, self.dilation, self.groups,
                                     self.clamp_alpha, self.target_name, self.meta, self.ema_grad_meta)
         else:
@@ -119,16 +117,15 @@ class DOConv3d(nn.Conv3d):
         #     'ema_smooth' : torch.torch.zeros_like(self.weight, device='cuda')
         # }
         self.ema_grad_meta = None
-        self.learnable_scale =  nn.Parameter(torch.ones((1,), dtype=torch.bfloat16) * 3.0)
 
     def forward(self, x):
         if self.training:
             if self.padding_mode != 'zeros':
                 return _DOConv3d(F.pad(x, self._reversed_padding_repeated_twice, mode=self.padding_mode),
-                                  self.weight, self.learnable_scale,
+                                  self.weight,
                                   self.stride, self.padding, self.dilation, self.groups,
                                   self.clamp_alpha, self.target_name, self.meta, self.ema_grad_meta)
-            return _DOConv3d(x, self.weight, self.learnable_scale,
+            return _DOConv3d(x, self.weight,
                               self.stride, self.padding, self.dilation, self.groups,
                               self.clamp_alpha, self.target_name, self.meta, self.ema_grad_meta)
         else:

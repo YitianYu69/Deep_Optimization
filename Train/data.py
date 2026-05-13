@@ -77,18 +77,15 @@ def get_dataloader(batch_size, num_workers, drop_last,
     if num_workers and num_workers > 0:
         worker_kwargs.update(dict(prefetch_factor=3, persistent_workers=True))
     
-    pin_memory_kwargs = {}
-    if pin_memory_device is not None:
-        pin_memory_kwargs.update(dict(pin_memory_device='cuda'))
-
+    
     if not ddp:
         train_shuffle = True
     else:
         train_shuffle = False
 
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, shuffle=train_shuffle, batch_size=batch_size, drop_last=drop_last,
-                                  num_workers=num_workers, pin_memory=True, **worker_kwargs, **pin_memory_kwargs)
+                                  num_workers=num_workers, pin_memory=True, **worker_kwargs)
     valid_dataloader = DataLoader(valid_dataset, sampler=valid_sampler, shuffle=False, batch_size=batch_size, drop_last=drop_last,
-                                  num_workers=num_workers, pin_memory=True, **worker_kwargs, **pin_memory_kwargs)
+                                  num_workers=num_workers, pin_memory=True, **worker_kwargs)
     test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=512, num_workers=num_workers)
     return train_dataloader, valid_dataloader, test_dataloader

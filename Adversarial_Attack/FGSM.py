@@ -330,7 +330,7 @@ def LIET_attack(model, cri, data, labels, eps,
 @torch.enable_grad()
 def PGD_attack(model, cri, data, labels, num_iters=(7,), random_eps=8/255, alpha=2/255,
                mu=(0.5,0.5,0.5), std=(0.5,0.5,0.5),
-               target_top2=False,
+               target_top2=False, valid=False,
                device='cuda'):
     was_training = model.training
     model.eval()
@@ -376,6 +376,9 @@ def PGD_attack(model, cri, data, labels, num_iters=(7,), random_eps=8/255, alpha
             else:
                 loss = cri(logits, target.detach())
 
+                if not valid:
+                    loss += soft_margin_loss_V2(logits, labels, target_margin=4.0, T=1.5)
+              
             grad = torch.autograd.grad(
                 loss,
                 data,
@@ -415,33 +418,14 @@ def TRADES_attack(model, data, labels=None,
                   alpha=2/255,
                   mu=(0.5, 0.5, 0.5),
                   std=(0.5, 0.5, 0.5),
-                  distance='l_inf',
-                  device='cuda',
-                  use_amp=True):
-    """
-    TRADES adversarial sample generation only.
-
-    Important:
-        data is already normalized.
-        model only receives normalized inputs.
-        return value is also normalized.
-
-    For l_inf:
-        epsilon, alpha, random_eps are interpreted in pixel space,
-        then converted to normalized space channel-wise.
-
-    For l_2:
-        epsilon is interpreted as normalized-space L2 radius,
-        following the official TRADES optimizer_delta style.
-    """
+                  valid=False,
+                  device='cuda'):
 
     was_training = model.training
     model.eval()
 
     device = torch.device(device)
     data = data.to(device)
-
-    batch_size = data.shape[0]
 
     mu = torch.tensor(mu, device=device).view(1, 3, 1, 1)
     std = torch.tensor(std, device=device).view(1, 3, 1, 1)
@@ -457,142 +441,71 @@ def TRADES_attack(model, data, labels=None,
     # Clean prediction target: model(x_clean)
     # --------------------------------------------------
     with torch.no_grad():
-        with torch.amp.autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=use_amp and device.type == 'cuda'
-        ):
+        with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
             clean_logits = model(ori_data)
 
         clean_prob = F.softmax(clean_logits.float(), dim=1).detach()
 
-    # ==================================================
-    # L_inf TRADES attack
-    # ==================================================
-    if distance == 'l_inf':
-        epsilon_norm = epsilon / std
-        alpha_norm = alpha / std
-        random_eps_norm = random_eps / std
 
-        # Official TRADES starts from small Gaussian noise
-        data_adv = ori_data + random_eps_norm * torch.randn_like(ori_data)
-        data_adv = torch.max(torch.min(data_adv, clamp_max), clamp_min)
+    epsilon_norm = epsilon / std
+    alpha_norm = alpha / std
 
-        # Project random start into L_inf epsilon ball
-        eta = torch.max(
-            torch.min(data_adv - ori_data, epsilon_norm),
-            -epsilon_norm
-        )
-        data_adv = torch.max(torch.min(ori_data + eta, clamp_max), clamp_min).detach()
+    temp_data = (ori_data * std) + mu
+    data_adv = temp_data + random_eps * torch.randn_like(temp_data)
+    data_adv = (data_adv - mu) / std
 
-        for _ in range(num_iters):
-            data_adv = data_adv.detach().requires_grad_(True)
+    for _ in range(num_iters):
+        data_adv = data_adv.requires_grad_(True)
 
-            with torch.amp.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=use_amp and device.type == 'cuda'
-            ):
-                adv_logits = model(data_adv)
+        with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
+            adv_logits = model(data_adv)
 
-                loss_kl = criterion_kl(
-                    F.log_softmax(adv_logits.float(), dim=1),
-                    clean_prob
-                )
+            loss_kl = criterion_kl(
+                F.log_softmax(adv_logits.float(), dim=1),
+                clean_prob
+            )
 
-                # loss_kl += F.cross_entropy(adv_logits, labels)
+            if not valid:
+                loss_kl += F.cross_entropy(adv_logits, labels)
+                loss_kl += soft_margin_loss_V2(adv_logits, labels, target_margin=4.0, T=1.5)
 
             grad = torch.autograd.grad(
                 loss_kl,
-                [data_adv],
+                data_adv,
                 grad_outputs=None,
                 retain_graph=False,
                 create_graph=False
             )[0]
 
-            # Official TRADES: gradient ascent on KL
-            data_adv = data_adv.detach() + alpha_norm * torch.sign(grad.detach())
-
-            # L_inf projection
-            eta = torch.max(
-                torch.min(data_adv - ori_data, epsilon_norm),
-                -epsilon_norm
-            )
-
-            data_adv = torch.max(torch.min(ori_data + eta, clamp_max), clamp_min).detach()
-
-    # ==================================================
-    # L2 TRADES attack
-    # ==================================================
-    elif distance == 'l_2':
-        # Official TRADES-style delta
-        delta = random_eps * torch.randn_like(ori_data).detach()
-        delta = torch.autograd.Variable(delta.data, requires_grad=True)
-
-        # Official TRADES-style optimizer on delta
-        optimizer_delta = optim.SGD(
-            [delta],
-            lr=epsilon / num_iters * 2
-        )
-
-        for _ in range(num_iters):
-            adv = ori_data + delta
-            adv = torch.max(torch.min(adv, clamp_max), clamp_min)
-
-            optimizer_delta.zero_grad()
-
-            with torch.amp.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=use_amp and device.type == 'cuda'
-            ):
-                adv_logits = model(adv)
-
-                # Official TRADES minimizes -KL for delta,
-                # which is equivalent to maximizing KL.
-                loss = (-1.0) * criterion_kl(
-                    F.log_softmax(adv_logits.float(), dim=1),
-                    clean_prob
-                )
-
-            loss.backward()
-
-            # --------------------------------------------------
-            # Official TRADES: renorm delta gradient
-            # --------------------------------------------------
-            grad_norms = delta.grad.reshape(batch_size, -1).norm(p=2, dim=1)
-
-            zero_mask = grad_norms == 0
-            if zero_mask.any():
-                delta.grad[zero_mask] = torch.randn_like(delta.grad[zero_mask])
-                grad_norms = delta.grad.reshape(batch_size, -1).norm(p=2, dim=1)
-
-            delta.grad.div_(grad_norms.view(-1, 1, 1, 1).clamp_min(1e-12))
-
-            optimizer_delta.step()
-
-            # --------------------------------------------------
-            # Official TRADES projection style, but clamp in
-            # normalized image space instead of [0, 1].
-            # --------------------------------------------------
-            delta.data.add_(ori_data)
-
-            delta.data.copy_(
-                torch.max(torch.min(delta.data, clamp_max), clamp_min)
-            )
-
-            delta.data.sub_(ori_data)
-
-            # L2 projection around clean input
-            delta.data.renorm_(p=2, dim=0, maxnorm=epsilon)
-
-        data_adv = ori_data + delta.detach()
-        data_adv = torch.max(torch.min(data_adv, clamp_max), clamp_min).detach()
-
-    else:
-        raise ValueError(f"Unsupported distance: {distance}. Use 'l_inf' or 'l_2'.")
+        data_adv = data_adv.detach() + alpha_norm * torch.sign(grad)
+        data_adv = torch.min(torch.max(data_adv, ori_data - epsilon_norm), ori_data + epsilon_norm)
+        data_adv = torch.clamp(data_adv, clamp_min, clamp_max)
 
     if was_training:
         model.train()
 
-    return (data_adv.detach() * std) + mu
+    return (data_adv * std) + mu
+
+
+
+def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True): 
+    prob = F.log_softmax(logits / T, dim=1) 
+    true_prob = prob.gather(1, target[:, None]).squeeze(1) 
+
+    wrong_prob = prob.clone() 
+    wrong_prob.scatter_(1, target[:, None], value=-1.0) 
+    max_wrong_prob = wrong_prob.max(1).values 
+
+    margin = true_prob - max_wrong_prob
+    gap = target_margin - margin
+    
+    # smooth hinge: approx max(0, target_margin - margin)
+    loss_each = F.softplus(gap)
+
+    if only_hard:
+        mask = (gap > 0)
+        if mask.any():
+            return loss_each[mask].mean()
+        return logits.sum() * 0.0
+
+    return loss_each.mean()
