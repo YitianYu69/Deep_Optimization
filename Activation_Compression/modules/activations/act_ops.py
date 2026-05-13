@@ -5,7 +5,7 @@ from torch.amp import custom_fwd, custom_bwd
 from torch.library import triton_op, wrap_triton
 
 from ..module_utils import unified_quantize, unified_dequantize
-import .kernel_registration
+import kernel_registration
 
 import triton
 import triton.language as tl
