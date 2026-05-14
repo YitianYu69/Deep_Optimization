@@ -43,7 +43,7 @@ class AWP():
 
         proxy = self.proxy_cls(**self.proxy_kwarys).to(self.device)
         # if epoch <= 2:
-        #     apply_parametrizations(proxy)
+        # apply_parametrizations(proxy)
         
         if isinstance(model, nn.parallel.DistributedDataParallel):
             proxy.load_state_dict(model.module.state_dict())
@@ -106,8 +106,58 @@ class AWP():
 
 
 
+class Symmetric(nn.Module):
+    """
+    Symmetrize the last two dimensions.
+
+    Supports:
+        2D: [N, N]
+        4D: [C_out, C_in, K, K]
+
+    For Conv2d weights, this makes each spatial kernel symmetric.
+    """
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        if X.ndim not in (2, 4):
+            raise ValueError(
+                f"Symmetric only supports 2D or 4D tensors, but got shape {tuple(X.shape)}"
+            )
+
+        if X.shape[-1] != X.shape[-2]:
+            raise ValueError(
+                f"Last two dims must be square, but got shape {tuple(X.shape)}"
+            )
+
+        upper = torch.triu(X, diagonal=0)
+        upper_no_diag = torch.triu(X, diagonal=1)
+
+        return upper + upper_no_diag.transpose(-1, -2)
+
+    def right_inverse(self, S: torch.Tensor) -> torch.Tensor:
+        """
+        Needed for torch.nn.utils.parametrize.
+        Stores only the upper-triangular part.
+        """
+        if S.ndim not in (2, 4):
+            raise ValueError(
+                f"Symmetric only supports 2D or 4D tensors, but got shape {tuple(S.shape)}"
+            )
+
+        if S.shape[-1] != S.shape[-2]:
+            raise ValueError(
+                f"Last two dims must be square, but got shape {tuple(S.shape)}"
+            )
+
+        return torch.triu(S, diagonal=0)
+
+
 def apply_parametrizations(model):
     for m in model.modules():
-        if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d, layers.DOLinear, layers.DOConv1d, layers.DOConv2d)):
+        if isinstance(m, (
+            nn.Linear, nn.Conv1d, nn.Conv2d,
+            layers.DOLinear, layers.DOConv1d, layers.DOConv2d
+        )):
             if not nn.utils.parametrize.is_parametrized(m, "weight"):
-                nn.utils.parametrizations.spectral_norm(m)
+                # parametrizations.spectral_norm(m, name="weight")
+                if m.weight.shape[-1] == m.weight.shape[-2]:
+                    nn.utils.parametrize.register_parametrization(m, "weight", Symmetric())
