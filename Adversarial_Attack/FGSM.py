@@ -1,3 +1,4 @@
+from numpy import var
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -348,6 +349,10 @@ def PGD_attack(model, cri, data, labels, num_iters=(7,), random_eps=8/255, alpha
 
     ori_data = data.detach()
 
+    if not valid:
+        with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
+            clean_logits = model(ori_data)
+
     delta = torch.zeros_like(data)
     for j in range(len(random_eps)):
         delta[:, j, :, :].uniform_(-random_eps[j][0][0].item(), random_eps[j][0][0].item())
@@ -377,7 +382,11 @@ def PGD_attack(model, cri, data, labels, num_iters=(7,), random_eps=8/255, alpha
                 loss = cri(logits, target.detach())
 
                 if not valid:
-                    loss += soft_margin_loss_V2(logits, labels, target_margin=4.0, T=1.5)
+                    loss += soft_margin_loss_V2(logits, labels, target_margin=4.0, T=1.5, focal=True)
+
+                    clean_margin = margin(clean_logits, labels)
+                    adv_margin = margin(logits, labels)
+                    loss += F.smooth_l1_loss(adv_margin, clean_margin.detach())
               
             grad = torch.autograd.grad(
                 loss,
@@ -467,7 +476,11 @@ def TRADES_attack(model, data, labels=None,
 
             if not valid:
                 loss_kl += F.cross_entropy(adv_logits, labels)
-                loss_kl += soft_margin_loss_V2(adv_logits, labels, target_margin=4.0, T=1.5)
+                loss_kl += soft_margin_loss_V2(adv_logits, labels, target_margin=4.0, T=1.5, focal=True)
+                
+                clean_margin = margin(clean_logits, labels)
+                adv_margin = margin(adv_logits, labels)
+                loss_kl += F.smooth_l1_loss(adv_margin, clean_margin.detach())
 
             grad = torch.autograd.grad(
                 loss_kl,
@@ -488,7 +501,7 @@ def TRADES_attack(model, data, labels=None,
 
 
 
-def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True): 
+def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True, focal=False, gamma=3.0): 
     prob = F.log_softmax(logits / T, dim=1) 
     true_prob = prob.gather(1, target[:, None]).squeeze(1) 
 
@@ -509,3 +522,13 @@ def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True
         return logits.sum() * 0.0
 
     return loss_each.mean()
+
+
+
+
+def margin(logits, y):
+    true = logits.gather(1, y[:, None]).squeeze(1)
+    wrong = logits.clone()
+    wrong.scatter_(1, y[:, None], -float("inf"))
+    max_wrong = wrong.max(dim=1).values
+    return true - max_wrong
