@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from ..Activation_Compression.modules import layers
 
@@ -39,7 +40,7 @@ class AWP():
         self.device = device
 
 
-    def compute_diff(self, adv_data, target, model, epoch, num_iters=1):
+    def compute_diff(self, adv_data, target, model, epoch, num_iters=1, clean_data=None):
 
         proxy = self.proxy_cls(**self.proxy_kwarys).to(self.device)
         # if epoch <= 2:
@@ -59,13 +60,25 @@ class AWP():
             for name, p in proxy.named_parameters()
         }
 
+        if clean_data is not None:
+            with torch.amp.autocast(device_type=self.device, dtype=torch.bfloat16):
+                clean_logits = proxy(clean_data)
+                clean_prob = F.softmax(clean_logits, dim=1).detach()
+
         for _ in range(num_iters):
 
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 proxy_opt.zero_grad(set_to_none=True)
 
                 logits = proxy(adv_data)
-                loss = - self.cri(logits, target)
+                loss = -self.cri(logits, target)
+
+                if clean_data is not None:
+                    loss -= F.kl_div(
+                        F.log_softmax(logits, dim=1),
+                        clean_prob,
+                        reduction='sum'
+                    )
 
                 loss.backward()
 

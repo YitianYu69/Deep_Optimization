@@ -100,6 +100,11 @@ class Trainer():
         else:
             self._ema is None
 
+        
+        self.attack_types = self.Adversarial_Attack.get('Attack_Type', {})
+        if self.Trainer_config.get('Multi_View', False):
+            self.view_types, self.num_chunks = self._compute_views_and_counts()
+
 
         # Check confliction
         assert (self.QAT != self.amp_enable) or (not self.QAT and not self.amp_enable), "Please choose either QAT=True, or amp_enable=True!"
@@ -130,7 +135,7 @@ class Trainer():
         
         # Check for compile
         if compile_type is not None:
-            assert ACT_config is None, "Please turn off compile for when ACT is enabled, they are not compatible at the moment!"
+            assert ACT_config is not None, "Please turn off compile for when ACT is enabled, they are not compatible at the moment!"
 
             fullgraph = False if self.DS_config is not None else True
             model.compile(fullgraph=fullgraph, mode=compile_type)
@@ -189,12 +194,6 @@ class Trainer():
             self.opt = self.opt_type(self.engine.parameters(), **self.opt_kwargs)
         else:
             raise ValueError("Please provide a optimizerr class")
-        
-
-        self.attack_types = self.Adversarial_Attack.get('Attack_Type', {})
-        if self.Trainer_config.get('Multi_View', False):
-            self.view_types, self.num_chunks = self._compute_views_and_counts()
-
         
 
 
@@ -362,10 +361,8 @@ class Trainer():
                         if self.Trainer_config.get("SAM", {}) and self.Trainer_config.get("SAM", {}).get('turn_on', False):
                             backup = self._sam(step, data, target)
 
-                        if self.awp is not None:
-                            self.awp.compute_diff(data, target, self.engine, epoch)
-                            self.awp.perturbate(self.engine)
-
+                        
+                        self.compute_AWP_diff_and_perturbate(data, target, epoch=epoch)
                         logits = self.engine(data)
 
 
@@ -377,10 +374,8 @@ class Trainer():
                         if self.Trainer_config.get("SAM", {}) and self.Trainer_config.get("SAM", {}).get('turn_on', False):
                             backup = self._sam(step, data, target)
 
-                        if self.awp is not None:
-                            self.awp.compute_diff(data, target, self.engine, epoch)
-                            self.awp.perturbate(self.engine)
 
+                        self.compute_AWP_diff_and_perturbate(data, target, epoch=epoch)
                         logits = self.engine(data)
 
                     if isinstance(self.cri, Setup_Criterion):
@@ -479,15 +474,14 @@ class Trainer():
 
                                 clean_margin = margin(logits_view_map['Clean'], target_view_map['Clean'])
                                 trades_margin = margin(logits_view_map['TRADES'], target_view_map['TRADES'])
-
-                                ori_loss += F.smooth_l1_loss(clean_margin, trades_margin)
+                                ori_loss +=  F.smooth_l1_loss(clean_margin, trades_margin.detach())
 
 
                             if len(self.Trainer_config.get('Soft_Margin_Loss', {})) != 0:
                                 sml_name = self.Trainer_config['Soft_Margin_Loss'].get('logits_name', 'Clean')
                                 ori_loss += top_pred_correction_loss(logits_view_map[sml_name], target_view_map[sml_name], T=1.5)
-                                ori_loss += 1 * soft_margin_loss_V2(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0)
-                                ori_loss += 5 * soft_margin_loss_V1(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0)
+                                ori_loss += 1 * soft_margin_loss_V2(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0, focal=True)
+                                ori_loss += 5 * soft_margin_loss_V1(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0, focal=True)
 
                         if self.ema is not None and isinstance(self.ema, EMA) and len(self.Trainer_config.get("EMA_Proximal_Loss", {})) != 0 and epoch >= self.Trainer_config.get("EMA_Proximal_Loss", {}).get("Start_Epoch", 6):
                             rho = self.Trainer_config.get("EMA_Proximal_Loss", {}).get("rho", 5e-4)
@@ -501,7 +495,7 @@ class Trainer():
                             ori_loss += trust_ratio * l1_s_loss
 
 
-                            if 'PGD' in self.attack_types:
+                            if 'TRADES' in self.attack_types:
                                 act_chunks = self.l1_act.chunk(self.num_chunks, dim=0)
                                 act_view_map = dict(zip(self.view_types,act_chunks))
 
@@ -1007,6 +1001,40 @@ class Trainer():
         for p in self.engine.parameters():
             if p in backup:
                 p.copy_(backup[p])
+
+    def compute_AWP_diff_and_perturbate(self, data, target, epoch=0):
+        if self.awp is None:
+            raise ValueError('AWP cannot be None!')
+
+        if self.Trainer_config.get('Multi_View', False):
+            data_chunks = data.chunk(self.num_chunks, dim=0)
+            target_chunks = target.chunk(self.num_chunks, dim=0)
+
+            data_view_map = dict(zip(self.view_types, data_chunks))
+            target_view_map = dict(zip(self.view_types, target_chunks))
+
+            if 'TRADES' in self.attack_types:
+                keys = 'TRADES'
+            elif 'PGD' in self.attack_types:
+                keys = 'PGD'
+            elif 'FGSM_RS' in self.attack_types:
+                keys = 'FGSM_RS'
+            elif 'FGSM_RS_Small' in self.attack_types:
+                keys = 'FGSM_RS_Small'
+            elif 'FGSM_RS_Large' in self.attack_types:
+                keys = 'FGSM_RS_Large'
+            elif 'FGSM' in self.attack_types:
+                keys = 'FGSM'
+            elif 'FGSM_Small' in self.attack_types:
+                keys = 'FGSM_Small'
+            elif 'FGSM_Large' in self.attack_types:
+                keys = 'FGSM_Large'
+
+            self.awp.compute_diff(data_view_map[keys], target_view_map[keys], self.engine, epoch, clean_data=data_view_map['Clean'])
+        else:
+            self.awp.compute_diff(data, target, self.engine, epoch)
+        
+        self.awp.perturbate(self.engine)
             
 
     def get_final_engine(self,):
@@ -1129,7 +1157,7 @@ def margin(logits, y):
     return true - max_wrong
 
 
-def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True): 
+def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True, focal=False, gamma=3.0): 
     prob = F.log_softmax(logits / T, dim=1) 
     true_prob = prob.gather(1, target[:, None]).squeeze(1) 
 
@@ -1143,14 +1171,28 @@ def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True
     # smooth hinge: approx max(0, target_margin - margin)
     loss_each = F.softplus(gap)
 
+    if focal:
+        pre_weight = 1.0 + torch.sigmoid(loss_each)
+        weight = pre_weight.pow(gamma)
+        weight = weight.detach()
+
+        loss_each = weight * loss_each
+
+    bad_mask = gap > 0
+    if bad_mask.any():
+        bad_margin = margin[bad_mask]
+        var_loss = bad_margin.var(unbiased=False)
+    else:
+        var_loss = 0.0
+
     if only_hard:
         mask = (gap > 0)
         if mask.any():
-            loss = loss_each[mask].mean()
+            loss = loss_each[mask].mean() + var_loss
         else:
             loss = logits.sum() * 0.0
     else:
-        loss = loss_each.mean()
+        loss = loss_each.mean() + var_loss
     return loss
 
 
@@ -1183,7 +1225,7 @@ def top_pred_correction_loss(logits, target, T=1.0, beta=10.0):
 
     return logits.sum() * 0.0
 
-def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0):
+def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0, focal=False, gamma=3.0):
     prob = F.log_softmax(logits / T, dim=1)
 
     true_prob = prob.gather(1, target[:, None]).squeeze(1)
@@ -1194,7 +1236,23 @@ def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0):
     margin = true_prob - max_wrong_prob
     margin_loss = F.softplus(target_margin - margin)
 
-    return margin_loss.mean()
+
+    if focal:
+        pre_weight = 1.0 + torch.sigmoid(margin_loss)
+        weight = pre_weight.pow(gamma)
+        weight = weight.detach()
+
+        margin_loss = weight * margin_loss
+
+    bad_mask = margin > 0
+    if bad_mask.any():
+        bad_margin = margin[bad_mask]
+        var_loss = bad_margin.var(unbiased=False)
+    else:
+        var_loss = 0.0
+
+
+    return margin_loss.mean() + var_loss
 
 
 def make_low_mid_mask(h, w, ratio=0.6, device='cuda'):

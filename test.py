@@ -4,7 +4,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
 )
 
 import sys
-sys.path.insert(0, "/teamspace/studios/this_studio/CW 2")
+sys.path.insert(0, "/teamspace/studios/this_studio/")
 
 import torch
 from torch.utils.data import Subset, random_split
