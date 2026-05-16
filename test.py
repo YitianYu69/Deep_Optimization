@@ -4,7 +4,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
 )
 
 import sys
-sys.path.insert(0, "/teamspace/studios/this_studio/")
+sys.path.insert(0, "/storage/home/hcoda1/1/yyu496/r-cwiese7-0/kaggle/CW/")
 
 import torch
 from torch.utils.data import Subset, random_split
@@ -151,7 +151,7 @@ def main():
     test_dataset_cifar10 = test_cifar10
 
 
-    train_dataloader_cifar10, valid_dataloader_cifar10, test_dataloader_cifar10 = get_dataloader(batch_size=batch_size, num_workers=15, drop_last=True,
+    train_dataloader_cifar10, valid_dataloader_cifar10, test_dataloader_cifar10 = get_dataloader(batch_size=batch_size, num_workers=8, drop_last=True,
                                                                                                 train_dataset=train_dataset_cifar10,
                                                                                                 valid_dataset=valid_dataset_cifar10,
                                                                                                 test_dataset=test_dataset_cifar10,
@@ -256,7 +256,7 @@ def main():
                          'PGD' : {'steps' : 10, 'alpha' : 2/255, 'kl_weight' : 12.0},
                         'TRADES' : {'random_eps' : 0.003, 'alpha' : 2/255, 'num_iters' : 10, 'beta' : 12.0},
                          'LIET' : {'LI' : True, 'num_class' : 10},
-                         'AWP' : AWP_config,
+                        #  'AWP' : AWP_config,
                         },
         'KL_temperature' : 1.5,
         'mu' : IMAGENET_MEAN,

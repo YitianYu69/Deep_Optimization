@@ -362,7 +362,8 @@ class Trainer():
                             backup = self._sam(step, data, target)
 
                         
-                        self.compute_AWP_diff_and_perturbate(data, target, epoch=epoch)
+                        if self.awp is not None:
+                            self.compute_AWP_diff_and_perturbate(data, target, epoch=epoch)
                         logits = self.engine(data)
 
 
@@ -374,8 +375,8 @@ class Trainer():
                         if self.Trainer_config.get("SAM", {}) and self.Trainer_config.get("SAM", {}).get('turn_on', False):
                             backup = self._sam(step, data, target)
 
-
-                        self.compute_AWP_diff_and_perturbate(data, target, epoch=epoch)
+                        if self.awp is not None:
+                            self.compute_AWP_diff_and_perturbate(data, target, epoch=epoch)
                         logits = self.engine(data)
 
                     if isinstance(self.cri, Setup_Criterion):
@@ -474,14 +475,22 @@ class Trainer():
 
                                 clean_margin = margin(logits_view_map['Clean'], target_view_map['Clean'])
                                 trades_margin = margin(logits_view_map['TRADES'], target_view_map['TRADES'])
-                                ori_loss +=  F.smooth_l1_loss(clean_margin, trades_margin.detach())
+                                ori_loss +=  2 * F.smooth_l1_loss(clean_margin, trades_margin.detach())
 
+                            # if 'Freq' in self.view_types:
+
+                            #     kl_5 = F.kl_div(
+                            #         F.log_softmax(logits_view_map['PGD'] / T, dim=1),
+                            #         F.softmax(logits_view_map['Freq'] / T, dim=1),
+                            #         reduction='batchmean'
+                            #     )
+                            #     ori_loss += kl_5 * (T * T)
 
                             if len(self.Trainer_config.get('Soft_Margin_Loss', {})) != 0:
                                 sml_name = self.Trainer_config['Soft_Margin_Loss'].get('logits_name', 'Clean')
                                 ori_loss += top_pred_correction_loss(logits_view_map[sml_name], target_view_map[sml_name], T=1.5)
-                                ori_loss += 1 * soft_margin_loss_V2(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0, focal=True)
-                                ori_loss += 5 * soft_margin_loss_V1(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0, focal=True)
+                                ori_loss += 1 * soft_margin_loss_V2(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0)
+                                ori_loss += 5 * soft_margin_loss_V1(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0)
 
                         if self.ema is not None and isinstance(self.ema, EMA) and len(self.Trainer_config.get("EMA_Proximal_Loss", {})) != 0 and epoch >= self.Trainer_config.get("EMA_Proximal_Loss", {}).get("Start_Epoch", 6):
                             rho = self.Trainer_config.get("EMA_Proximal_Loss", {}).get("rho", 5e-4)
@@ -495,7 +504,7 @@ class Trainer():
                             ori_loss += trust_ratio * l1_s_loss
 
 
-                            if 'TRADES' in self.attack_types:
+                            if 'PGD' in self.attack_types:
                                 act_chunks = self.l1_act.chunk(self.num_chunks, dim=0)
                                 act_view_map = dict(zip(self.view_types,act_chunks))
 
@@ -1003,9 +1012,6 @@ class Trainer():
                 p.copy_(backup[p])
 
     def compute_AWP_diff_and_perturbate(self, data, target, epoch=0):
-        if self.awp is None:
-            raise ValueError('AWP cannot be None!')
-
         if self.Trainer_config.get('Multi_View', False):
             data_chunks = data.chunk(self.num_chunks, dim=0)
             target_chunks = target.chunk(self.num_chunks, dim=0)
@@ -1157,7 +1163,7 @@ def margin(logits, y):
     return true - max_wrong
 
 
-def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True, focal=False, gamma=3.0): 
+def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True): 
     prob = F.log_softmax(logits / T, dim=1) 
     true_prob = prob.gather(1, target[:, None]).squeeze(1) 
 
@@ -1171,28 +1177,14 @@ def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True
     # smooth hinge: approx max(0, target_margin - margin)
     loss_each = F.softplus(gap)
 
-    if focal:
-        pre_weight = 1.0 + torch.sigmoid(loss_each)
-        weight = pre_weight.pow(gamma)
-        weight = weight.detach()
-
-        loss_each = weight * loss_each
-
-    bad_mask = gap > 0
-    if bad_mask.any():
-        bad_margin = margin[bad_mask]
-        var_loss = bad_margin.var(unbiased=False)
-    else:
-        var_loss = 0.0
-
     if only_hard:
         mask = (gap > 0)
         if mask.any():
-            loss = loss_each[mask].mean() + var_loss
+            loss = loss_each[mask].mean()
         else:
             loss = logits.sum() * 0.0
     else:
-        loss = loss_each.mean() + var_loss
+        loss = loss_each.mean()
     return loss
 
 
@@ -1225,7 +1217,7 @@ def top_pred_correction_loss(logits, target, T=1.0, beta=10.0):
 
     return logits.sum() * 0.0
 
-def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0, focal=False, gamma=3.0):
+def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0):
     prob = F.log_softmax(logits / T, dim=1)
 
     true_prob = prob.gather(1, target[:, None]).squeeze(1)
@@ -1236,23 +1228,7 @@ def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0, focal=False, g
     margin = true_prob - max_wrong_prob
     margin_loss = F.softplus(target_margin - margin)
 
-
-    if focal:
-        pre_weight = 1.0 + torch.sigmoid(margin_loss)
-        weight = pre_weight.pow(gamma)
-        weight = weight.detach()
-
-        margin_loss = weight * margin_loss
-
-    bad_mask = margin > 0
-    if bad_mask.any():
-        bad_margin = margin[bad_mask]
-        var_loss = bad_margin.var(unbiased=False)
-    else:
-        var_loss = 0.0
-
-
-    return margin_loss.mean() + var_loss
+    return margin_loss.mean()
 
 
 def make_low_mid_mask(h, w, ratio=0.6, device='cuda'):
