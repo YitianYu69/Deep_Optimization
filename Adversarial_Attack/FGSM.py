@@ -382,7 +382,7 @@ def PGD_attack(model, cri, data, labels, num_iters=(7,), random_eps=8/255, alpha
                 loss = cri(logits, target.detach())
 
                 if not valid:
-                    loss += soft_margin_loss_V2(logits, labels, target_margin=4.0, T=1.5, focal=True)
+                    loss += soft_margin_loss_V2(logits, labels, target_margin=4.0, T=1.5)
 
                     clean_margin = margin(clean_logits, labels)
                     adv_margin = margin(logits, labels)
@@ -476,7 +476,7 @@ def TRADES_attack(model, data, labels=None,
 
             if not valid:
                 loss_kl += F.cross_entropy(adv_logits, labels)
-                loss_kl += soft_margin_loss_V2(adv_logits, labels, target_margin=4.0, T=1.5, focal=True)
+                loss_kl += soft_margin_loss_V2(adv_logits, labels, target_margin=4.0, T=1.5)
                 
                 clean_margin = margin(clean_logits, labels)
                 adv_margin = margin(adv_logits, labels)
@@ -501,7 +501,7 @@ def TRADES_attack(model, data, labels=None,
 
 
 
-def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True, focal=False, gamma=3.0): 
+def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True): 
     prob = F.log_softmax(logits / T, dim=1) 
     true_prob = prob.gather(1, target[:, None]).squeeze(1) 
 
