@@ -8,15 +8,8 @@ from typing import Callable
 import copy
 
 
-def normalize(perturbated_weights, ori_weights):
-    perturbated_weights.mul_(ori_weights.norm() / (perturbated_weights.norm() + 1e-8))
-
-def normalize_grad_by_weights(perturbated_weights, ori_weights):
-    for name, w in perturbated_weights:
-        if name in ori_weights and w.ndim > 1:
-            normalize(w.grad.data, ori_weights[name])
-        else:
-            w.grad.data.fill_(0)
+def normalize_and_cmpute(diff, ori_weights):
+    return diff * (ori_weights.norm() / (diff.norm() + 1e-8))
 
 
 
@@ -27,6 +20,7 @@ class AWP():
                  cri: Callable,
                  proxy_opt: torch.optim.Optimizer,
                  opt_kwargs: dict,
+                 gamma: float = 0.01,
                  device: str = 'cuda'):
 
         self.proxy_cls = proxy_cls # Object Class
@@ -37,6 +31,7 @@ class AWP():
         self.opt_kwargs = opt_kwargs
         self.diff = None
 
+        self.gamma = gamma
         self.device = device
 
 
@@ -81,22 +76,18 @@ class AWP():
                     )
 
                 loss.backward()
-
-                normalize_grad_by_weights(proxy.named_parameters(), ori_params)
-
                 proxy_opt.step()
-                proxy_opt.zero_grad(set_to_none=True)
             
         self.diff = {}
         for name, p in proxy.named_parameters():
             if name in ori_params:
-                d = p.detach() - ori_params[name]
-                self.diff[name] = d
+                diff = p.detach() - ori_params[name]
+                self.diff[name] = normalize_and_cmpute(diff, ori_params[name])
 
         del proxy
 
     @torch.no_grad()
-    def perturbate(self, model, gamma=0.01):
+    def perturbate(self, model):
         if not self.diff:
             raise ValueError('Please run perbute() before restore!')
 
@@ -106,7 +97,7 @@ class AWP():
                 p.add_(d.to(dtype=p.dtype, device=p.device), alpha=gamma)
 
     @torch.no_grad()
-    def restore(self, model, gamma=0.01):
+    def restore(self, model):
         if not self.diff:
             raise ValueError('Please run perbute() before restore!')
 
