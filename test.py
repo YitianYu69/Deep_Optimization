@@ -4,7 +4,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
 )
 
 import sys
-sys.path.insert(0, "/storage/home/hcoda1/1/yyu496/r-cwiese7-0/kaggle/CW/")
+sys.path.insert(0, "/u/yyu13/")
 
 import torch
 from torch.utils.data import Subset, random_split
@@ -245,6 +245,7 @@ def main():
         'cri' : criterion['Train'],
         'proxy_opt' : optimizer,
         'opt_kwargs' : optimizer_kwargs,
+        'gamma' : 0.001,
         'device' : 'cuda'
     }
 
@@ -254,7 +255,7 @@ def main():
                         'FGSM' : {'eps' : 8/255},
                          'FGSM_RS' : {'alpah' : 10/255},
                          'PGD' : {'steps' : 10, 'alpha' : 2/255, 'kl_weight' : 12.0},
-                        'TRADES' : {'random_eps' : 0.003, 'alpha' : 2/255, 'num_iters' : 10, 'beta' : 12.0},
+                        'TRADES' : {'random_eps' : 0.003, 'alpha' : 2/255, 'num_iters' : 10, 'beta' : 15.0},
                          'LIET' : {'LI' : True, 'num_class' : 10},
                         #  'AWP' : AWP_config,
                         },

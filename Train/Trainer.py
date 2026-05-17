@@ -435,12 +435,12 @@ class Trainer():
                                 #     F.softmax(kl_clean_logits.detach() / T, dim=1),
                                 #     reduction='batchmean'
                                 # )
-                                # kl2 = F.kl_div(
-                                #     F.log_softmax(kl_clean_logits / T, dim=1),
-                                #     F.softmax(logits_view_map[attack_key] / T, dim=1),
-                                #     reduction='batchmean'
-                                # )
-                                # ori_loss += kl2 * (T * T)
+                                kl2 = F.kl_div(
+                                    F.log_softmax(kl_clean_logits / T, dim=1),
+                                    F.softmax(logits_view_map[attack_key] / T, dim=1),
+                                    reduction='batchmean'
+                                )
+                                ori_loss += kl2 * (T * T)
                       
                             if "PGD" in self.attack_types:
                                 # kl3 = F.kl_div(
@@ -489,8 +489,8 @@ class Trainer():
                             if len(self.Trainer_config.get('Soft_Margin_Loss', {})) != 0:
                                 sml_name = self.Trainer_config['Soft_Margin_Loss'].get('logits_name', 'Clean')
                                 ori_loss += top_pred_correction_loss(logits_view_map[sml_name], target_view_map[sml_name], T=1.5)
-                                ori_loss += 1 * soft_margin_loss_V2(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0)
-                                ori_loss += 5 * soft_margin_loss_V1(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0)
+                                ori_loss += 1 * soft_margin_loss_V2(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0, focal=True)
+                                ori_loss += 5 * soft_margin_loss_V1(logits_view_map[sml_name], target_view_map[sml_name], T=1.5, target_margin=4.0, focal=True)
 
                         if self.ema is not None and isinstance(self.ema, EMA) and len(self.Trainer_config.get("EMA_Proximal_Loss", {})) != 0 and epoch >= self.Trainer_config.get("EMA_Proximal_Loss", {}).get("Start_Epoch", 6):
                             rho = self.Trainer_config.get("EMA_Proximal_Loss", {}).get("rho", 5e-4)
@@ -1163,7 +1163,7 @@ def margin(logits, y):
     return true - max_wrong
 
 
-def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True): 
+def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True, focal=False, gamma=3.0, offset=0.5): 
     prob = F.log_softmax(logits / T, dim=1) 
     true_prob = prob.gather(1, target[:, None]).squeeze(1) 
 
@@ -1176,6 +1176,12 @@ def soft_margin_loss_V2(logits, target, target_margin=1.0, T=1.0, only_hard=True
     
     # smooth hinge: approx max(0, target_margin - margin)
     loss_each = F.softplus(gap)
+
+    if focal:
+        pre_weight = offset + torch.sigmoid(loss_each)
+        weight = pre_weight.pow(gamma)
+
+        loss_each = weight * loss_each 
 
     if only_hard:
         mask = (gap > 0)
@@ -1217,7 +1223,7 @@ def top_pred_correction_loss(logits, target, T=1.0, beta=10.0):
 
     return logits.sum() * 0.0
 
-def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0):
+def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0, focal=False, gamma=3.0, offset=0.5):
     prob = F.log_softmax(logits / T, dim=1)
 
     true_prob = prob.gather(1, target[:, None]).squeeze(1)
@@ -1227,6 +1233,12 @@ def soft_margin_loss_V1(logits, target, target_margin=1.0, T=1.0):
 
     margin = true_prob - max_wrong_prob
     margin_loss = F.softplus(target_margin - margin)
+
+    if focal:
+        pre_weight = offset + torch.sigmoid(margin_loss)
+        weight = pre_weight.pow(gamma).detach()
+
+        margin_loss = weight * margin_loss
 
     return margin_loss.mean()
 
