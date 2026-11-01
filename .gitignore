@@ -1,0 +1,32 @@
+# Local Python environment and generated Python files
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test/lint output
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Experiment artifacts and locally downloaded datasets
+runs/
+/data/
+wandb/
+*.pt
+*.pth
+
+# Local settings and operating-system files
+.env
+.DS_Store
+
+# Local inspection and verification artifacts
+work/
+
+# Configuration-named diagnostic logs
+logs/
+*.log

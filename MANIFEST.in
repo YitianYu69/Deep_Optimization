@@ -1,0 +1,19 @@
+include README.md LICENSE pyproject.toml
+recursive-include src *.py
+recursive-include tests *.py *.md
+recursive-include docs *.md
+recursive-include examples *.py *.md
+recursive-include configs *.toml
+recursive-include benchmarks *.py
+prune build
+prune dist
+prune logs
+prune work
+prune runs
+prune data
+prune .venv
+prune .git
+prune .mypy_cache
+prune .ruff_cache
+prune .pytest_cache
+global-exclude __pycache__ *.py[cod] *.pt *.pth *.log .DS_Store
