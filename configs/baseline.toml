@@ -20,3 +20,11 @@ checkpoint_every_steps = 0  # Opt in: e.g. 100 saves every 100 optimizer updates
 device = "cpu"
 precision = "fp32"
 deterministic = true
+
+# Optional model-only torch.compile; first execution pays compilation cost.
+[runtime.compile]
+enabled = false
+backend = "inductor"
+fullgraph = false
+# mode = "default"
+# dynamic = true  # Omit for PyTorch's automatic shape handling.

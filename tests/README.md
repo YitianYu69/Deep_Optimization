@@ -10,6 +10,7 @@ python -m unittest discover -s tests -v
 | --- | --- |
 | `training/` | Fit/manual APIs, module hooks, runtime safety, progress and performance |
 | `execution/` | Mode policies, reference-equivalent updates, compile behavior, transfers and profiler invariants |
+| `cuda/` | CUDA Graph lifecycle, module/function capture, decorator/context replay, autograd and real NCCL composition |
 | `checkpointing/` | Checkpoint durability, generator discovery, step resume and batch-size changes |
 | `data/` | Loader construction, skipping, worker state and cursor-preserving rebatching |
 | `distributed/` | Separate execution cores, real Gloo/torchrun training, sharding, rank-local recovery and NCCL when available |
@@ -30,6 +31,12 @@ python -m unittest discover -s tests -p 'test_step_checkpoint.py' -v
 Each group is a Python package so full discovery descends into it. CUDA and
 optional TorchData tests skip when their prerequisites are unavailable; see the
 [development guide](../docs/architecture/README.md) for those checks.
+
+Configured compilation has white-box schema/dispatch tests in
+`execution/test_compile_white_box.py` and real eager/AOT-backend training,
+memory-estimation and checkpoint tests in `execution/test_compile_black_box.py`.
+The Inductor GPU check in `cuda/test_compile_black_box.py` skips without CUDA;
+the distributed acceptance tests also exercise in-place compilation with DDP.
 
 ## White-box and black-box coverage
 
@@ -53,6 +60,7 @@ module. CUDA skips must not be reported as GPU validation.
 | Area | White-box focus | Black-box focus |
 | --- | --- | --- |
 | Training and execution cores | Core selection, delegation, graph lifetime, failure state | Fit/manual updates, module hooks, stopping and scheduler behavior |
+| CUDA Graph | `cuda/test_graph_white_box.py`: state transitions, storage/signature validation, function dispatch and core ownership | `cuda/test_graph_black_box.py` and `test_graph_ddp_black_box.py`: real CUDA values/gradients, training, state restore and two-GPU DDP |
 | Distributed | `distributed/test_cores_white_box.py` and `test_data_white_box.py`: core isolation, reducer boundaries, normalization, fake tracing and generator ownership | `distributed/test_ddp_black_box.py`: real Gloo/NCCL processes, torchrun, worker prefetch, global results, rank-local recovery |
 | Data | Cursor/origin validation, dispatch versus delivery, generator ownership | Sample order, worker prefetch, custom collation, resume and rebatching |
 | Checkpointing | Schema/topology validation, transactional writes, RNG restoration | Interrupted versus uninterrupted runs and public checkpoint/CLI recovery |

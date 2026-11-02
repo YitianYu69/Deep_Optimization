@@ -29,6 +29,16 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class CompileConfig:
+    enabled: bool = False
+    backend: str = "inductor"
+    mode: str | None = None
+    fullgraph: bool = False
+    dynamic: bool | None = None
+    options: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     device: str = "cpu"
     precision: str = "fp32"
@@ -38,6 +48,7 @@ class RuntimeConfig:
     diagnostics: dict[str, Any] | None = None
     mode_schedule: dict[str, str] | None = None
     non_blocking: bool = False
+    compile: CompileConfig = field(default_factory=CompileConfig)
 
 
 @dataclass(frozen=True)
@@ -153,7 +164,7 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
     application = _application_value(application, "application")
     r = raw.get("runtime", {})
     _require_keys(r, set(), "runtime", {"device", "precision", "deterministic", "checks", "execution_mode",
-                                          "diagnostics", "mode_schedule", "non_blocking"})
+                                          "diagnostics", "mode_schedule", "non_blocking", "compile"})
     device, precision = r.get("device", "cpu"), r.get("precision", "fp32")
     if not isinstance(device, str) or not (
         device in ("cpu", "cuda", "auto") or
@@ -204,13 +215,41 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
     non_blocking = r.get("non_blocking", False)
     if type(non_blocking) is not bool:
         raise ConfigError("runtime.non_blocking must be a boolean")
+    compilation = compile_config_from_dict(r.get("compile", {}))
     identity = raw.get("experiment_identity", {})
     if not isinstance(identity, dict):
         raise ConfigError("experiment_identity must be a table")
     identity = _application_value(identity, "experiment_identity")
     return ExperimentConfig(name, seed, training, application=application,
-                            runtime=RuntimeConfig(device, precision, deterministic, checks, mode, diagnostics, schedule, non_blocking),
+                            runtime=RuntimeConfig(device, precision, deterministic, checks, mode, diagnostics, schedule,
+                                                  non_blocking, compilation),
                             experiment_identity=identity)
+
+
+def compile_config_from_dict(raw: dict) -> CompileConfig:
+    """Validate compiler settings without importing Torch or loading backends."""
+    _require_keys(raw, set(), "runtime.compile", {"enabled", "backend", "mode", "fullgraph", "dynamic", "options"})
+    for key in ("enabled", "fullgraph"):
+        if type(raw.get(key, False)) is not bool:
+            raise ConfigError(f"runtime.compile.{key} must be a boolean")
+    dynamic = raw.get("dynamic")
+    if dynamic is not None and type(dynamic) is not bool:
+        raise ConfigError("runtime.compile.dynamic must be a boolean or null")
+    backend = raw.get("backend", "inductor")
+    if not isinstance(backend, str) or not backend.strip():
+        raise ConfigError("runtime.compile.backend must be a nonempty string")
+    mode = raw.get("mode")
+    if mode not in (None, "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"):
+        raise ConfigError("runtime.compile.mode must be default, reduce-overhead, max-autotune, or max-autotune-no-cudagraphs")
+    options = raw.get("options", {})
+    if not isinstance(options, dict) or any(not isinstance(key, str) or not key for key in options):
+        raise ConfigError("runtime.compile.options must be a table with nonempty string keys")
+    if any(type(value) not in (str, bool, int, float) or (type(value) is float and not isfinite(value))
+           for value in options.values()):
+        raise ConfigError("runtime.compile.options values must be strings, booleans or finite numbers")
+    if mode is not None and options:
+        raise ConfigError("Choose runtime.compile.mode or runtime.compile.options, not both")
+    return CompileConfig(raw.get("enabled", False), backend, mode, raw.get("fullgraph", False), dynamic, dict(options))
 
 
 def load_config(path: str | Path) -> ExperimentConfig:

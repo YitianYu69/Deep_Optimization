@@ -6,9 +6,10 @@ from importlib import import_module
 __all__ = ["Trainer", "TrainingRuntime", "TrainingModule", "MultiOptimizer", "FiniteCheck", "TensorEvent",
            "LossResult", "LossReport", "Checkpoint", "EveryNSteps",
            "initialize_distributed", "shutdown_distributed", "is_main_process", "DistributedContext", "TrainingCore", "DDPCore",
-           "DiagnosticPolicy", "ExecutionMode"]
+           "DiagnosticPolicy", "ExecutionMode", "CUDAGraphCore", "cuda_graph_core"]
 
 _MODULES = {"Trainer": ".engine", "TrainingRuntime": ".engine",
+            "CUDAGraphCore": ".cuda_graph", "cuda_graph_core": ".cuda_graph",
             "TrainingModule": ".module", "MultiOptimizer": ".optimizers",
             "FiniteCheck": ".observers", "TensorEvent": ".observers",
             "LossResult": ".tasks.loss", "LossReport": ".tasks.loss",

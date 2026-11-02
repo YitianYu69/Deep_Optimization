@@ -35,6 +35,7 @@ model, loader, and optimizer already exist unless the snippet constructs them.
 | Skip a batch prefix or use worker-aware loading | [Data loading](data/README.md) |
 | Train with a scalar loss or customize the whole forward/loss computation | [Training APIs](training/README.md) |
 | Train across CPU/GPU ranks with separate regular and DDP cores | [Distributed training](distributed/README.md) |
+| Capture models/functions or CUDA code blocks and replay with training/DDP | [CUDA Graphs](cuda/README.md) |
 | Use validation, best-metric selection, progress bars, callbacks, or graceful stopping | [Training APIs](training/README.md) |
 | Control backward and optimizer order, or wrap a model without using the trainer | [Training APIs](training/README.md) |
 | Reuse a `Task`, `TrainingModule`, or custom batch/device-transfer method | [Training APIs](training/README.md) |

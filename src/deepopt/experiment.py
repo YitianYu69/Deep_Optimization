@@ -7,6 +7,7 @@ from .optim import build_optimizer, build_scheduler
 from .runtime import resolve_device, seed_everything
 from .distributed._process import initialize_distributed, rank, world_size
 from .engine.execution.policy import DiagnosticPolicy
+from .engine.execution.compilation import compile_model
 
 
 def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory,
@@ -34,6 +35,7 @@ def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory
     train_loader, validation_loader, generators = loader_factory(
         train_data, validation_data, batch_size=config.training.batch_size, seed=config.seed, **loader_options)
     model = model_factory().to(device)
+    compile_model(model, config.runtime.compile)
     optimizer = optimizer_factory(model, config.training)
     scheduler = scheduler_factory(optimizer, config.training)
     options = {name: value for name, value in {

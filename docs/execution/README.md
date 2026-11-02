@@ -7,6 +7,10 @@ Loss reduction, precision, accumulation, clipping, optimizer updates, structural
 validation and distributed failure coordination remain separate responsibilities.
 Both `TrainingCore` and `DDPCore` use the same runtime policy controller.
 
+Model compilation is independently configurable through
+[`[runtime.compile]`](../runs/README.md#configure-torchcompile). It is disabled
+by default and does not compile the runtime or its diagnostic scheduling.
+
 | Selection | Loss/gradient finite checks | Other diagnostics |
 | --- | --- | --- |
 | No mode; legacy `checks=True` | Existing strict checks at every observation | Existing default event kinds; behavior preserved |

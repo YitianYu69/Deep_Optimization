@@ -11,7 +11,7 @@ python examples/training/regression.py
 ```
 
 Alternatively, use `PYTHONPATH=src python ...` with an environment that already
-has the dependencies. Every example below uses small generated CPU data and
+has the dependencies. Examples use small generated data (CUDA examples require a GPU) and
 requires no downloads. Data shapes, class counts and architectures belong to
 the examples; they are not framework requirements. Reported numbers can vary
 with the installed PyTorch version and environment.
@@ -21,6 +21,7 @@ Examples are grouped by the feature they teach:
 | Folder | Start here for |
 | --- | --- |
 | `training/` | Standard losses, custom steps and optional module hooks |
+| `cuda/` | [CUDA Graph capture](cuda/graphs.py): models, functions, decorators, contexts and runtime composition; run `python examples/cuda/graphs.py` |
 | `metrics/` | Custom metrics, routing and explicit loss weighting |
 | `optimization/` | Multiple optimizers, custom updates and strategies |
 | `checkpointing/` | Save, resume and evaluate best weights |

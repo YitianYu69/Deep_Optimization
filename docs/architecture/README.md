@@ -51,11 +51,17 @@ collect selected exports; `__main__.py` enables `python -m deepopt`.
 ```text
 src/deepopt/
 ├── engine/
+│   ├── core.py         # Regular training core
 │   ├── training/       # Trainer, epoch loops, step adapters and progress
 │   ├── execution/      # Batch transfer, precision, backward and updates
 │   ├── reporting/      # Metric accumulation, lifecycle and saved states
 │   ├── checkpointing/  # Durable checkpoints and strategy state
 │   └── strategies/     # Loss and gradient policies
+├── distributed/        # Parent package of distributed cores
+│   ├── ddp.py          # DDP core
+│   └── _process.py     # Internal process-group helpers
+├── cuda_graph/         # Independent graph capture/replay service
+│   └── core.py         # CUDA Graph core, composed with either training core
 ├── memory/             # Estimation, storage statistics and batch planning
 ├── data/               # Ordinary, skipping and resumable loading
 ├── tasks/              # Optional tasks and explicit loss metadata
@@ -80,6 +86,7 @@ for focused commands. The usual recursive test discovery covers all groups.
 | --- | --- |
 | Packaging | [pyproject.toml](../../pyproject.toml): dependencies, `src` layout, `deepopt` console entry point |
 | Public exports | [src/deepopt/__init__.py](../../src/deepopt/__init__.py): lazily load training APIs; configuration can be imported without loading Torch |
+| CUDA Graphs | [cuda_graph/core.py](../../src/deepopt/cuda_graph/core.py): model/function capture, raw blocks and inference decorators; graph lifetime stays separate from training and DDP |
 | Application configuration | [config.py](../../src/deepopt/config.py): typed settings, strict common keys, application-owned metadata |
 | Model storage summary | [memory/statistics.py](../../src/deepopt/memory/statistics.py): parameter counts/percentages, current storage and initialization logging without fake execution |
 | Recipe callbacks | [checkpoint.py](../../src/deepopt/checkpoint.py): history, discovery and checkpoint files; [callbacks.py](../../src/deepopt/callbacks.py): scheduled update callbacks |
@@ -157,8 +164,8 @@ DEEPOPT_TEST_DISTRIBUTED=1 python -m unittest discover -s tests -p 'test_metrics
 ```
 
 See the [examples README](../../examples/README.md) for runnable commands and
-which scripts create artifacts. There is no configured linter, type-checker,
-or hosted CI workflow in the current repository.
+which scripts create artifacts. The [CI workflow](../../.github/workflows/ci.yml)
+runs lint, targeted typing, CPU tests and opt-in GPU checks.
 
 ## Autograd and performance
 
@@ -197,6 +204,9 @@ serve a different purpose and do not replace measured workload validation.
   is the parent namespace for distributed cores. Both share runtime/trainer
   orchestration. CPU uses fp32; CUDA supports fp32/bf16. There is no fp16 gradient
   scaler. See [DDP architecture and launch instructions](../distributed/README.md).
+- The sibling `cuda_graph/core.py` owns CUDA capture/replay. Capture a model
+  before constructing either training core; runtime/trainer state and DDP
+  collectives remain eager. See [CUDA Graph APIs and tests](../cuda/README.md).
 - Ordinary loaders are the default for epoch saving. Built-in index-skip
   sampler/loader utilities do not claim state recovery. The resumable loader
   supports rebatching and worker prefetch with a delivered-sample cursor;

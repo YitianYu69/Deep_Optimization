@@ -283,6 +283,7 @@ def estimate_training_memory(trainer, sample_batch) -> TrainingMemoryEstimate:
              if trainer.runtime.distributed else
              "Kernel workspaces, allocator fragmentation, CUDA context, communication and external allocations are excluded.",
              "Metrics, observers, scheduler and Trainer callbacks are excluded; user computation must not mutate external Python state or perform I/O.",
+             "In-place compiled modules are copied and traced eagerly; compiler workspaces and graph pools are not estimated.",
              "Existing scalar CPU optimizer step counters are copied as known control constants; model and input values remain unknown."))
     except MemoryEstimationError:
         raise

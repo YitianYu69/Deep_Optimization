@@ -312,6 +312,10 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
             # and counters are not part of optimization or checkpoint state.
             settings["runtime"] = {k: v for k, v in settings["runtime"].items()
                                    if k not in ("checks", "execution_mode", "diagnostics", "mode_schedule", "non_blocking")}
+            # Old checkpoints omit the compiler table. Disabled compilation is
+            # equivalent; enabled settings remain strict for reproducibility.
+            if not settings["runtime"].get("compile", {}).get("enabled", False):
+                settings["runtime"].pop("compile", None)
         if not settings.get("experiment_identity"):
             settings.pop("experiment_identity", None)
     if saved != requested:

@@ -207,6 +207,8 @@ def _accumulation_cases(rank, world, device):
 
 
 def _compiled_mode_cases(rank, device):
+    from deepopt.config import CompileConfig
+    from deepopt.engine.execution.compilation import compile_model
     precisions = ("fp32", "bf16") if device.type == "cuda" and torch.cuda.is_bf16_supported() else ("fp32",)
     for precision in precisions:
         expected = None
@@ -214,7 +216,8 @@ def _compiled_mode_cases(rank, device):
             torch._dynamo.reset()
             raw = nn.Linear(1, 1, bias=False).to(device)
             nn.init.ones_(raw.weight)
-            model = torch.compile(raw, backend="inductor" if device.type == "cuda" else "eager")
+            model = compile_model(raw, CompileConfig(enabled=True,
+                                  backend="inductor" if device.type == "cuda" else "eager"))
             trainer = Trainer(model, torch.optim.SGD(model.parameters(), lr=.01), device=device,
                               precision=precision, loss_fn=nn.functional.mse_loss, accumulation_steps=2,
                               execution_mode="max_speed", mode_schedule=schedule)

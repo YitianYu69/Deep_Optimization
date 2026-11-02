@@ -130,9 +130,17 @@ class TrainingRuntime:
         self._stepper.require_complete_optimizer()
 
     def _require_healthy(self) -> None:
+        self._require_eager()
         if self._failed:
             raise RuntimeError("A previous backward or optimizer update failed; restore a checkpoint "
                                "or reconstruct the runtime before continuing")
+
+    def _require_eager(self) -> None:
+        # Python counters, diagnostics and rank coordination must execute on
+        # every update. Capture the model, leaving runtime operations outside.
+        if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("TrainingRuntime operations cannot be CUDA-captured; use "
+                               "cuda_graph_core.capture_model before constructing the runtime")
 
     def _mark_failed(self) -> None:
         self._failed = True
@@ -175,6 +183,7 @@ class TrainingRuntime:
         No BatchOutput, Task, metric, or optimizer contract is imposed here.
         This does not change train/eval mode or disable autograd.
         """
+        self._require_eager()
         if self.model.training and torch.is_grad_enabled() and not self._pending_gradients:
             if self.mode_controller.prepare_update():
                 self._configure_checks()
@@ -220,6 +229,7 @@ class TrainingRuntime:
             raise
 
     def zero_grad(self):
+        self._require_eager()
         if self.optimizer is None:
             raise RuntimeError("zero_grad requires an optimizer")
         self.optimizer.zero_grad(set_to_none=True)
