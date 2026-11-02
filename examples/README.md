@@ -24,6 +24,7 @@ Examples are grouped by the feature they teach:
 | `cuda/` | [CUDA Graph capture](cuda/graphs.py): models, functions, decorators, contexts and runtime composition; run `python examples/cuda/graphs.py` |
 | `metrics/` | Custom metrics, routing and explicit loss weighting |
 | `optimization/` | Multiple optimizers, custom updates and strategies |
+| `scheduling/` | [Named coefficient warmup](scheduling/coefficients.py); run `python examples/scheduling/coefficients.py` |
 | `checkpointing/` | Save, resume and evaluate best weights |
 | `data/` | Batch skipping and worker-aware recovery |
 | `memory/` | Storage summaries, fake estimates and batch-size planning |

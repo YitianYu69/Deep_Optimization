@@ -21,15 +21,17 @@ class EpochProgress:
     seconds: float = 0.0
     # Keep epoch-start logging stable when an update-level schedule resumes.
     learning_rates: list | None = None
+    scheduled_values_start: dict | None = None
 
     def state_dict(self) -> dict:
         return {"updates_at_start": self.updates_at_start, "batches": self.batches,
                 "samples": self.samples, "seconds": self.seconds,
                 "learning_rates": deepcopy(self.learning_rates),
+                "scheduled_values_start": deepcopy(self.scheduled_values_start),
                 "metrics": snapshot_metrics(self.metrics)}
 
     @classmethod
     def restore(cls, state: dict, metric: Metric, device):
         restore_metrics(metric, state["metrics"], device)
         return cls(metric, state["updates_at_start"], state["batches"], state["samples"], state["seconds"],
-                   deepcopy(state.get("learning_rates")))
+                   deepcopy(state.get("learning_rates")), deepcopy(state.get("scheduled_values_start")))

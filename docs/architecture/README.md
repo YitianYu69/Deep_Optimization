@@ -62,6 +62,9 @@ src/deepopt/
 │   └── _process.py     # Internal process-group helpers
 ├── cuda_graph/         # Independent graph capture/replay service
 │   └── core.py         # CUDA Graph core, composed with either training core
+├── scheduling/         # Pure curves, coefficient lifecycle and native LR factory
+├── optimizer_factory.py # PyTorch/custom optimizer construction
+├── optim.py            # Reserved optimizer algorithms; lazy legacy factory aliases
 ├── memory/             # Estimation, storage statistics and batch planning
 ├── data/               # Ordinary, skipping and resumable loading
 ├── tasks/              # Optional tasks and explicit loss metadata
@@ -104,7 +107,8 @@ for focused commands. The usual recursive test discovery covers all groups.
 | Runtime operations | [engine/execution/runtime.py](../../src/deepopt/engine/execution/runtime.py), [batch.py](../../src/deepopt/engine/execution/batch.py), [precision.py](../../src/deepopt/engine/execution/precision.py): transfer, backward, autocast and runtime health |
 | Updates | [engine/execution/optimization.py](../../src/deepopt/engine/execution/optimization.py), [optimizer_step.py](../../src/deepopt/engine/execution/optimizer_step.py): accumulation, gradient processing and updates |
 | Policies | [engine/strategies/](../../src/deepopt/engine/strategies/), [strategy_state.py](../../src/deepopt/engine/checkpointing/strategy_state.py): replaceable policies and checkpoint metadata |
-| Optimizers | [optim.py](../../src/deepopt/optim.py), [optimizers/multi.py](../../src/deepopt/optimizers/multi.py): construction helpers and disjoint child optimizers |
+| Optimizers | [optimizer_factory.py](../../src/deepopt/optimizer_factory.py) constructs optimizers; [optim.py](../../src/deepopt/optim.py) is reserved for algorithms; [optimizers/multi.py](../../src/deepopt/optimizers/multi.py) composes disjoint children |
+| Scheduling | [scheduling/](../../src/deepopt/scheduling/) owns pure curves, coefficient values and native LR construction; Trainer owns timing; validation never advances schedules |
 | Reporting | [engine/reporting/metrics.py](../../src/deepopt/engine/reporting/metrics.py), [metric_lifecycle.py](../../src/deepopt/engine/reporting/metric_lifecycle.py): phase-local accumulation and scalar output checks |
 | Metric persistence | [engine/reporting/metric_state.py](../../src/deepopt/engine/reporting/metric_state.py): registered states, nested update counters and cache invalidation |
 | Progress and checkpointing | [engine/training/state.py](../../src/deepopt/engine/training/state.py), [progress.py](../../src/deepopt/engine/training/progress.py), [checkpoint.py](../../src/deepopt/engine/checkpointing/checkpoint.py): durable state and restoration boundaries |

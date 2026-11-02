@@ -152,13 +152,14 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
     elif "batch_size" in saved_config.get("training", {}):
         saved_config["training"] = {**saved_config["training"], "batch_size": batch_size}
     payload = {
-        "format_version": 4,
+        "format_version": 5,
         "kind": kind,
         "epoch_progress": trainer.epoch_progress.state_dict() if kind == "step" else None,
         "train_loader": {"type": type_name(train_loader), "state": train_loader.state_dict()} if kind == "step" else None,
         "config": saved_config,
         "experiment_identity": snapshot_identity(saved_config, trainer.experiment_identity),
         "diagnostics": trainer.runtime.diagnostic_state(),
+        "schedules": trainer.schedules.state_dict() if trainer.schedules is not None else None,
         "batch_size": batch_size,
         "components": _component_types(trainer),
         "trainer_settings": _trainer_settings(trainer),
@@ -176,6 +177,8 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
                          torch.cuda.get_rng_state_all()) if trainer.device.type == "cuda" else []},
         "generators": {name: generator.get_state() for name, generator in generators.items()},
     }
+    if trainer.schedules is not None:
+        trainer.schedules.validate_state_dict(payload["schedules"], completed_update=trainer.state.optimizer_steps)
     return payload
 
 
@@ -189,6 +192,8 @@ def save_checkpoint(path, trainer, config, *, generators, history, kind="epoch",
                                            ("rng", "generators", "train_loader", "epoch_progress", "strategies", "device")})
             local["buffers"] = distributed.cpu_state(dict(trainer.model.named_buffers()))
     if distributed.world_size() > 1:
+        if trainer.schedules is not None:
+            distributed.require_equal(payload["schedules"], "coefficient schedule checkpoint state")
         states = [None] * distributed.world_size() if distributed.is_main_process() else None
         torch.distributed.gather_object(local, states, dst=0)
         payload["distributed"] = {"world_size": distributed.world_size(), "ranks": states}
@@ -238,11 +243,14 @@ def read_checkpoint_progress(path) -> tuple[str, tuple[int, int]]:
 
 
 def _validate_checkpoint(payload) -> None:
-    if not isinstance(payload, dict) or payload.get("format_version") != 4:
-        raise ValueError("Unsupported checkpoint format; expected deepopt format_version 4")
+    if (not isinstance(payload, dict) or type(payload.get("format_version")) is not int
+            or payload["format_version"] not in (4, 5)):
+        raise ValueError("Unsupported checkpoint format; expected deepopt format_version 4 or 5")
     required = {"config", "environment", "device", "model", "optimizer", "scheduler",
                 "state", "history", "rng", "generators", "components", "trainer_settings",
                 "kind", "epoch_progress", "train_loader"}
+    if payload["format_version"] == 5:
+        required.add("schedules")
     if not required.issubset(payload):
         raise ValueError("Checkpoint is missing required training state")
     if payload["kind"] not in ("epoch", "step"):
@@ -262,6 +270,7 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
     keeps the requested size. Neither policy changes LR, accumulation, or the
     number of previously consumed samples. No real training probes are run.
     """
+    _validate_checkpoint(payload)
     saved_distributed = payload.get("distributed")
     saved_world = saved_distributed.get("world_size") if isinstance(saved_distributed, Mapping) else 1
     if saved_world != distributed.world_size():
@@ -307,6 +316,10 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
             settings["training"] = {k: v for k, v in settings["training"].items()
                                     if k not in ("epochs", "checkpoint_every_steps", "batch_size")
                                     and not (k == "scheduler_interval" and v == "epoch")}
+            if settings["training"].get("lr_schedule") is None:
+                settings["training"].pop("lr_schedule", None)
+        if not settings.get("schedules"):
+            settings.pop("schedules", None)
         if "runtime" in settings:
             # Passive diagnostics may be enabled after a resume. Their objects
             # and counters are not part of optimization or checkpoint state.
@@ -340,6 +353,13 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
     if trainer.device.type == "cuda" and len(payload["rng"]["cuda"]) != (1 if saved_world > 1 else torch.cuda.device_count()):
         raise ValueError("Resume requires the same number of visible CUDA devices")
     state = TrainingState(**payload["state"])
+    saved_schedules = payload.get("schedules")
+    if (saved_schedules is None) != (trainer.schedules is None):
+        raise ValueError("Resume requires the same coefficient schedules; old checkpoints cannot acquire new schedules")
+    if trainer.schedules is not None:
+        trainer.schedules.validate_state_dict(saved_schedules, completed_update=state.optimizer_steps)
+        if saved_schedules["epoch"] > state.completed_epochs + (payload["kind"] == "step"):
+            raise ValueError("Schedule epoch is ahead of saved training progress")
     history = payload["history"]
     if len(history) != state.completed_epochs:
         raise ValueError("Checkpoint history does not match its completed epoch count")
@@ -367,6 +387,13 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
     progress = None
     if payload["kind"] == "step":
         progress = EpochProgress.restore(payload["epoch_progress"], trainer.new_metrics(), trainer.device)
+        if trainer.schedules is not None:
+            from deepopt.scheduling.base import finite
+            start_values = progress.scheduled_values_start
+            if not isinstance(start_values, dict) or start_values.keys() != trainer.schedules.values.keys():
+                raise ValueError("Invalid saved epoch-start coefficient values")
+            for name, value in start_values.items():
+                finite(value, name)
         if (type(progress.batches) is not int or progress.batches <= 0
                 or (progress.samples is not None and
                     (type(progress.samples) is not int or progress.samples <= 0))
@@ -396,6 +423,8 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
     if trainer.scheduler is not None:
         trainer.scheduler.load_state_dict(payload["scheduler"])
     restore_strategies(payload.get("strategies"), trainer)
+    if trainer.schedules is not None:
+        trainer.schedules.load_state_dict(saved_schedules, completed_update=state.optimizer_steps)
     trainer.state = state
     for name, generator in generators.items():
         generator.set_state(payload["generators"][name])
@@ -430,3 +459,12 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
     trainer.at_epoch_boundary = progress is None
     trainer.at_step_boundary = False
     return list(history)
+
+
+def restore_schedules_for_evaluation(payload, trainer):
+    """Restore last applied values without preparing or completing an update."""
+    saved = payload.get("schedules")
+    if (saved is None) != (trainer.schedules is None):
+        raise ValueError("Evaluation requires the checkpoint's coefficient schedules")
+    if trainer.schedules is not None:
+        trainer.schedules.load_state_dict(saved, completed_update=payload["state"]["optimizer_steps"])

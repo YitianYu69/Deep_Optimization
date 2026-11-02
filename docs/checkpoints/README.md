@@ -177,7 +177,12 @@ that application layer.
 
 ## What is saved
 
-Current files use checkpoint `format_version=4`:
+Current files use checkpoint `format_version=5`; supported version-4 files remain readable:
+
+Version 5 adds named coefficient schedule identity, state and last applied
+values. Restoring validates schedule progress against the trainer's optimizer
+updates. Version-4 checkpoints without schedules restore without a controller;
+they cannot silently acquire one. See [scheduling resume rules](../scheduling/README.md#reports-and-restoration).
 
 - Model parameters/buffers, optimizer state, scheduler state, and strategy state.
 - Completed epoch/update counters, best score/epoch, and monitor selection.

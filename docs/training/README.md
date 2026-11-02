@@ -182,6 +182,7 @@ stops after epoch two, and continues the same trainer to a total of three epochs
 | `mode_schedule` | Apply mode transitions at optimizer-update boundaries |
 | `non_blocking` | Request nonblocking transfers through nested batches |
 | `experiment_identity` | Required caller-declared recipe/data/code versions for resume |
+| `schedules` | Optional shared `ScheduleController`; prepare coefficients at accumulation-window boundaries; see [scheduling](../scheduling/README.md) |
 
 When passing an existing runtime, configure optimizer, device, precision,
 clipping/gradient strategy, and checks on that runtime. Do not supply those

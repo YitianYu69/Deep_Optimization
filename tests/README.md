@@ -16,6 +16,7 @@ python -m unittest discover -s tests -v
 | `distributed/` | Separate execution cores, real Gloo/torchrun training, sharding, rank-local recovery and NCCL when available |
 | `metrics/` | Metric inputs, aggregation, saved state and optional counts |
 | `optimization/` | Loss semantics, accumulation, strategies and optimizers |
+| `scheduling/` | Curve/controller white-box checks; training, LR timing, resume, compilation counts and two/four-rank Gloo acceptance |
 | `memory/` | Storage accounting, fake estimation, planning and activation retention |
 | `observability/` | Logging, numerical observers and their configuration |
 | `application/` | Configuration, factories, configured runs and CLI |

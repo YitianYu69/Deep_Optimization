@@ -99,6 +99,7 @@ map. Each topic has its own README and links to complete runnable examples.
 | [Training APIs](docs/training/README.md) | `fit`, custom steps, callbacks, evaluation, manual loops, optional tasks and wrappers |
 | [CUDA Graphs](docs/cuda/README.md) | Model/function capture, context/decorator APIs, replay lifetime and composition with training/DDP |
 | [Losses and optimization](docs/optimization/README.md) | Loss reduction and weighting, accumulation, clipping, schedulers, custom optimizers and strategies |
+| [Scheduling and warmup](docs/scheduling/README.md) | Named coefficients, LR policies, update/epoch timing, compiled tensor values and exact resume |
 | [Metrics](docs/metrics/README.md) | TorchMetrics, custom `Metric` subclasses, input routing, reporting and synchronization |
 | [Logging](docs/logging/README.md) | vLLM-style module loggers, configuration-named files, verbosity and clean command output |
 | [Configured runs and data](docs/runs/README.md) | TOML settings, factories, caller-owned datasets, CLI, artifacts and evaluation |

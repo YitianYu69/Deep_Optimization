@@ -140,12 +140,12 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
 trainer = Trainer(model, optimizer, loss_fn=loss_function)
 ```
 
-The optional configured factory `deepopt.optim.build_optimizer(model, config)`
+The optional configured factory `deepopt.optimizer_factory.build_optimizer(model, config)`
 supports `adamw`, `sgd`, and a `custom` choice. AdamW uses learning rate and
 weight decay; SGD additionally uses momentum. For a parameter-iterable factory:
 
 ```python
-from deepopt.optim import build_optimizer
+from deepopt.optimizer_factory import build_optimizer
 
 def apply_optimizer(parameters, settings):
     return torch.optim.AdamW(parameters, lr=settings.learning_rate)

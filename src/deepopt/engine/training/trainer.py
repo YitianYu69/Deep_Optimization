@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from copy import deepcopy
+from contextlib import nullcontext
 import inspect
 from math import isfinite
 
@@ -44,7 +45,7 @@ class Trainer:
                  loss_strategy: LossStrategy | None = None, gradient_strategy: GradientStrategy | None = None,
                  loss_fn=None, step_fn=None, validation_step_fn=None, metrics=None, metric_inputs=None,
                  checks=None, ddp_options=None, execution_mode=None, diagnostics=None, mode_schedule=None,
-                 non_blocking=None, experiment_identity=None):
+                 non_blocking=None, experiment_identity=None, schedules=None):
         if metric_factory is not None and (metrics is not None or metric_inputs is not None):
             raise ValueError("Choose metrics/metric_inputs or metric_factory, not both")
         if scheduler_interval not in ("epoch", "step"):
@@ -84,10 +85,18 @@ class Trainer:
         self._epochs = EpochRunner(self.runtime, self._steps, accumulation_steps=accumulation_steps,
                                    loss_strategy=loss_strategy, metric_factory=metric_factory)
         from deepopt.engine.checkpointing.identity import validate_identity
+        from deepopt.scheduling import ScheduleController
         with self.runtime.core.check_errors("experiment identity"):
             self.experiment_identity = validate_identity({} if experiment_identity is None else experiment_identity)
+            if schedules is not None and not isinstance(schedules, ScheduleController):
+                raise TypeError("schedules must be a ScheduleController")
+            if schedules is not None and schedules.completed_update != 0:
+                raise ValueError("Use a fresh schedule controller and restore trainer progress from a checkpoint")
+            self.schedules = schedules if schedules is not None and len(schedules) else None
+            schedule_state = self.schedules.state_dict() if self.schedules is not None else None
         self.runtime.core.require_equal({"accumulation_steps": accumulation_steps, "precision": self.precision,
                                          "experiment_identity": self.experiment_identity,
+                                         "schedules": schedule_state,
                                          "scheduler_interval": scheduler_interval,
                                          "loss_strategy": (type(loss_strategy).__qualname__, loss_strategy.get_config()),
                                          "gradient_strategy": (type(self.runtime.gradient_strategy).__qualname__,
@@ -99,6 +108,7 @@ class Trainer:
         self.epoch_progress: EpochProgress | None = None
         self._resume_pending = False
         self._stop_requested = False
+        self._schedule_report = None
         log_model_memory(self.model, self.optimizer)
 
     @property
@@ -237,6 +247,8 @@ class Trainer:
                 row = {"epoch": self.state.completed_epochs, "learning_rate": lr,
                        "learning_rates": learning_rates, "optimizer_steps": self.state.optimizer_steps,
                        "train": training, "validation": validation}
+                if self.schedules is not None:
+                    row.update(self._schedule_report)
                 logger.info("Epoch %s/%s: train=%s validation=%s",
                             self.state.completed_epochs, epochs, training, validation)
                 for callback in callbacks:
@@ -285,6 +297,11 @@ class Trainer:
 
         selected_callbacks = []
 
+        def prepare_coefficients():
+            self.schedules.prepare_update(self.state.optimizer_steps + 1, epoch=self.state.completed_epochs + 1)
+            if progress.scheduled_values_start is None:
+                progress.scheduled_values_start = dict(self.schedules.values)
+
         def prepare_update():
             if not step_callbacks:
                 return False
@@ -302,6 +319,8 @@ class Trainer:
 
         def on_update(progress):
             self.state.optimizer_steps += 1
+            if self.schedules is not None:
+                self.schedules.complete_update(self.state.optimizer_steps)
             if self.scheduler is not None and self.scheduler_interval == "step":
                 self.scheduler.step()
             self.at_step_boundary = True
@@ -309,22 +328,34 @@ class Trainer:
                 event = {"epoch": self.state.completed_epochs + 1,
                          "optimizer_step": self.state.optimizer_steps,
                          "batches_processed": progress.batches, "samples_processed": progress.samples}
+                if self.schedules is not None:
+                    event["scheduled_values"] = dict(self.schedules.values)
                 for callback in selected_callbacks:
                     with self.runtime.core.check_errors("step callback"):
                         callback(self, event)
             finally:
                 self.at_step_boundary = False
 
-        results = self._epochs.train(loader, progress, on_update=on_update,
-                                     synchronize_updates=prepare_update)
+        try:
+            results = self._epochs.train(loader, progress, on_update=on_update,
+                                         synchronize_updates=prepare_update,
+                                         on_window_start=prepare_coefficients if self.schedules is not None else None)
+        except BaseException:
+            if self.schedules is not None:
+                self.schedules.abort_update()
+            raise
         # A resumed final-step checkpoint may have no new batches this epoch.
         if (self.scheduler is not None and self.scheduler_interval == "epoch"
                 and self.state.optimizer_steps > progress.updates_at_start):
             self.scheduler.step()
         self.state.completed_epochs += 1
+        if self.schedules is not None:
+            self._schedule_report = {"scheduled_values_start": deepcopy(progress.scheduled_values_start),
+                                     "scheduled_values": dict(self.schedules.values)}
         self.at_epoch_boundary = True
         self.epoch_progress = None
         return results
 
     def evaluate(self, loader) -> dict:
-        return self._epochs.evaluate(loader)
+        with self.schedules.read_only() if self.schedules is not None else nullcontext():
+            return self._epochs.evaluate(loader)

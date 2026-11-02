@@ -1,0 +1,28 @@
+# Generic coefficient names are consumed by your recipe's step_factory.
+# The built-in CLI demo illustrates LR scheduling; it does not invent uses
+# for user-defined coefficients. See docs/scheduling/README.md.
+name = "scheduled"
+seed = 7
+
+[training]
+epochs = 3
+batch_size = 16
+learning_rate = 0.001
+scheduler_interval = "step"
+
+[training.lr_schedule]
+type = "warmup_cosine"
+warmup_steps = 4
+total_steps = 24
+start_factor = 0.1
+eta_min = 0.00001
+
+[schedules.auxiliary_weight]
+type = "linear_warmup"
+interval = "update"
+start = 0.0
+end = 0.1
+duration = 10
+
+[runtime]
+execution_mode = "max_speed"

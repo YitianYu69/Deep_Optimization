@@ -23,6 +23,7 @@ from deepopt.engine.execution.policy import ModeController
 from deepopt.distributed import _process as distributed
 from deepopt.observers import CheckObservers
 from deepopt.optimizers import MultiOptimizer
+from deepopt.scheduling.controller import fake_tensor_reads
 
 
 class MemoryEstimationError(RuntimeError):
@@ -247,7 +248,7 @@ def estimate_training_memory(trainer, sample_batch) -> TrainingMemoryEstimate:
     try:
         runtime, steps, strategy, batch, initial = _clone_training(trainer, sample_batch, mode)
         trace = _StorageTrace()
-        with torch.enable_grad(), mode, trace:
+        with torch.enable_grad(), mode, trace, fake_tensor_reads(mode):
             # A custom runtime can accept already-placed inputs without any
             # transfer dispatch. Every live batch field still occupies storage,
             # including fields this particular step does not consume.

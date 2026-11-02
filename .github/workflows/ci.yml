@@ -22,7 +22,7 @@ jobs:
       - run: python -m mypy --strict --follow-imports=skip --ignore-missing-imports src/deepopt/engine/execution/policy.py
       - name: Fast CPU white-box and black-box tests
         run: |
-          for group in cuda execution optimization training metrics memory observability application onboarding; do
+          for group in cuda execution optimization training metrics memory observability application onboarding scheduling; do
             python -m unittest discover -s tests/$group -v
           done
       - run: python -m build
@@ -50,6 +50,7 @@ jobs:
           python -m unittest discover -s tests/data -v
           python -m unittest discover -s tests/checkpointing -v
           python -m unittest discover -s tests/distributed -v
+          python -m unittest discover -s tests/scheduling -p test_ddp_black_box.py -v
           python -m unittest discover -s tests/metrics -p test_metrics.py -v
   cuda:
     if: vars.DEEPOPT_GPU_CI == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')

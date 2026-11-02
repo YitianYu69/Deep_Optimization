@@ -3,7 +3,9 @@
 from .config import ExperimentConfig
 from .data.loaders import build_loaders
 from .engine import Trainer
-from .optim import build_optimizer, build_scheduler
+from .optimizer_factory import build_optimizer
+from .scheduling.lr import build_scheduler
+from .scheduling import ScheduleController
 from .runtime import resolve_device, seed_everything
 from .distributed._process import initialize_distributed, rank, world_size
 from .engine.execution.policy import DiagnosticPolicy
@@ -14,7 +16,8 @@ def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory
                      loader_factory=build_loaders,
                      optimizer_factory=build_optimizer, scheduler_factory=build_scheduler,
                      task_factory=None, metric_factory=None, trainer_factory=Trainer,
-                     loss_fn=None, step_fn=None, validation_step_fn=None, metrics=None, metric_inputs=None):
+                     loss_fn=None, step_fn=None, validation_step_fn=None, metrics=None, metric_inputs=None,
+                     schedules=None, step_factory=None):
     """Wire caller-owned model_factory() and dataset_factory() components.
 
     The dataset factory returns the actual training/validation datasets and
@@ -29,6 +32,18 @@ def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory
     seed_everything(config.seed, config.runtime.deterministic)
     context = initialize_distributed(config.runtime.device)
     device = resolve_device(str(context.device))
+    configured = ScheduleController.from_config(config.schedules) if config.schedules else None
+    if schedules is not None and not isinstance(schedules, ScheduleController):
+        raise TypeError("schedules must be a ScheduleController")
+    if schedules is not None and configured is not None and schedules.get_config() != configured.get_config():
+        raise ValueError("Supplied coefficient schedules differ from configuration")
+    schedules = schedules if schedules is not None else configured
+    if step_factory is not None:
+        if step_fn is not None or loss_fn is not None:
+            raise ValueError("Choose step_factory or step_fn/loss_fn")
+        step_fn = step_factory(schedules)
+        if not callable(step_fn):
+            raise TypeError("step_factory(schedules) must return a step_fn(model, batch)")
     train_data, validation_data = dataset_factory()
     loader_options = ({"resumable": config.training.checkpoint_every_steps > 0}
                       if loader_factory is build_loaders else {})
@@ -55,6 +70,8 @@ def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory
         options["non_blocking"] = True
     if config.experiment_identity:
         options["experiment_identity"] = config.experiment_identity
+    if schedules is not None:
+        options["schedules"] = schedules
     trainer = trainer_factory(
         model, optimizer, device=device, precision=config.runtime.precision,
         checks=config.runtime.checks, accumulation_steps=config.training.accumulation_steps,

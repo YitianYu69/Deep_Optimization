@@ -20,7 +20,7 @@ class EpochRunner:
     def new_metrics(self):
         return self.metrics.create(self.steps, self.metric_factory)
 
-    def train(self, loader, progress, *, on_update, synchronize_updates=True) -> dict:
+    def train(self, loader, progress, *, on_update, synchronize_updates=True, on_window_start=None) -> dict:
         window = OptimizationWindow(self.runtime, accumulation_steps=self.accumulation_steps,
                                     loss_strategy=self.loss_strategy)
         self.runtime.model.train()
@@ -59,6 +59,8 @@ class EpochRunner:
                 should_sync = (left is None or left == 0 or window.pending_batches + 1 == self.accumulation_steps)
                 with self.runtime.core.accumulation_context(synchronize=should_sync):
                     with distributed.collective_errors("training step"):
+                        if window.pending_batches == 0 and on_window_start is not None:
+                            on_window_start()
                         output = self.runtime.compute(batch, self.steps.training_step)
                     if self.runtime.diagnostics is None:
                         self.runtime.observe("loss", output.loss, name="loss")

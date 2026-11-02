@@ -40,6 +40,7 @@ model, loader, and optimizer already exist unless the snippet constructs them.
 | Control backward and optimizer order, or wrap a model without using the trainer | [Training APIs](training/README.md) |
 | Reuse a `Task`, `TrainingModule`, or custom batch/device-transfer method | [Training APIs](training/README.md) |
 | Accumulate gradients, define token/sample weights, or report a different loss statistic | [Losses and optimization](optimization/README.md) |
+| Warm up or schedule named coefficients and configure native LR policies | [Scheduling and warmup](scheduling/README.md) |
 | Assign optimizers to different layers, customize optimizer construction, clip gradients, or schedule LR | [Losses and optimization](optimization/README.md) |
 | Write a TorchMetrics `Metric`, route several metric inputs, or use compound scalar reports | [Metrics](metrics/README.md) |
 | Understand metric lifetime, synchronization, checkpoint counters, or detached reporting | [Metrics](metrics/README.md) |

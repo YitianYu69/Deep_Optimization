@@ -26,6 +26,7 @@ class TrainingConfig:
     monitor_mode: str = "min"
     checkpoint_every_steps: int = 0  # Opt in with a positive optimizer-update interval.
     scheduler_interval: str = "epoch"
+    lr_schedule: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class ExperimentConfig:
     application: dict[str, Any] = field(default_factory=dict)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     experiment_identity: dict[str, Any] = field(default_factory=dict)
+    schedules: dict[str, Any] = field(default_factory=dict)
 
 
 def _require_keys(table: Any, expected: set[str], location: str,
@@ -114,7 +116,7 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
         raise ConfigError("The fixed [data] schema was removed. Supply datasets through dataset_factory(); "
                           "store caller-owned options under [application]. For the synthetic demo only, "
                           "move the old [data] fields to [application.synthetic].")
-    _require_keys(raw, {"name", "seed", "training"}, "config", {"application", "runtime", "experiment_identity"})
+    _require_keys(raw, {"name", "seed", "training"}, "config", {"application", "runtime", "experiment_identity", "schedules"})
     name = raw["name"]
     if not isinstance(name, str) or not name.strip():
         raise ConfigError("name must be a non-empty string")
@@ -125,7 +127,7 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
     t = raw["training"]
     _require_keys(t, {"epochs", "batch_size", "learning_rate"}, "training",
                   {"accumulation_steps", "optimizer", "weight_decay", "momentum", "lr_gamma", "grad_clip_norm",
-                   "monitor", "monitor_mode", "checkpoint_every_steps", "scheduler_interval"})
+                   "monitor", "monitor_mode", "checkpoint_every_steps", "scheduler_interval", "lr_schedule"})
     optimizer = t.get("optimizer", "adamw")
     if optimizer not in ("adamw", "sgd", "custom"):
         raise ConfigError("training.optimizer must be adamw, sgd, or custom")
@@ -147,6 +149,15 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
     scheduler_interval = t.get("scheduler_interval", "epoch")
     if scheduler_interval not in ("epoch", "step"):
         raise ConfigError("training.scheduler_interval must be epoch or step")
+    from .scheduling.factory import normalize_schedules
+    from .scheduling.lr_config import normalize_lr_schedule
+    try:
+        schedules = normalize_schedules(raw.get("schedules", {}))
+        lr_schedule = normalize_lr_schedule(t.get("lr_schedule"))
+    except (ValueError, TypeError) as exc:
+        raise ConfigError(str(exc)) from exc
+    if lr_schedule is not None and gamma != 1.:
+        raise ConfigError("Choose training.lr_schedule or legacy lr_gamma, not both")
     training = TrainingConfig(
         epochs=_integer(t["epochs"], "training.epochs", 1),
         batch_size=_integer(t["batch_size"], "training.batch_size", 1),
@@ -156,7 +167,7 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
         momentum=momentum, lr_gamma=gamma, grad_clip_norm=clip,
         monitor=monitor, monitor_mode=monitor_mode,
         checkpoint_every_steps=_integer(t.get("checkpoint_every_steps", 0), "training.checkpoint_every_steps", 0),
-        scheduler_interval=scheduler_interval,
+        scheduler_interval=scheduler_interval, lr_schedule=lr_schedule,
     )
     application = raw.get("application", {})
     if not isinstance(application, dict):
@@ -223,7 +234,7 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
     return ExperimentConfig(name, seed, training, application=application,
                             runtime=RuntimeConfig(device, precision, deterministic, checks, mode, diagnostics, schedule,
                                                   non_blocking, compilation),
-                            experiment_identity=identity)
+                            experiment_identity=identity, schedules=schedules)
 
 
 def compile_config_from_dict(raw: dict) -> CompileConfig:
