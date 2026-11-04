@@ -136,6 +136,7 @@ owns history, generator registration and saves. Prefer
 | [training/train_module.py](training/train_module.py) | `python examples/training/train_module.py --mode fit`, `--mode manual`, or `--mode wrapper` | Optional module hooks, using a module in a manual loop, or ordinary forward-only wrapping |
 | [optimization/train_strategies.py](optimization/train_strategies.py) | `python examples/optimization/train_strategies.py --api fit --weighting samples` | Explicit sample weights and gradient-value clipping |
 | [optimization/train_strategies.py](optimization/train_strategies.py) | `python examples/optimization/train_strategies.py --api manual --weighting microbatches` | Reusing `OptimizationWindow` while owning the loop |
+| [optimization/fp8_training.py](optimization/fp8_training.py) | `python examples/optimization/fp8_training.py` or `--device cuda --backend triton` | FP8 model conversion, report, and three optimizer updates; reference emulation by default, actual Triton requires NVIDIA CC >= 9 |
 | [observability/train_observers.py](observability/train_observers.py) | `python examples/observability/train_observers.py --mode all` | Default checks, checks off, and selective finite/activation observers |
 | [metrics/custom_metric.py](metrics/custom_metric.py) | `python examples/metrics/custom_metric.py` | Standalone registered metric states: MAE is `2.0`, then reset count is zero |
 | [configured/read_config.py](configured/read_config.py) | `python examples/configured/read_config.py` | Read and validate the baseline TOML, then print selected fields |
