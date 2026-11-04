@@ -1,11 +1,16 @@
 """Construct native PyTorch LR schedulers; Trainer owns step/epoch timing."""
 
+from collections.abc import Mapping
+
 from torch.optim import lr_scheduler as lr
 
+from deepopt.config import TrainingConfig, normalize_training_config
 from .lr_config import normalize_lr_schedule
 
 
-def build_scheduler(optimizer, config):
+def build_scheduler(optimizer, config: TrainingConfig | Mapping):
+    """Accept TrainingConfig or its dictionary representation."""
+    config = normalize_training_config(config)
     policy = normalize_lr_schedule(config.lr_schedule)
     if policy is None:
         return lr.ExponentialLR(optimizer, gamma=config.lr_gamma)

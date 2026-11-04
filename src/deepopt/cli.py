@@ -22,12 +22,14 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="deepopt", description="Train and evaluate reproducible baselines.")
-    parser.add_argument("--config", type=Path, help="Inspect a config (legacy shorthand)")
+    parser.add_argument("--config", help="Inspect a TOML path or builtin:NAME (legacy shorthand)")
     commands = parser.add_subparsers(dest="command")
     inspect = commands.add_parser("inspect-config", help="Validate TOML and print resolved settings")
-    inspect.add_argument("--config", type=Path, required=True, dest="inspect_config")
+    inspect.add_argument("--config", required=True, dest="inspect_config",
+                         help="TOML file path or installed preset builtin:NAME")
     train_parser = commands.add_parser("train", help="Train a new run or resume last.pt")
-    train_parser.add_argument("--config", type=Path, dest="train_config")
+    train_parser.add_argument("--config", dest="train_config",
+                              help="TOML file path or installed preset builtin:NAME")
     train_parser.add_argument("--output", type=Path, help="New run directory")
     train_parser.add_argument("--resume", type=Path, help="Resume last.pt or last_step.pt")
     train_parser.add_argument("--epochs", type=int, help="Total target epochs, including completed epochs")

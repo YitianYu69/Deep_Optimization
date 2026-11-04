@@ -5,6 +5,7 @@ from functools import partial
 import torch
 
 from .data.synthetic import SyntheticDataSettings, build_datasets
+from .config import load_config
 from .experiment import build_experiment
 from .models.mlp import build_mlp
 from .tasks.classification import ClassificationTask
@@ -14,12 +15,14 @@ def baseline_sample_batch(config, size):
     """Describe the synthetic recipe's batch for fake-tensor memory planning."""
     if type(size) is not int or size < 1:
         raise ValueError("Sample batch size must be a positive integer")
+    config = load_config(config)
     settings = SyntheticDataSettings.from_dict(config.application.get("synthetic", {}))
     return (torch.empty(size, settings.input_dim, dtype=torch.float32),
             torch.empty(size, dtype=torch.long))
 
 
 def build_baseline_experiment(config, **overrides):
+    config = load_config(config)
     settings = SyntheticDataSettings.from_dict(config.application.get("synthetic", {}))
     defaults = {
         "dataset_factory": partial(build_datasets, settings, config.seed),

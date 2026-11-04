@@ -1,0 +1,18 @@
+# Run with: torchrun --standalone --nproc-per-node=2 -m deepopt train \
+#   --config configs/ddp.toml --output runs/ddp
+name = "ddp-baseline"
+seed = 42
+
+[training]
+epochs = 3
+batch_size = 16 # Per-rank microbatch size.
+accumulation_steps = 2
+learning_rate = 1e-3
+checkpoint_every_steps = 5
+monitor = "accuracy"
+monitor_mode = "max"
+
+[runtime]
+device = "auto" # NCCL + LOCAL_RANK on CUDA; Gloo on CPU.
+precision = "fp32"
+deterministic = true

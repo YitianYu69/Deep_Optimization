@@ -1,24 +1,27 @@
 """Optimizer construction, separate from shipped algorithms and scheduling."""
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 
 import torch
 from torch import nn
 
-from .config import TrainingConfig
+from .config import TrainingConfig, normalize_training_config
 
 
 OptimizerApplyFunction = Callable[[Iterable[nn.Parameter], TrainingConfig], torch.optim.Optimizer]
 
 
-def build_optimizer(model: nn.Module, config: TrainingConfig,
+def build_optimizer(model: nn.Module, config: TrainingConfig | Mapping,
                     apply_func: OptimizerApplyFunction | None = None) -> torch.optim.Optimizer:
     """Create an optimizer, optionally using apply_func(parameters, settings).
 
     apply_func runs once during construction, after the model is on its device.
     Return a torch.optim.Optimizer so state saving and scheduling work.
     Without a function, use the configured built-in optimizer.
+    Dictionary settings use the same required fields as TrainingConfig;
+    apply_func always receives a TrainingConfig instance.
     """
+    config = normalize_training_config(config)
     if apply_func is not None:
         optimizer = apply_func(model.parameters(), config)
         if not isinstance(optimizer, torch.optim.Optimizer):

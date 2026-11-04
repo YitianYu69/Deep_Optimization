@@ -32,7 +32,10 @@ class SyntheticDataSettings:
         return cls(**options)
 
 
-def build_datasets(config: SyntheticDataSettings, seed: int) -> tuple[TensorDataset, TensorDataset]:
+def build_datasets(config: SyntheticDataSettings | dict, seed: int) -> tuple[TensorDataset, TensorDataset]:
+    """Build this demo's datasets from typed settings or the same settings dict."""
+    if not isinstance(config, SyntheticDataSettings):
+        config = SyntheticDataSettings.from_dict(config)
     # This generator does not consume model/dropout randomness. The splits
     # share a teacher, but contain independently drawn input examples.
     generator = torch.Generator().manual_seed(seed)
