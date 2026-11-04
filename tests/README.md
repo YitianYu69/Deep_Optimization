@@ -9,19 +9,19 @@ python -m unittest discover -s tests -v
 | Folder | Coverage |
 | --- | --- |
 | `training/` | Fit/manual APIs, module hooks, runtime safety, progress and performance |
-| `execution/` | Mode policies, reference-equivalent updates, compile behavior, transfers and profiler invariants |
+| `execution/` | Mode policies, automatic FP8 configuration/core preparation, reference-equivalent updates, compilation, transfers and profiler invariants |
 | `cuda/` | CUDA Graph lifecycle, capture/replay, real Triton FP8 GEMM/autograd, ViT/HF models, and NCCL composition/resume |
 | `checkpointing/` | Checkpoint durability, generator discovery, step resume and batch-size changes |
 | `data/` | Loader construction, skipping, worker state and cursor-preserving rebatching |
 | `distributed/` | Separate execution cores, real Gloo/torchrun training, FP8 gradient synchronization/resume, sharding and rank-local recovery |
 | `metrics/` | Metric inputs, aggregation, saved state and optional counts |
 | `optimization/` | Loss semantics, accumulation, strategies and optimizers |
-| `opt/` | FP8 numerical/autograd black-box and white-box checks, FX transformation, shared state, trainer resume, and optional real ViT/GPT-2/Llama models |
+| `opt/` | FP8 numerical/autograd and AMP/FP8 scope checks, FX transformation, shared state, trainer resume, and optional real ViT/GPT-2/Llama models |
 | `scheduling/` | Curve/controller white-box checks; training, LR timing, resume, compilation counts and two/four-rank Gloo acceptance |
 | `memory/` | Storage accounting, fake estimation, planning and activation retention |
 | `observability/` | Logging, numerical observers and their configuration |
 | `application/` | Configuration, factories, configured runs and CLI |
-| `onboarding/` | User workflows, published walkthrough and import compatibility |
+| `onboarding/` | User workflows, documentation links/anchors/snippet syntax, runnable CPU recipes, configured resume and public imports |
 
 Run one group or one file:
 
@@ -30,15 +30,47 @@ python -m unittest discover -s tests/memory -v
 python -m unittest discover -s tests -p 'test_step_checkpoint.py' -v
 ```
 
+To verify documentation and its executable recipes:
+
+```bash
+python -m unittest tests.onboarding.test_documentation_white_box tests.onboarding.test_examples_black_box tests.onboarding.test_getting_started -v
+python -m unittest tests.data.test_examples_black_box tests.distributed.test_examples_black_box -v
+```
+
+The first command checks navigation and Python/TOML snippet syntax, then runs
+the base CPU catalog and save/resume walkthroughs. The second uses real loader
+workers and two Gloo ranks. Optional TorchData recovery skips without `workers`;
+CUDA examples are checked with `--help` here, while actual CUDA execution belongs
+to [tests/cuda](cuda/). Temporary directories contain test artifacts.
+
 Each group is a Python package so full discovery descends into it. CUDA and
 optional TorchData tests skip when their prerequisites are unavailable; see the
 [development guide](../docs/architecture/README.md) for those checks.
+
+Tensor-worker examples require a working PyTorch shared-memory manager. On
+macOS, a deeply nested `TMPDIR` can exceed the Unix-socket path limit and produce
+`no response from torch_shm_manager`. If that is the cause, run with a short
+writable temporary path, for example `TMPDIR=/tmp python -m unittest discover -s tests/data -v`.
+This changes the test environment, not the loader's recovery behavior.
 
 Configured compilation has white-box schema/dispatch tests in
 `execution/test_compile_white_box.py` and real eager/AOT-backend training,
 memory-estimation and checkpoint tests in `execution/test_compile_black_box.py`.
 The Inductor GPU check in `cuda/test_compile_black_box.py` skips without CUDA;
 the distributed acceptance tests also exercise in-place compilation with DDP.
+
+Automatic FP8 tests cover enabled/disabled configuration, preparation order,
+existing optimizer state, direct and configured checkpoint recovery, and
+cross-rank policy agreement. Combined AMP/FP8 context tests check native linear
+calls, nested disable/restore, decorators, thread isolation, saved backward
+policy, and cached compiled models across dense/FP8 transitions. The CUDA
+context test executes Triton under BF16 AMP when compatible hardware is present.
+
+```bash
+python -m unittest discover -s tests/execution -p 'test_fp8_*.py' -v
+python -m unittest discover -s tests/opt -p 'test_autocast_*.py' -v
+python -m unittest tests.application.test_fp8_configured_runs tests.distributed.test_fp8_automatic_black_box -v
+```
 
 ## White-box and black-box coverage
 

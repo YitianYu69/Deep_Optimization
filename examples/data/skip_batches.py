@@ -19,6 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=0)
     args = parser.parse_args()
+    if args.workers < 0:
+        parser.error("--workers must be nonnegative")
     dataset = TensorDataset(torch.arange(10))
     batch_sampler = SkipBatchSampler(BatchSampler(SequentialSampler(dataset), 2, drop_last=False), skip_batches=3)
     explicit = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=args.workers)

@@ -15,7 +15,8 @@ from deepopt import TrainingRuntime
 def main():
     torch.manual_seed(42)
     real_samples = 1.5 + 0.4 * torch.randn(32, 2)
-    loader = DataLoader(real_samples, batch_size=8, shuffle=True)
+    loader = DataLoader(real_samples, batch_size=8, shuffle=True,
+                        generator=torch.Generator().manual_seed(43))
     generator = nn.Sequential(nn.Linear(3, 8), nn.Tanh(), nn.Linear(8, 2))
     discriminator = nn.Sequential(nn.Linear(2, 8), nn.SiLU(), nn.Linear(8, 1))
     generator_optimizer = torch.optim.AdamW(generator.parameters(), lr=0.01)
@@ -23,17 +24,25 @@ def main():
     generation = TrainingRuntime(generator, generator_optimizer)
     discrimination = TrainingRuntime(discriminator, discriminator_optimizer)
 
+    def discriminator_step(real):
+        # No generator graph is needed while updating the discriminator.
+        with torch.no_grad():
+            fake = generator(torch.randn(real.shape[0], 3, device=real.device))
+        real_logits, fake_logits = discriminator(real), discriminator(fake)
+        return (F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
+                + F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits)))
+
+    def generator_step(noise):
+        logits = discriminator(generator(noise))
+        return F.binary_cross_entropy_with_logits(logits, torch.ones_like(logits))
+
     generator.train()
     discriminator.train()
     for epoch in range(3):
         for real in loader:
-            # First update the discriminator using detached generated samples.
+            # compute() supplies batch transfer and the runtime's precision context.
             discrimination.zero_grad()
-            with torch.no_grad():
-                fake = generator(torch.randn(real.shape[0], 3))
-            real_logits, fake_logits = discriminator(real), discriminator(fake)
-            discriminator_loss = (F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
-                                  + F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits)))
+            discriminator_loss = discrimination.compute(real, discriminator_step)
             discrimination.backward(discriminator_loss)
             discrimination.step()
 
@@ -41,9 +50,7 @@ def main():
             generation.zero_grad()
             discriminator.requires_grad_(False)
             try:
-                fake = generator(torch.randn(real.shape[0], 3))
-                logits = discriminator(fake)
-                generator_loss = F.binary_cross_entropy_with_logits(logits, torch.ones_like(logits))
+                generator_loss = generation.compute(torch.randn(real.shape[0], 3), generator_step)
                 generation.backward(generator_loss)
                 generation.step()
             finally:

@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from deepopt.logger import log_output
-from deepopt import Trainer
+from deepopt import EveryNSteps, Trainer
 
 
 def main():
@@ -36,12 +36,14 @@ def main():
             current.request_stop()  # This is a successful completed epoch.
 
     def report_update(current, event):
-        if event["optimizer_step"] % 5 == 0:
-            log_output(json.dumps({"update": event["optimizer_step"],
-                              "batches_this_epoch": event["batches_processed"]}))
+        log_output(json.dumps({"update": event["optimizer_step"],
+                          "batches_this_epoch": event["batches_processed"]}))
 
+    # Declare cadence before entering callbacks, avoiding callback-related
+    # device synchronization on updates that do not produce a report.
     state = trainer.fit(train, validation, epochs=5, progress_bar=False,
-                        callbacks=[report_epoch, stop_after_two], step_callbacks=[report_update])
+                        callbacks=[report_epoch, stop_after_two],
+                        step_callbacks=[EveryNSteps(report_update, 5)])
     log_output("Stopped after completed epoch:", state.completed_epochs)
     # epochs is a TOTAL target; this call trains one more epoch, not three.
     trainer.fit(train, validation, epochs=3, progress_bar=False, callbacks=[report_epoch])

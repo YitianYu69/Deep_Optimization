@@ -1,4 +1,8 @@
-"""Show batch-average vs explicitly element-weighted loss on uneven batches."""
+"""Show batch-average vs explicitly element-weighted loss on uneven batches.
+
+Run: python examples/metrics/loss_reporting.py
+This evaluates a fixed zero predictor; it does not train or write files.
+"""
 
 import torch
 from torch import nn
@@ -18,6 +22,7 @@ def element_mean_loss(predictions, targets):
 
 
 def main():
+    torch.manual_seed(42)
     model = nn.Linear(1, 1, bias=False)
     with torch.no_grad():
         model.weight.zero_()

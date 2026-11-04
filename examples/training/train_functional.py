@@ -53,7 +53,8 @@ def main():
     torch.manual_seed(42)
     generator = torch.Generator().manual_seed(42)
     custom = args.mode == "custom"
-    train_loader = DataLoader(make_data(64, generator, custom=custom), batch_size=8, shuffle=True)
+    train_loader = DataLoader(make_data(64, generator, custom=custom), batch_size=8,
+                              shuffle=True, generator=torch.Generator().manual_seed(43))
     validation_loader = DataLoader(make_data(24, generator, custom=custom), batch_size=8)
     model = nn.Sequential(nn.Linear(4, 16), nn.SiLU(), nn.Linear(16, 1))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.03)
@@ -68,7 +69,8 @@ def main():
         log_output(json.dumps({"epoch": row["epoch"], "train": row["train"],
                           "validation": row["validation"]}))
 
-    trainer.fit(train_loader, validation_loader, epochs=args.epochs, callbacks=[report_epoch])
+    trainer.fit(train_loader, validation_loader, epochs=args.epochs,
+                callbacks=[report_epoch], progress_bar=False)
     log_output(f"Completed {trainer.state.completed_epochs} epochs with {trainer.state.optimizer_steps} updates")
 
 

@@ -6,9 +6,13 @@ __all__ = [
     "TransformationTraceError",
     "ConversionRegistry",
     "default_registry",
+    "autocast",
+    "FP8Config",
 ]
 
 _EXPORTS = {
+    "autocast": "._autocast",
+    "FP8Config": "..config",
     "transform_model": ".transform",
     "TransformReport": ".transform",
     "TransformationTraceError": ".transform",

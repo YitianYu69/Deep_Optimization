@@ -1,6 +1,6 @@
 # Execution modes and performance contracts
 
-[Training](../training/README.md) · [DDP](../distributed/README.md) · [Observers](../observers/README.md) · [Checkpoints](../checkpoints/README.md)
+[Documentation index](../README.md) · [Training](../training/README.md) · [DDP](../distributed/README.md) · [Observers](../observers/README.md) · [Checkpoints](../checkpoints/README.md)
 
 Execution modes control passive diagnostics, not the optimization algorithm.
 Loss reduction, precision, accumulation, clipping, optimizer updates, structural
@@ -10,6 +10,112 @@ Both `TrainingCore` and `DDPCore` use the same runtime policy controller.
 Model compilation is independently configurable through
 [`[runtime.compile]`](../runs/README.md#configure-torchcompile). It is disabled
 by default and does not compile the runtime or its diagnostic scheduling.
+
+FP8 is a separate opt-in computation policy through
+[`[runtime.fp8]`](../runs/README.md#configure-fp8) or `Trainer(..., fp8=...)`.
+It can be combined with AMP precision; changing diagnostic modes does not change
+FP8 formats or scaling.
+
+## Run the examples
+
+```bash
+python examples/execution/execution_modes.py
+python examples/execution/compile_training.py
+python examples/execution/compile_training.py --backend inductor --fullgraph
+python examples/optimization/fp8_training.py
+```
+
+[Execution modes](../../examples/execution/execution_modes.py) runs seven
+microbatches with accumulation 2. Its four optimizer updates use `max_speed`,
+`analyze`, `analyze`, then `balanced`, and it demonstrates an explicit safe mode
+switch after the final partial window. It prints the mode at each update and a
+final loss; diagnostics may also emit log messages to stderr.
+
+[Compiled training](../../examples/execution/compile_training.py) compiles a
+small MLP before optimizer/trainer construction and performs three updates on
+generated data. Its default `aot_eager` backend exercises compiler/autograd
+integration without native kernel generation. Select `inductor` to exercise its
+compiler toolchain. Neither example downloads data or writes run artifacts.
+Both accept `--device cuda` when CUDA is available; unavailable devices and
+compiler failures propagate instead of silently changing execution.
+
+The [FP8 example](../../examples/optimization/fp8_training.py) passes `FP8Config`
+to the trainer, prints the automatic transformation report, and performs three
+updates. Its default CPU reference backend emulates FP8 quantization; select
+`--device cuda --backend triton` for the actual CUDA backend.
+
+## Enable FP8 in a direct recipe
+
+```python
+import torch
+
+from deepopt import Trainer
+from deepopt.config import FP8Config
+
+model = make_model().to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+trainer = Trainer(model, optimizer, device=device, loss_fn=loss_fn,
+                  fp8=FP8Config(enabled=True, backend="reference"))
+model = trainer.model
+report = trainer.runtime.transformation_report
+```
+
+FP8 preparation preserves master parameter objects, so the supplied optimizer
+continues to own them. Both regular and DDP cores apply the same preparation
+policy before their execution setup. The default module strategy keeps a
+container's root class and methods; exact registered root operations return
+their DO adapter. Explicit `full`/`auto` tracing can replace the root with an FX
+graph. Use the model exposed by the trainer/runtime afterward.
+
+The core also enters the FP8 context around its step, so supported functional
+linear calls in untraced Python code use the same policy. The transformation
+report lists graph/module rewrites; it does not enumerate runtime-dispatched
+calls or promise that every operation uses FP8. `precision="bf16"` continues to
+control CUDA AMP independently. The [FP8 guide](../fp8/README.md) also covers a
+standalone combined autocast context for caller-owned loops.
+
+## Compile the model
+
+The direct Python equivalent of `[runtime.compile]` is:
+
+```python
+import torch
+
+from deepopt import Trainer
+from deepopt.config import CompileConfig
+from deepopt.engine.execution.compilation import compile_model
+
+model = make_model().to(device)
+model = compile_model(model, CompileConfig(enabled=True, backend="inductor"))
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+trainer = Trainer(model, optimizer, device=device, loss_fn=loss_fn)
+```
+
+This helper uses `nn.Module.compile()` in place, retaining the model class,
+parameter objects, and checkpoint keys. The first forward performs compilation;
+new shapes or guards can cause recompilation. `fullgraph=True` makes graph breaks
+an error. Backend-specific `mode` and `options` are mutually exclusive in the
+configuration. See the [complete compiler field reference](../runs/README.md#configure-torchcompile).
+
+Configured recipes apply compilation automatically through `build_experiment`.
+When automatic FP8 is enabled too, construction follows model placement, FP8
+preparation, compilation, optimizer creation, then runtime/DDP setup. Direct
+recipes combining the two can call `prepare_fp8_model(model, fp8_settings)` from
+`deepopt.opt.policy` before `compile_model`, then pass the same `fp8_settings`
+to the trainer. Matching preparation is reused; preparing an already compiled
+or captured unprepared model is rejected.
+
+Direct recipes using only compilation call the compiler helper themselves.
+Checkpoint state contains ordinary
+weights and optimizer state, not generated code; recreate compilation when
+rebuilding a direct recipe. Diagnostic-mode switching operates outside the
+compiled model. Compiler-managed CUDA graphs and explicit
+[CUDA Graph capture](../cuda/README.md) are separate mechanisms; combining them
+requires validation for that recipe. Current [FP8 operations](../fp8/README.md)
+also have their own constraints and do not inherit compiler/capture support
+merely because the surrounding runtime supports those features.
+
+## Diagnostic presets
 
 | Selection | Loss/gradient finite checks | Other diagnostics |
 | --- | --- | --- |
@@ -103,7 +209,7 @@ not change precision, accumulation, learning rates, clipping or loss semantics.
 
 ## DDP accumulation and reductions
 
-For finite loaders with a trustworthy count, `DDPCore.no_sync()` covers both
+For finite loaders with a trustworthy count, `DDPCore` uses native DDP's `no_sync()` for both
 forward and backward on intermediate microbatches. The final microbatch of each
 full or partial window synchronizes. With 10 batches and accumulation 4, the
 reduction points are batches 4, 8 and 10. No lookahead consumes extra data before

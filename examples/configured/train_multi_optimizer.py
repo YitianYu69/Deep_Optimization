@@ -54,16 +54,24 @@ def experiment(config):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--resume", type=Path)
-    parser.add_argument("--epochs", type=int, default=5)
+    location = parser.add_mutually_exclusive_group(required=True)
+    location.add_argument("--output", type=Path, help="New run directory")
+    location.add_argument("--resume", type=Path, help="Continue last.pt or last_step.pt")
+    parser.add_argument("--epochs", type=int, help="Total target epochs; new runs default to 5")
+    parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
+    if args.resume is not None:
+        train(resume=args.resume, epochs=args.epochs, experiment_factory=experiment,
+              progress_bar=not args.no_progress)
+        return
     config = config_from_dict({
         "name": "multiple-optimizers", "seed": 42,
-        "training": {"epochs": args.epochs, "batch_size": 32, "learning_rate": 0.01,
+        "training": {"epochs": args.epochs if args.epochs is not None else 5,
+                     "batch_size": 32, "learning_rate": 0.01,
                      "optimizer": "custom", "lr_gamma": 0.9},
     })
-    train(config, output=args.output, resume=args.resume, experiment_factory=experiment)
+    train(config, output=args.output, experiment_factory=experiment,
+          progress_bar=not args.no_progress)
 
 
 if __name__ == "__main__":

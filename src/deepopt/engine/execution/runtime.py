@@ -30,11 +30,13 @@ class TrainingRuntime:
     gradients. The optimizer may own only part of the model.
     For a scalar mean loss use step() (N=1). For custom update algorithms, call
     the optimizer directly and use only the helpers needed by that algorithm.
+    fp8 enables automatic preparation in the chosen core. Use runtime.model
+    afterward; autocast() combines its FP8 policy with the configured AMP mode.
     """
 
     def __init__(self, model, optimizer=None, *, device="cpu", precision="fp32", grad_clip_norm=None,
                  gradient_strategy: GradientStrategy | None = None, checks=True, ddp_options=None,
-                 execution_mode=None, diagnostics=None, mode_schedule=None, non_blocking=False):
+                 execution_mode=None, diagnostics=None, mode_schedule=None, non_blocking=False, fp8=None):
         if precision not in ("fp32", "bf16"):
             raise ValueError("precision must be fp32 or bf16; fp16 is unsupported")
         self.distributed_context = distributed_ops.initialize_distributed(device)
@@ -64,16 +66,20 @@ class TrainingRuntime:
         self._precision = PrecisionPolicy(self.device, precision)
         if any(p.device != self.device for p in model.parameters()):
             raise ValueError("Move the model to the training device before constructing its optimizer")
-        self._stepper = (OptimizerStepper(model, optimizer, self._precision, gradient_strategy,
-                                         checks=self.checks)
-                         if optimizer is not None else None)
-        self._failed = False
         if distributed_ops.world_size() > 1:
-            self.core = DDPCore(model, self.device, ddp_options)
+            self.core = DDPCore(model, self.device, ddp_options, fp8=fp8)
         else:
             if ddp_options:
                 raise ValueError("ddp_options requires an initialized multi-rank process group")
-            self.core = TrainingCore(model, self.device)
+            self.core = TrainingCore(model, self.device, fp8=fp8)
+        self.model = self.core.model
+        self.fp8 = self.core.fp8
+        self.transformation_report = self.core.transformation_report
+        self._precision.fp8 = self.fp8 if self.fp8.enabled else None
+        self._stepper = (OptimizerStepper(self.model, optimizer, self._precision, gradient_strategy,
+                                         checks=self.checks)
+                         if optimizer is not None else None)
+        self._failed = False
         if self._stepper is not None:
             # The stepper borrows its owner for diagnostics; owning it back
             # would keep native DDP resources alive until cyclic collection.

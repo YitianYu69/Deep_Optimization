@@ -42,7 +42,7 @@ def main():
     log_output("Samples after reset:", metric.count.item())
     # In a recipe: Trainer(model, optimizer, loss_fn=..., metrics=create_metrics()).
     # The trainer gives training/validation independent metric instances and
-    # owns update/compute/reset. See recipes/metric_routing.py for a full run.
+    # owns update/compute/reset. See examples/metrics/metric_routing.py for a full run.
 
 
 if __name__ == "__main__":

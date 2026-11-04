@@ -1,5 +1,7 @@
 import torch
+from torch.nn import functional as F
 
+from .._autocast import _get_fp8_plan
 from ..scaling_strategy.amax import AmaxScaling
 from .AOTAutograd_Func.linear_autograd_func import _DOLinearFunction
 
@@ -128,6 +130,11 @@ def do_linear(
     plan: dict
 ) -> torch.Tensor:
 
+    active_plan = _get_fp8_plan(x.device.type) if isinstance(x, torch.Tensor) else None
+    if active_plan is False:
+        return F.linear(x, weight, bias)
+    if active_plan is not None:
+        plan = active_plan
     checked_plan = validate_fp8_plan(plan)
     training = checked_plan["fp8_training"]
 

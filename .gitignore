@@ -14,7 +14,7 @@ dist/
 htmlcov/
 
 # Experiment artifacts and locally downloaded datasets
-runs/
+/runs/
 /data/
 wandb/
 *.pt

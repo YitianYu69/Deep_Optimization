@@ -11,6 +11,15 @@ The loader stays caller-owned. Pick the smallest interface your recipe needs:
 | Exact sample cursor restore and rebatching, including prefetch | `ResumableDataLoader` | Yes; zero or multiple workers; no worker-local state recovery |
 | Restore consumed batches and worker snapshots | `StatefulDataLoader` (optional TorchData adapter) | Yes; fixed batch size/worker count within an epoch |
 
+Run these from the repository root after installing the package:
+
+| Example | Command | Result / files |
+| --- | --- | --- |
+| Skip a known prefix | `python examples/data/skip_batches.py` | Logs remaining indices `[6, 7, 8, 9]`, then the full next epoch; no files |
+| Replay transforms and change batch size | `python examples/data/resumable_prefetch.py` | JSON showing nine remaining samples grouped as `[3, 3, 3]` and `replay_matches: true`; no files |
+| Same replay with prefetch | `python examples/data/resumable_prefetch.py --workers 2` | Spawns two workers, then restores with zero workers; no optional dependency |
+| Restore worker-local RNG state | `python examples/data/worker_resume.py` | Requires `.[workers]`; temporary checkpoints are removed on exit |
+
 All DeepOpt loaders are available from `deepopt.data`. An ordinary or skip loader
 is still rejected when step checkpoints are requested. There is no silent
 conversion or unsupported claim that worker state can be recovered by skipping.
@@ -217,6 +226,11 @@ rebatching without TorchData. For worker-local dataset/RNG recovery, construct
 snapshots must still be restored with that adapter; their format differs from
 the sample-cursor loader's format.
 
+The helper shuffles training and keeps validation sequential within each rank.
+Its generator mapping uses the names `"train"` and `"validation"`. Do not pass
+`shuffle`, `generator`, `sampler`, or `batch_sampler` through `loader_options`;
+construct a custom loader factory when those choices belong to your recipe.
+
 When persistent workers are enabled, the helper also makes ordinary training
 and validation loaders consume one base-seed draw per epoch, matching freshly
 constructed loaders after an epoch restore. This preserves sampler order and
@@ -229,3 +243,24 @@ sample cursor; applying an additional batch skip would discard more data.
 Options passed through `loader_options`, including `drop_last`, apply to both
 training and validation. Build the two loaders separately if validation should
 keep its partial batch while training drops it.
+
+## Custom collation and replay boundaries
+
+The [prefetch example](../../examples/data/resumable_prefetch.py) combines
+`SeededTransformDataset`, a module-level `collate_fn` returning a dictionary,
+and restoration from batch size four to three. Snapshot the loader after the
+returned batch has been processed; prefetch may have already read additional
+samples, but they remain unconsumed in the saved state. The example compares
+sample indices and transformed values against an uninterrupted reference.
+
+The cursor counts consumed samples. If four samples have been delivered, the
+next group of three begins at cursor four; it is not rounded to a multiple of
+three. Internally, `batch_origin` records where the current grouping began so
+later checkpoints can validate boundaries after repeated rebatching. Callers
+use the loader's public state methods instead of editing these fields.
+
+A loader snapshot also saves its generator and seeded-transform epoch. It
+does not save a model, optimizer, accumulated gradients, or training progress.
+Use [Checkpoint](../checkpoints/README.md) for complete training recovery. In
+a manual epoch loop, call `loader.set_epoch(epoch)` for explicit augmentation
+epoch numbering; the built-in trainer does this for you.

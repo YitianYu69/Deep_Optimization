@@ -84,8 +84,11 @@ class DDPCoreWhiteBoxTests(unittest.TestCase):
         model.register_buffer("counter", torch.tensor(0))
         wrapper = Mock(side_effect=lambda batch, step: step(batch))
         with patch("deepopt.distributed.ddp.distributed.world_size", return_value=2), \
+                patch("deepopt.distributed.ddp.distributed.collective_errors", side_effect=lambda _: nullcontext()), \
+                patch("deepopt.distributed.ddp.distributed.require_equal") as agreement, \
                 patch("deepopt.distributed.ddp.DistributedDataParallel.__new__", return_value=wrapper) as constructor:
             core = DDPCore(model, "cpu")
+            agreement.assert_called_once()
         return core, wrapper, constructor.call_args
 
     def test_training_enters_ddp_but_uneven_evaluation_bypasses_forward_collectives(self):

@@ -6,6 +6,25 @@ Use normal PyTorch loss functions and optimizers for an ordinary recipe.
 Explicit weighting, multiple optimizers, and replaceable strategies are optional
 tools for computations that need them.
 
+## Run the examples
+
+From the repository root after installation:
+
+```bash
+python examples/optimization/train_strategies.py --api fit --weighting samples
+python examples/optimization/train_strategies.py --api manual --weighting samples
+python examples/optimization/train_strategies.py --api manual --weighting microbatches
+python examples/optimization/multiple_optimizers.py
+python examples/optimization/alternating_updates.py
+```
+
+These are small CPU programs with generated data and no output files. The
+[strategy example](../../examples/optimization/train_strategies.py) uses five
+microbatches per epoch, so accumulation by three leaves a final window with
+batch sizes six and three. This exposes the difference between sample weighting
+and equal microbatch weighting. Compare `fit` and `manual` with the same
+weighting option before changing the weighting policy.
+
 For explicit DDP `rank_mean`, `global_mean`, and `global_sum` objectives, see
 [distributed reduction contracts](../execution/README.md#ddp-accumulation-and-reductions).
 The legacy `LossResult.from_sum` behavior remains rank-averaged under DDP unless
@@ -26,7 +45,7 @@ scalar; return `.mean()`, `.sum()`, or your chosen scalar objective for unreduce
 values. Plain tensors do not declare whether their values were originally
 means, sums, or something else.
 
-For the default loss strategy:
+For the default loss strategy on one device:
 
 | Result | One microbatch per update | Several microbatches per update | Reported phase `loss` |
 | --- | --- | --- | --- |
@@ -210,8 +229,13 @@ steps after each successful optimizer update, including the final partial
 accumulation window, and before step callbacks. Step counters count updates,
 not microbatches. No scheduler is created by direct `Trainer` use.
 
-The configured default factory builds `ExponentialLR` using `training.lr_gamma`.
-Use `scheduler_factory` to choose another scheduler or return `None`.
+The configured factory uses `training.lr_schedule` when present, including
+warmup, step decay, cosine, and warmup/cosine policies. Without that table it
+builds `ExponentialLR` using the legacy `training.lr_gamma`. Use
+`scheduler_factory` to choose another scheduler or return `None`. The
+[scheduling guide](../scheduling/README.md#learning-rate-policies) documents exact
+boundaries, and [learning_rate.py](../../examples/scheduling/learning_rate.py)
+shows both update and epoch intervals.
 Metric-based schedulers such as `ReduceLROnPlateau` and custom policies belong
 in a caller-owned loop. An automatic physical-batch resize changes update
 counts; OneCycleLR resizing is rejected and other fixed-horizon schedules need
@@ -278,6 +302,16 @@ need it; ordinary non-accumulated backward does not require it. Validation
 helpers check declared contracts; they do not discover a tensor's reduction
 history. For new recipes, prefer scalar returns or explicit `LossResult` when
 weights are needed.
+
+## FP8 model computation
+
+FP8 transformation changes supported model operations and their backward
+computations. Ordinary optimizer state, accumulation, clipping, and scheduling
+remain owned by the APIs in this guide. Start with
+[FP8 training and model transformation](../fp8/README.md) and the
+[FP8 example](../../examples/optimization/fp8_training.py). The CPU reference
+backend checks FP8 quantization behavior; actual FP8 GEMM uses the CUDA Triton
+backend on supported NVIDIA hardware.
 
 Related: [metrics](../metrics/README.md), [observers](../observers/README.md),
 [checkpoints](../checkpoints/README.md), and [architecture](../architecture/README.md).

@@ -43,19 +43,28 @@ def regression_experiment(config):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--resume", type=Path)
-    parser.add_argument("--epochs", type=int, default=8)
+    location = parser.add_mutually_exclusive_group(required=True)
+    location.add_argument("--output", type=Path, help="New run directory")
+    location.add_argument("--resume", type=Path, help="Continue last.pt or last_step.pt")
+    parser.add_argument("--epochs", type=int, help="Total target epochs; new runs default to 8")
+    parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
+    if args.resume is not None:
+        # Keep saved settings unless the user explicitly overrides them.
+        train(resume=args.resume, epochs=args.epochs, experiment_factory=regression_experiment,
+              progress_bar=not args.no_progress)
+        return
     config = config_from_dict({
         "name": "regression", "seed": 42,
-        "training": {"epochs": args.epochs, "batch_size": 16, "learning_rate": 0.05,
+        "training": {"epochs": args.epochs if args.epochs is not None else 8,
+                     "batch_size": 16, "learning_rate": 0.05,
                      "monitor": "loss", "monitor_mode": "min"},
         "application": {"generated_regression": {
             "train_samples": 256, "validation_samples": 64, "input_dim": 4,
         }},
     })
-    train(config, output=args.output, resume=args.resume, experiment_factory=regression_experiment)
+    train(config, output=args.output, experiment_factory=regression_experiment,
+          progress_bar=not args.no_progress)
 
 
 if __name__ == "__main__":

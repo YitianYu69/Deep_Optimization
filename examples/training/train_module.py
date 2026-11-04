@@ -58,20 +58,21 @@ def main():
     args = parser.parse_args()
     torch.manual_seed(42)
     module = RegressionModule(nn.Linear(4, 1))
-    inputs = torch.randn(32, 4)
+    inputs = torch.randn(48, 4)
     targets = inputs.sum(dim=1, keepdim=True)
 
     if args.mode == "wrapper":
         module.eval()
         with torch.no_grad():
-            log_output("Prediction shape:", tuple(module(inputs).shape))
+            log_output("Prediction shape:", tuple(module(inputs[:32]).shape))
         return
 
-    loader = DataLoader(TensorDataset(inputs, targets), batch_size=8)
+    loader = DataLoader(TensorDataset(inputs[:32], targets[:32]), batch_size=8)
+    validation = DataLoader(TensorDataset(inputs[32:], targets[32:]), batch_size=8)
     optimizer = torch.optim.AdamW(module.parameters(), lr=0.05)
     if args.mode == "fit":
         trainer = Trainer(module, optimizer)
-        trainer.fit(loader, loader, epochs=3)  # Demo only; use a separate validation split in real runs.
+        trainer.fit(loader, validation, epochs=3, progress_bar=False)
         log_output("Completed epochs:", trainer.state.completed_epochs)
     else:
         manual_train(module, optimizer, loader)

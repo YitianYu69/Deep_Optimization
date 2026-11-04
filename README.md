@@ -22,18 +22,35 @@ require a model or dataset schema.
 Follow [one recipe in five steps](docs/getting-started/README.md) to add metrics,
 logging, checkpoints, resume and optional batch planning without changing API families.
 
-## Start with the simplest API
+## Train a model
 
-Given an existing model, optimizer, and loaders producing `(inputs, targets)`:
+This complete CPU recipe uses generated data and writes no files:
 
 ```python
+import torch
+from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset
 from deepopt import Trainer
 
+torch.manual_seed(7)
+inputs = torch.randn(64, 3)
+targets = inputs.sum(dim=1, keepdim=True)
+train_loader = DataLoader(
+    TensorDataset(inputs[:48], targets[:48]), batch_size=8, shuffle=True,
+    generator=torch.Generator().manual_seed(17),
+)
+validation_loader = DataLoader(TensorDataset(inputs[48:], targets[48:]), batch_size=8)
+model = nn.Linear(3, 1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.03)
 trainer = Trainer(model, optimizer, loss_fn=F.mse_loss)
-trainer.fit(train_loader, validation_loader, epochs=5)
+trainer.fit(train_loader, validation_loader, epochs=2, progress_bar=False)
 results = trainer.evaluate(validation_loader)
+print(results)
 ```
+
+Replace the model, data and loss with your own. For a complete recipe with
+dataset-wide metrics, run [regression.py](examples/training/regression.py).
 
 For a scalar loss, reported `loss` is a **mean of batch objectives**, not an
 inferred sample/token mean. Unequal batches can make it differ from dataset-wide
@@ -50,7 +67,8 @@ Configured runs save logs automatically; wrap a direct recipe in
 [logging guide](docs/logging/README.md) and
 [runnable logging recipe](examples/observability/logging_recipe.py).
 
-For arbitrary batch structures or several loss terms, supply one function:
+For arbitrary batch structures or several loss terms, supply one function.
+This fragment assumes a compatible model, optimizer and dictionary batches:
 
 ```python
 def step(model, batch):
@@ -89,34 +107,34 @@ To evaluate `best.pt` while keeping training weights and optimizer intact, follo
 
 ## FP8 training and model transformation
 
-Transform supported projections before constructing the trainer or wrapping the
-model in DDP. The returned model uses ordinary PyTorch parameters and optimizers:
+Enable FP8 when constructing the trainer; both the regular and DDP cores prepare
+supported operations automatically. Master parameters and optimizer ownership
+are preserved. With the model and loaders from the CPU recipe above:
 
 ```python
-import torch
-from deepopt.opt import transform_model
+from deepopt import FP8Config
 
-plan = {
-    "fp8_training": {
-        "backend": "reference",
-        "fp8_dtypes": {
-            "activation": torch.float8_e4m3fn,
-            "weight": torch.float8_e4m3fn,
-            "grad": torch.float8_e5m2,
-        },
-    },
-    "block_shapes": {role: None for role in ("activation", "weight", "grad")},
-}
-model, report = transform_model(model, plan=plan, trace_mode="modules")
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+trainer = Trainer(model, optimizer, loss_fn=F.mse_loss,
+                  fp8=FP8Config(enabled=True, backend="reference"))
+trainer.fit(train_loader, validation_loader, epochs=2, progress_bar=False)
+report = trainer.runtime.transformation_report
+print(report)
 ```
 
 The reference backend emulates FP8 quantization with FP32 matrix multiplication;
 it runs on CPU or CUDA. Actual FP8 GEMM uses `backend="triton"`, an NVIDIA GPU
 with compute capability 9.0 or newer, and the same FP8 dtype for all three roles.
-Use `"full"` for a rewritten FX graph, `"modules"` to retain the root class and
-methods such as `generate()`, or `"auto"` to try full tracing before fallback.
-Always use the returned model and inspect the report for partial conversion.
+Configured runs enable the same feature with `[runtime.fp8] enabled = true`;
+see [fp8.toml](configs/fp8.toml). Manual loops can use `TrainingRuntime(..., fp8=True)`
+or the combined [AMP/FP8 context](docs/fp8/README.md#combine-fp8-with-amp-in-a-context).
+Native linear calls inside `deepopt.autocast(..., fp8=True)` need no transformation.
+
+Automatic setup defaults to `trace_mode="modules"`, preserving ordinary root
+methods such as `generate()`. Root projections become their DO adapters;
+`"full"` returns a rewritten FX graph and `"auto"` tries tracing before fallback.
+Use `trainer.model` after setup and inspect the report for partial conversion.
+Explicit `transform_model(...)` remains available in the [FP8 guide](docs/fp8/README.md).
 
 Run the offline example with `python examples/optimization/fp8_training.py`.
 The [FP8 guide](docs/fp8/README.md) covers plans, supported adapters, checkpoints,
@@ -133,6 +151,8 @@ map. Each topic has its own README and links to complete runnable examples.
 | [Getting started](docs/getting-started/README.md) | One recipe, progressively adding production features |
 | [Data loading](docs/data/README.md) | Ordinary loaders, batch-skip sampler/loader, and worker-state resume |
 | [Training APIs](docs/training/README.md) | `fit`, custom steps, callbacks, evaluation, manual loops, optional tasks and wrappers |
+| [Distributed training](docs/distributed/README.md) | CPU/Gloo and CUDA/NCCL, rank metadata, sharding, accumulation and recovery |
+| [Execution and compilation](docs/execution/README.md) | Diagnostic modes, update-based mode changes, transfers and model-only `torch.compile` |
 | [CUDA Graphs](docs/cuda/README.md) | Model/function capture, context/decorator APIs, replay lifetime and composition with training/DDP |
 | [FP8 and model transformation](docs/fp8/README.md) | FP8 autograd, full/submodule FX conversion, reference/Triton backends, model validation and extension boundaries |
 | [Losses and optimization](docs/optimization/README.md) | Loss reduction and weighting, accumulation, clipping, schedulers, custom optimizers and strategies |
@@ -174,11 +194,36 @@ the default is `0`, keeping ordinary DataLoaders compatible with epoch checkpoin
 Training uses a regular core for one process, or a separate DDP core for
 multi-process CPU/Gloo and CUDA/NCCL execution. See the
 [distributed guide](docs/distributed/README.md) for architecture, torchrun,
-sharded loaders, and per-rank step/epoch recovery. CPU uses fp32; CUDA supports
-fp32 or bf16. Trainer fp16 AMP and automatic GPU OOM retries are unsupported.
+sharded loaders, and per-rank step/epoch recovery.
+
+For **trainer-level automatic mixed precision (AMP)**, CPU runs FP32 with AMP
+disabled; CUDA supports FP32 with AMP disabled or BF16 with AMP enabled.
+**FP8 training is also supported**, through the separate DO projection and
+autograd operations: the reference backend runs FP8 quantization/emulation on
+CPU or CUDA, while the Triton backend executes FP8 GEMM on NVIDIA GPUs with
+compute capability 9.0 or newer. Parameters retain their original floating-point
+dtype. FP8 currently covers supported linear/projection operations, including
+attention Q/K/V and output projections. See the [FP8 guide](docs/fp8/README.md)
+for formats, scaling, transformation modes and backend requirements.
+
+Trainer-level FP16 AMP and automatic GPU OOM retries are unsupported.
 Fake-tensor memory estimates exclude kernel
 workspaces, allocator overhead, metrics, and callbacks; validate your workload
 on its target hardware.
+
+Choose a runnable entry point for each execution path:
+
+```bash
+python examples/execution/execution_modes.py
+python examples/execution/compile_training.py
+torchrun --standalone --nproc-per-node=2 examples/distributed/ddp_training.py
+python examples/cuda/graphs.py --help
+```
+
+The compile example defaults to `aot_eager`, which exercises tracing/autograd
+without claiming Inductor speedups. CUDA Graph replay requires CUDA; the FP8
+Triton backend requires NVIDIA compute capability 9.0 or newer. See the
+[example catalog](examples/README.md) for dependencies, outputs and GPU commands.
 
 Run the existing tests with:
 
