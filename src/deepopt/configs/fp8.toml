@@ -1,0 +1,42 @@
+# Small offline CLI recipe using automatic FP8 quantization on CPU.
+# Reference GEMMs emulate FP8 operands; this is not a GPU speed benchmark.
+name = "fp8-reference"
+seed = 17
+
+[training]
+epochs = 2
+batch_size = 8
+learning_rate = 0.001
+optimizer = "adamw"
+accumulation_steps = 2
+monitor = "accuracy"
+monitor_mode = "max"
+
+[runtime]
+device = "cpu"
+precision = "fp32"  # AMP selection, independent of the FP8 operand format.
+deterministic = true
+
+[runtime.fp8]
+enabled = true
+backend = "reference"
+trace_mode = "modules"
+activation_dtype = "e4m3fn"
+weight_dtype = "e4m3fn"
+grad_dtype = "e4m3fn"
+num_stages = 3
+# Omit out_dtype to follow the active AMP/input dtype.
+# out_dtype = "fp32"
+
+# Omitted operands use tensorwise scaling. Uncomment for blockwise scaling.
+# Triton requires both dimensions to be multiples of 32.
+# [runtime.fp8.block_shapes]
+# activation = [32, 32]
+# weight = [32, 32]
+# grad = [32, 32]
+
+[application.synthetic]
+train_samples = 32
+validation_samples = 16
+input_dim = 16
+num_classes = 4

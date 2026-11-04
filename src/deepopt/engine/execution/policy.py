@@ -51,17 +51,25 @@ class DiagnosticPolicy:
     def as_dict(self) -> dict[str, Any]:
         return {**asdict(self), "mode": self.mode.value}
 
+    @classmethod
+    def from_dict(cls, options: Mapping[str, Any]) -> DiagnosticPolicy:
+        """Apply the selected preset's defaults, then validate explicit fields."""
+        defaults = cls.for_mode(options.get("mode", ExecutionMode.BALANCED)).as_dict()
+        return cls(**{**defaults, **options})
+
 
 class ModeController:
     """Schedule diagnostics by optimizer update, outside compiled forward graphs."""
 
     def __init__(self, execution_mode: ExecutionMode | str | None = None,
-                 diagnostics: DiagnosticPolicy | None = None,
+                 diagnostics: DiagnosticPolicy | Mapping[str, Any] | None = None,
                  mode_schedule: Mapping[int, ExecutionMode | str] | None = None) -> None:
         if execution_mode is not None and diagnostics is not None:
             raise ValueError("Choose execution_mode or diagnostics, not both")
+        if isinstance(diagnostics, Mapping):
+            diagnostics = DiagnosticPolicy.from_dict(diagnostics)
         if diagnostics is not None and not isinstance(diagnostics, DiagnosticPolicy):
-            raise TypeError("diagnostics must be a DiagnosticPolicy")
+            raise TypeError("diagnostics must be a DiagnosticPolicy or mapping")
         self.base_policy = diagnostics if execution_mode is None else DiagnosticPolicy.for_mode(execution_mode)
         self.policy = self.base_policy
         if mode_schedule is not None and not isinstance(mode_schedule, Mapping):

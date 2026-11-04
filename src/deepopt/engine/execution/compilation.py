@@ -1,5 +1,6 @@
 """Opt-in model compilation during experiment construction, outside the cores."""
 
+from collections.abc import Mapping
 from dataclasses import asdict
 
 from torch import nn
@@ -7,13 +8,15 @@ from torch import nn
 from deepopt.config import CompileConfig, compile_config_from_dict
 
 
-def compile_model(model: nn.Module, settings: CompileConfig) -> nn.Module:
+def compile_model(model: nn.Module, settings: CompileConfig | Mapping) -> nn.Module:
     """Compile in place, retaining model type, parameters and checkpoint names.
 
     Compilation is lazy: backend tracing/kernel generation happens on first
     execution. The runtime, optimizer, diagnostics and DDP reducer stay eager.
+    A dictionary accepts the same fields and defaults as CompileConfig.
     """
-    settings = compile_config_from_dict(asdict(settings))
+    raw = asdict(settings) if isinstance(settings, CompileConfig) else settings
+    settings = compile_config_from_dict(dict(raw) if isinstance(raw, Mapping) else raw)
     if not settings.enabled:
         return model
     if any(getattr(module.forward, "_deepopt_cuda_capture", False) for module in model.modules()):

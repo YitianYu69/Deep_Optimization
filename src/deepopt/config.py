@@ -1,5 +1,6 @@
 """Validated experiment settings; this module does not import PyTorch."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
@@ -83,8 +84,10 @@ class ExperimentConfig:
 
 def _require_keys(table: Any, expected: set[str], location: str,
                   optional: set[str] | None = None) -> None:
-    if not isinstance(table, dict):
+    if not isinstance(table, Mapping):
         raise ConfigError(f"{location} must be a TOML table")
+    if any(not isinstance(key, str) for key in table):
+        raise ConfigError(f"{location} keys must be strings")
     missing = expected - table.keys()
     unknown = table.keys() - expected - (optional or set())
     if missing:
@@ -126,21 +129,20 @@ def _application_value(value: Any, location: str) -> Any:
                       "encode paths and dates as strings")
 
 
-def config_from_dict(raw: dict) -> ExperimentConfig:
-    """Shared validation for TOML input and checkpoint configuration."""
-    if isinstance(raw, dict) and "data" in raw:
-        raise ConfigError("The fixed [data] schema was removed. Supply datasets through dataset_factory(); "
-                          "store caller-owned options under [application]. For the synthetic demo only, "
-                          "move the old [data] fields to [application.synthetic].")
-    _require_keys(raw, {"name", "seed", "training"}, "config", {"application", "runtime", "experiment_identity", "schedules"})
-    name = raw["name"]
-    if not isinstance(name, str) or not name.strip():
-        raise ConfigError("name must be a non-empty string")
-    seed = _integer(raw["seed"], "seed", 0)
-    if seed > 2**32 - 1:
-        raise ConfigError("seed must be <= 2**32 - 1")
+def _copy_tables(value: Any) -> Any:
+    """Own mapping/list containers while retaining schema-specific value types."""
+    if isinstance(value, Mapping):
+        return {key: _copy_tables(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_tables(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_tables(item) for item in value)
+    return value
 
-    t = raw["training"]
+
+def training_config_from_dict(raw: Mapping[str, Any]) -> TrainingConfig:
+    """Validate a training table independently of experiment name and seed."""
+    t = _copy_tables(raw)
     _require_keys(t, {"epochs", "batch_size", "learning_rate"}, "training",
                   {"accumulation_steps", "optimizer", "weight_decay", "momentum", "lr_gamma", "grad_clip_norm",
                    "monitor", "monitor_mode", "checkpoint_every_steps", "scheduler_interval", "lr_schedule"})
@@ -165,16 +167,14 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
     scheduler_interval = t.get("scheduler_interval", "epoch")
     if scheduler_interval not in ("epoch", "step"):
         raise ConfigError("training.scheduler_interval must be epoch or step")
-    from .scheduling.factory import normalize_schedules
     from .scheduling.lr_config import normalize_lr_schedule
     try:
-        schedules = normalize_schedules(raw.get("schedules", {}))
         lr_schedule = normalize_lr_schedule(t.get("lr_schedule"))
     except (ValueError, TypeError) as exc:
         raise ConfigError(str(exc)) from exc
     if lr_schedule is not None and gamma != 1.:
         raise ConfigError("Choose training.lr_schedule or legacy lr_gamma, not both")
-    training = TrainingConfig(
+    return TrainingConfig(
         epochs=_integer(t["epochs"], "training.epochs", 1),
         batch_size=_integer(t["batch_size"], "training.batch_size", 1),
         learning_rate=_number(t["learning_rate"], "training.learning_rate", 0, positive=True),
@@ -185,6 +185,28 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
         checkpoint_every_steps=_integer(t.get("checkpoint_every_steps", 0), "training.checkpoint_every_steps", 0),
         scheduler_interval=scheduler_interval, lr_schedule=lr_schedule,
     )
+
+
+def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
+    """Shared validation for mapping, TOML, and checkpoint configuration."""
+    if isinstance(raw, Mapping) and "data" in raw:
+        raise ConfigError("The fixed [data] schema was removed. Supply datasets through dataset_factory(); "
+                          "store caller-owned options under [application]. For the synthetic demo only, "
+                          "move the old [data] fields to [application.synthetic].")
+    _require_keys(raw, {"name", "seed", "training"}, "config", {"application", "runtime", "experiment_identity", "schedules"})
+    raw = _copy_tables(raw)
+    name = raw["name"]
+    if not isinstance(name, str) or not name.strip():
+        raise ConfigError("name must be a non-empty string")
+    seed = _integer(raw["seed"], "seed", 0)
+    if seed > 2**32 - 1:
+        raise ConfigError("seed must be <= 2**32 - 1")
+    training = training_config_from_dict(raw["training"])
+    from .scheduling.factory import normalize_schedules
+    try:
+        schedules = normalize_schedules(raw.get("schedules", {}))
+    except (ValueError, TypeError) as exc:
+        raise ConfigError(str(exc)) from exc
     application = raw.get("application", {})
     if not isinstance(application, dict):
         raise ConfigError("application must be a TOML table")
@@ -254,9 +276,10 @@ def config_from_dict(raw: dict) -> ExperimentConfig:
                             experiment_identity=identity, schedules=schedules)
 
 
-def compile_config_from_dict(raw: dict) -> CompileConfig:
+def compile_config_from_dict(raw: Mapping[str, Any]) -> CompileConfig:
     """Validate compiler settings without importing Torch or loading backends."""
     _require_keys(raw, set(), "runtime.compile", {"enabled", "backend", "mode", "fullgraph", "dynamic", "options"})
+    raw = _copy_tables(raw)
     for key in ("enabled", "fullgraph"):
         if type(raw.get(key, False)) is not bool:
             raise ConfigError(f"runtime.compile.{key} must be a boolean")
@@ -280,12 +303,13 @@ def compile_config_from_dict(raw: dict) -> CompileConfig:
     return CompileConfig(raw.get("enabled", False), backend, mode, raw.get("fullgraph", False), dynamic, dict(options))
 
 
-def fp8_config_from_dict(raw: dict) -> FP8Config:
+def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     """Validate FP8 settings without importing Torch or loading a GPU backend."""
     _require_keys(raw, set(), "runtime.fp8", {
         "enabled", "backend", "trace_mode", "activation_dtype", "weight_dtype",
         "grad_dtype", "block_shapes", "num_stages", "out_dtype",
     })
+    raw = _copy_tables(raw)
     enabled = raw.get("enabled", False)
     if type(enabled) is not bool:
         raise ConfigError("runtime.fp8.enabled must be a boolean")
@@ -327,6 +351,23 @@ def fp8_config_from_dict(raw: dict) -> FP8Config:
                      num_stages=stages, out_dtype=out_dtype)
 
 
-def load_config(path: str | Path) -> ExperimentConfig:
+def normalize_config(value: ExperimentConfig | Mapping[str, Any]) -> ExperimentConfig:
+    """Keep an existing typed configuration, or validate and copy a mapping."""
+    return value if isinstance(value, ExperimentConfig) else config_from_dict(value)
+
+
+def normalize_training_config(value: TrainingConfig | Mapping[str, Any]) -> TrainingConfig:
+    """Keep typed training settings, or parse an independently supplied table."""
+    return value if isinstance(value, TrainingConfig) else training_config_from_dict(value)
+
+
+def load_config(path: str | Path | ExperimentConfig | Mapping[str, Any]) -> ExperimentConfig:
+    """Read a TOML path, explicit builtin preset, or supplied configuration."""
+    if isinstance(path, (ExperimentConfig, Mapping)):
+        return normalize_config(path)
+    if isinstance(path, str) and path.startswith("builtin:"):
+        from .configs import load_preset
+
+        return load_preset(path.removeprefix("builtin:"))
     with Path(path).open("rb") as file:
         return config_from_dict(tomllib.load(file))

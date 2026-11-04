@@ -231,6 +231,19 @@ coordinates shared writes. Use a fresh output directory for the first saved run.
 
 ## Configured custom recipes
 
+Configuration can come from a dictionary, a selected TOML file, or an installed
+preset. The [configuration reader](configured/read_config.py) accepts all file
+choices through its command-line option:
+
+```bash
+python examples/configured/read_config.py --config builtin:fp8
+python examples/configured/read_config.py --config configs/scheduling.toml
+python examples/configured/read_config.py --config ./experiments/my-training.toml
+```
+
+Its default is the installed `builtin:baseline` preset. For training with a
+dictionary or chosen file, see the [input examples](../docs/runs/README.md#choose-a-toml-file-dictionary-or-installed-preset).
+
 These existing examples add reconstruction factories, application-owned data
 settings and managed artifacts. Unlike the direct `fit()` examples, a fresh run
 requires an explicit output directory that does not already exist:

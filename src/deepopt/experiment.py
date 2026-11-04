@@ -1,8 +1,10 @@
 """Connect independently defined components; no training or model logic here."""
 
 from dataclasses import asdict
+from collections.abc import Mapping
+from pathlib import Path
 
-from .config import ExperimentConfig
+from .config import ExperimentConfig, load_config
 from .data.loaders import build_loaders
 from .engine import Trainer
 from .optimizer_factory import build_optimizer
@@ -15,7 +17,7 @@ from .engine.execution.compilation import compile_model
 from .opt.policy import resolve_fp8_config, prepare_fp8_model
 
 
-def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory,
+def build_experiment(config: ExperimentConfig | Mapping | str | Path, *, model_factory, dataset_factory,
                      loader_factory=build_loaders,
                      optimizer_factory=build_optimizer, scheduler_factory=build_scheduler,
                      task_factory=None, metric_factory=None, trainer_factory=Trainer,
@@ -31,7 +33,11 @@ def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory
     Loss/step functions and metric instances use the same interface as Trainer;
     a Task or TrainingModule is optional. Omitted options do not override a
     caller's partially configured trainer_factory.
+    Dictionaries use the same schema as ExperimentConfig and are normalized
+    before any factories run; custom factories still receive typed settings.
+    A TOML path or builtin:NAME reference may be supplied directly as well.
     """
+    config = load_config(config)
     seed_everything(config.seed, config.runtime.deterministic)
     context = initialize_distributed(config.runtime.device)
     device = resolve_device(str(context.device))
@@ -70,8 +76,7 @@ def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory
     if config.runtime.execution_mode is not None:
         options["execution_mode"] = config.runtime.execution_mode
     if config.runtime.diagnostics is not None:
-        policy = DiagnosticPolicy.for_mode(config.runtime.diagnostics.get("mode", "balanced")).as_dict()
-        options["diagnostics"] = DiagnosticPolicy(**{**policy, **config.runtime.diagnostics})
+        options["diagnostics"] = DiagnosticPolicy.from_dict(config.runtime.diagnostics)
     if config.runtime.mode_schedule is not None:
         options["mode_schedule"] = {int(step): mode for step, mode in config.runtime.mode_schedule.items()}
     if config.runtime.non_blocking:

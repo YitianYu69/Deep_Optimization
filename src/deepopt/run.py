@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from .config import config_from_dict
+from .config import config_from_dict, load_config
 from deepopt.engine.checkpointing.checkpoint import environment, read_checkpoint, require_step_loader, restore_checkpoint, save_checkpoint
 from deepopt.engine.checkpointing.checkpoint import restore_schedules_for_evaluation
 from deepopt.memory.planning import apply_batch_size_plan, plan_batch_size
@@ -50,6 +50,7 @@ def train(config=None, *, output=None, resume=None, epochs=None, batch_size=None
           execution_mode=None) -> Path:
     """Run a configured experiment with artifacts and optional memory planning.
 
+    config accepts an ExperimentConfig, a dictionary, a TOML path, or builtin:NAME.
     batch_size overrides the configured size. Auto may adjust it before fresh
     or resumed training; manual keeps it fixed. Progress writes to stderr, while
     completed epoch records are JSON on stdout.
@@ -67,6 +68,7 @@ def train(config=None, *, output=None, resume=None, epochs=None, batch_size=None
         if payload is None:
             raise ValueError("A new run requires --config")
         config = config_from_dict(payload["config"])
+    config = load_config(config)
     if epochs is not None:
         config = replace(config, training=replace(config.training, epochs=epochs))
     if batch_size is not None:

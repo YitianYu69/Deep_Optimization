@@ -10,11 +10,11 @@ import arbitrary user models from TOML.
 
 ## Run the bundled recipe
 
-From the repository root, after installing the project:
+After installing the library, these commands work from any directory:
 
 ```bash
-python -m deepopt inspect-config --config configs/baseline.toml
-python -m deepopt train --config configs/baseline.toml --output runs/baseline --epochs 2 --no-progress
+python -m deepopt inspect-config --config builtin:baseline
+python -m deepopt train --config builtin:baseline --output runs/baseline --epochs 2 --no-progress
 python -m deepopt train --resume runs/baseline/last.pt --epochs 3 --no-progress
 python -m deepopt evaluate --checkpoint runs/baseline/best.pt --device cpu
 ```
@@ -32,13 +32,88 @@ messages go to stderr; `--no-progress` disables progress bars only. See the
 
 | Command | Options |
 | --- | --- |
-| `inspect-config` | Required `--config PATH`; validates TOML and prints resolved settings |
-| `train` | Fresh `--config PATH --output NEW_DIR`, or `--resume last.pt/last_step.pt` |
+| `inspect-config` | Required `--config PATH_OR_PRESET`; validates a chosen TOML file or `builtin:NAME` |
+| `train` | Fresh `--config PATH_OR_PRESET --output NEW_DIR`, or `--resume last.pt/last_step.pt` |
 | Training overrides | `--epochs N`, `--batch-size N`, `--batch-size-mode auto/manual`, `--checkpoint-every-steps N`, `--execution-mode max_speed/balanced/analyze`, `--no-progress` |
 | `evaluate` | Required `--checkpoint PATH`; optional `--device DEVICE` (an override uses FP32) |
 
 `python -m deepopt --config PATH` remains a legacy inspection shorthand. Put
 `--config` after a subcommand when using `train` or `inspect-config`.
+
+## Choose a TOML file, dictionary, or installed preset
+
+Users choose the configuration source explicitly. Any readable TOML file can be
+selected with a relative or absolute path; its filename does not need to match a
+bundled preset:
+
+```bash
+python -m deepopt inspect-config --config ./experiments/my-training.toml
+python -m deepopt train --config ./experiments/my-training.toml --output runs/custom
+```
+
+The Python entry points accept the same chosen path directly, or a dictionary:
+
+```python
+from deepopt import load_config
+from deepopt.run import train
+
+config = {
+    "name": "dictionary-run",
+    "seed": 7,
+    "training": {"epochs": 2, "batch_size": 8, "learning_rate": 0.001},
+    "runtime": {"device": "cpu", "fp8": {"enabled": True}},
+}
+train(config, output="runs/dictionary-run", batch_size_mode="manual")
+
+# Alternatively, select your own file. Parsing it first is optional.
+selected = load_config("./experiments/my-training.toml")
+train(selected, output="runs/selected-config")
+train("./experiments/my-training.toml", output="runs/selected-file")
+```
+
+Dictionary keys follow the TOML tables. Inputs are validated and copied without
+adding defaults or applying overrides to the caller's dictionary. Existing
+`ExperimentConfig` and `TrainingConfig` objects remain supported. Factories and
+custom callbacks still receive typed settings after normalization.
+
+The repository has two preset locations:
+
+| Location | Use |
+| --- | --- |
+| [configs/](../../configs) | Editable TOML recipes for repository users |
+| [src/deepopt/configs/](../../src/deepopt/configs) | Packaged copies available as `deepopt.configs` in wheels and source distributions |
+
+The validation/schema API remains [deepopt.config](../../src/deepopt/config.py).
+Installed presets use package resources, so loading them does not depend on the
+current directory or access to this repository:
+
+```python
+from deepopt import load_config
+from deepopt.configs import list_presets, load_preset
+
+print(list_presets())  # baseline, ddp, fp8, scheduling
+typed = load_preset("fp8")
+config = load_preset("fp8", as_dict=True)
+config["training"]["epochs"] = 3
+same_preset = load_config("builtin:fp8")
+```
+
+Use `builtin:baseline`, `builtin:ddp`, `builtin:fp8`, or `builtin:scheduling` in
+the CLI or full-experiment Python entry points. Only the explicit `builtin:`
+prefix selects a packaged preset: a missing local file raises an error instead
+of silently selecting a default. Each preset load returns independent data;
+modifying a returned dictionary does not modify installed files. Tests keep the
+repository and packaged copies in sync.
+
+| API | Accepted configuration input |
+| --- | --- |
+| `load_config`, `train`, `build_experiment`, `build_baseline_experiment`, `baseline_sample_batch` | Full experiment dictionary, `ExperimentConfig`, selected TOML path, or `builtin:NAME` |
+| `build_optimizer`, `build_scheduler` | `TrainingConfig` or the `training` dictionary (including required epochs, batch size and learning rate) |
+| `compile_model` | `CompileConfig` or the `runtime.compile` dictionary |
+| Trainer/runtime `diagnostics` | `DiagnosticPolicy` or a dictionary of mode/default overrides |
+| Trainer/runtime/core `fp8` | Existing bool, `FP8Config`, or FP8 settings dictionary |
+| Synthetic `build_datasets` | `SyntheticDataSettings` or a synthetic-data options dictionary |
+| Checkpoints and logging | Existing dataclass/dictionary metadata contracts; arbitrary caller metadata stays supported |
 
 ## Configuration fields
 

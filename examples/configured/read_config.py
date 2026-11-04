@@ -2,19 +2,19 @@
 
 Run: python examples/configured/read_config.py
      python examples/configured/read_config.py --config configs/scheduling.toml
+     python examples/configured/read_config.py --config builtin:fp8
 """
 
 import argparse
-from pathlib import Path
 
 from deepopt.logger import log_output
 from deepopt.config import load_config
 
 
 def main() -> None:
-    project_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=project_root / "configs" / "baseline.toml")
+    parser.add_argument("--config", default="builtin:baseline",
+                        help="TOML path or installed preset builtin:NAME")
     args = parser.parse_args()
     config = load_config(args.config)
     log_output(f"Experiment: {config.name}")

@@ -168,14 +168,22 @@ map. Each topic has its own README and links to complete runnable examples.
 
 ## Run with configuration and checkpoints
 
-The CLI supplies a synthetic classification recipe:
+The CLI supplies a synthetic classification recipe. Packaged presets work from
+any directory after installation; `--config` also accepts your own TOML path:
 
 ```bash
-python -m deepopt inspect-config --config configs/baseline.toml
-python -m deepopt train --config configs/baseline.toml --output runs/baseline
+python -m deepopt inspect-config --config builtin:baseline
+python -m deepopt train --config builtin:baseline --output runs/baseline
 python -m deepopt train --resume runs/baseline/last.pt --epochs 8
 python -m deepopt evaluate --checkpoint runs/baseline/best.pt
 ```
+
+Choose a different file with `--config ./experiments/my-training.toml`.
+Python recipes can call `train(config_dict, ...)` or `train("my-training.toml", ...)`
+directly. `deepopt.configs.load_preset("fp8", as_dict=True)` provides an editable
+dictionary from an installed preset. The repository's [configs/](configs)
+and packaged [deepopt.configs](src/deepopt/configs) are both retained; see the
+[configuration input guide](docs/runs/README.md#choose-a-toml-file-dictionary-or-installed-preset).
 
 Use a new output directory for a new run. Custom recipes use the Python
 `deepopt.run.train()` API with their own experiment factory. That layer adds

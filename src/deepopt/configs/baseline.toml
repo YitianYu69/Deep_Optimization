@@ -1,0 +1,30 @@
+# Offline classification demo. Dataset/model choices live in deepopt.baseline,
+# not in a required data schema. Real applications supply their own factories.
+name = "baseline"
+seed = 42
+
+[training]
+epochs = 5
+batch_size = 32
+learning_rate = 1e-3
+optimizer = "adamw"
+weight_decay = 0.0
+accumulation_steps = 1
+lr_gamma = 1.0
+monitor = "accuracy"
+monitor_mode = "max"
+checkpoint_every_steps = 0  # Opt in: e.g. 100 saves every 100 optimizer updates.
+# Optional: grad_clip_norm = 1.0
+
+[runtime]
+device = "cpu"
+precision = "fp32"
+deterministic = true
+
+# Optional model-only torch.compile; first execution pays compilation cost.
+[runtime.compile]
+enabled = false
+backend = "inductor"
+fullgraph = false
+# mode = "default"
+# dynamic = true  # Omit for PyTorch's automatic shape handling.

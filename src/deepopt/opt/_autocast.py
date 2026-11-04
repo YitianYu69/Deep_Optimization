@@ -2,6 +2,7 @@
 
 from contextlib import ContextDecorator, ExitStack, contextmanager
 from contextvars import ContextVar
+from collections.abc import Mapping
 
 import torch
 from torch.nn import functional as F
@@ -65,7 +66,7 @@ def fp8_context(device_type, fp8):
 
     from .policy import fp8_plan, normalize_fp8_config
 
-    settings = normalize_fp8_config({"enabled": True, **fp8} if isinstance(fp8, dict) else fp8)
+    settings = normalize_fp8_config({"enabled": True, **fp8} if isinstance(fp8, Mapping) else fp8)
     if settings.enabled and device_type not in ("cpu", "cuda"):
         raise ValueError("FP8 autocast supports CPU and CUDA devices")
     plan = fp8_plan(settings) if settings.enabled else False
