@@ -58,8 +58,14 @@ jobs:
       DEEPOPT_EXTENDED_DDP: '1'
       DEEPOPT_TEST_DISTRIBUTED: '1'
       OMP_NUM_THREADS: '1'
+      PYTHONFAULTHANDLER: '1'
+      TORCH_SHOW_CPP_STACKTRACES: '1'
     steps:
       - uses: actions/checkout@v4
+      - name: Configure distributed worker log directory
+        shell: bash
+        run: |
+          printf 'DEEPOPT_DDP_LOG_DIR=%s/deepopt-ddp-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -74,6 +80,19 @@ jobs:
           python -m unittest discover -s tests/distributed -v
           python -m unittest discover -s tests/scheduling -p test_ddp_black_box.py -v
           python -m unittest discover -s tests/metrics -p test_metrics.py -v
+      - name: Stress four-rank schedule consistency
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            python -m unittest tests.scheduling.test_ddp_black_box.ScheduleDistributedTests.test_four_rank_consistency_and_collective_count -v
+          done
+      - name: Preserve distributed worker diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-worker-logs
+          path: ${{ runner.temp }}/deepopt-ddp-logs/
+          if-no-files-found: ignore
   cuda:
     if: vars.DEEPOPT_GPU_CI == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, linux, x64, gpu]

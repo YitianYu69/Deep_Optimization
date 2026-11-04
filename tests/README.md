@@ -54,6 +54,13 @@ validation errors, update-window reduction counts, compiled mode changes, and
 seeded crop/flip replay with persistent workers. Local torchrun tests use a
 loopback rendezvous and terminate the whole worker group on timeout.
 
+Scheduling's two/four-rank worker logs can be retained with
+`DEEPOPT_DDP_LOG_DIR=work/ddp-logs`. They contain native stderr, fatal-signal
+tracebacks and phase markers; the parent prints log tails and rank exit codes
+on failure. Multiprocessing CI uploads those logs and runs three additional
+four-rank stress checks, failing on the first error. See the
+[scheduling diagnostic command](../docs/scheduling/README.md#verification-and-performance).
+
 CI tiers are defined in [ci.yml](../.github/workflows/ci.yml): fast CPU checks,
 worker/DDP checks, and opt-in GPU correctness/performance jobs. Syntax/name lint
 checks cover the repository; strict typing currently targets the new policy

@@ -250,6 +250,33 @@ The compilation test counts actual Dynamo compilations while coefficients change
 The two/four-rank Gloo test compares collective counts with unscheduled reference
 training. The benchmark measures controller-only CPU cost, not GPU throughput.
 
+To investigate worker aborts, keep per-rank logs and repeat the four-rank case:
+
+```bash
+export DEEPOPT_EXTENDED_DDP=1
+export DEEPOPT_DDP_LOG_DIR="$PWD/work/ddp-logs"
+export OMP_NUM_THREADS=1
+export PYTHONFAULTHANDLER=1
+set -e
+for attempt in $(seq 1 20); do
+  python -m unittest tests.scheduling.test_ddp_black_box.ScheduleDistributedTests.test_four_rank_consistency_and_collective_count -v
+done
+```
+
+Each invocation writes a distinct directory containing each rank's Python/native
+stdout and stderr, fatal-signal tracebacks, PyTorch version, and flushed phase
+markers. On failure the parent prints rank exit codes and log tails before
+cleanup, and preserves the failing exit status. With no log directory configured,
+logs are temporary but their tails still appear in a failed test's output.
+
+The multiprocessing CI job repeats the four-rank case three additional times
+and uploads `distributed-worker-logs` even on failure. Repetitions are stress
+checks, not retries that turn a failure into success. A parent `join()` traceback
+only reports a worker failure; inspect the earliest rank error and last phase.
+`TORCH_DISTRIBUTED_DEBUG=DETAIL` can be enabled separately when diagnosing a
+collective mismatch, but it changes PyTorch's process-group implementation and
+can expose version-specific native failures. Compare with a normal-mode run.
+
 One local run on macOS arm64 / Python 3.11.17, with 10,000 updates and five
 repeats, measured median costs of **1.22 µs/update** for one Python coefficient
 and **2.18 µs/update** for one bound CPU tensor. These are isolated controller
