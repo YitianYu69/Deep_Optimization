@@ -10,12 +10,13 @@ python -m unittest discover -s tests -v
 | --- | --- |
 | `training/` | Fit/manual APIs, module hooks, runtime safety, progress and performance |
 | `execution/` | Mode policies, reference-equivalent updates, compile behavior, transfers and profiler invariants |
-| `cuda/` | CUDA Graph lifecycle, module/function capture, decorator/context replay, autograd and real NCCL composition |
+| `cuda/` | CUDA Graph lifecycle, capture/replay, real Triton FP8 GEMM/autograd, ViT/HF models, and NCCL composition/resume |
 | `checkpointing/` | Checkpoint durability, generator discovery, step resume and batch-size changes |
 | `data/` | Loader construction, skipping, worker state and cursor-preserving rebatching |
-| `distributed/` | Separate execution cores, real Gloo/torchrun training, sharding, rank-local recovery and NCCL when available |
+| `distributed/` | Separate execution cores, real Gloo/torchrun training, FP8 gradient synchronization/resume, sharding and rank-local recovery |
 | `metrics/` | Metric inputs, aggregation, saved state and optional counts |
 | `optimization/` | Loss semantics, accumulation, strategies and optimizers |
+| `opt/` | FP8 numerical/autograd black-box and white-box checks, FX transformation, shared state, trainer resume, and optional real ViT/GPT-2/Llama models |
 | `scheduling/` | Curve/controller white-box checks; training, LR timing, resume, compilation counts and two/four-rank Gloo acceptance |
 | `memory/` | Storage accounting, fake estimation, planning and activation retention |
 | `observability/` | Logging, numerical observers and their configuration |
@@ -67,6 +68,7 @@ module. CUDA skips must not be reported as GPU validation.
 | Checkpointing | Schema/topology validation, transactional writes, RNG restoration | Interrupted versus uninterrupted runs and public checkpoint/CLI recovery |
 | Metrics | Registered state, synchronization, routing, detached ownership | Loss/statistic values over complete phases and distributed shards |
 | Optimization | Divisors, gradient processing, optimizer ownership | Numerical updates against PyTorch reference computations |
+| FP8 and FX transformation | Saved tensors/scales, transpose dispatch, parameter aliases/order, graph replacement and native DDP reducer ownership | Numerical forward/backward oracles, real ViT/HF models, optimizer updates, step/epoch checkpoint continuation and Triton/NCCL execution |
 | Memory | Storage identity, fake execution, allocation isolation | Public estimates/plans and applied batch-size decisions |
 | Observability | Filtering, detachment, device retention, synchronization counts | Training failures, emitted records, logging and example workflows |
 | Application and onboarding | Configuration validation, public imports, factory contracts | CLI commands, complete recipes and documented walkthroughs |
@@ -77,3 +79,33 @@ Run the two distributed perspectives independently with:
 python -m unittest discover -s tests/distributed -p '*white_box.py' -v
 python -m unittest discover -s tests/distributed -p '*black_box.py' -v
 ```
+
+## FP8, real models, and CUDA
+
+For a fresh Linux/Windows CPU environment, first install matching CPU binaries:
+
+```bash
+python -m pip install 'torch>=2.4,<3' 'torchvision>=0.19,<1' --index-url https://download.pytorch.org/whl/cpu
+```
+
+For macOS/CUDA installation and troubleshooting `torchvision::nms` import errors,
+see the [FP8 dependency setup](../docs/fp8/README.md#black-box-and-white-box-validation).
+
+```bash
+python -m pip install -e '.[model-tests]'
+DEEPOPT_REQUIRE_MODEL_TESTS=1 python -m unittest discover -s tests/opt -v
+python -m unittest discover -s tests/distributed -p 'test_fp8_*.py' -v
+DEEPOPT_REQUIRE_MODEL_TESTS=1 DEEPOPT_REQUIRE_CUDA_FP8=1 \
+  python -m unittest discover -s tests/cuda -p 'test_fp8_*.py' -v
+```
+
+The CPU suite runs reference FP8 execution and tiny real torchvision/timm ViTs,
+GPT-2, and Llama built from random configurations without pretrained downloads.
+The CUDA suite uses actual Triton FP8 kernels and needs NVIDIA compute capability
+9.0 or newer; its NCCL cases require two compatible GPUs. The environment flags
+make missing model dependencies or CUDA FP8 prerequisites fail explicitly.
+Ordinary discovery permits explicit skips. CPU emulation, mocked boundaries,
+and skipped GPU tests are not actual CUDA validation.
+
+See the [FP8 guide](../docs/fp8/README.md) for supported behavior, plan constraints,
+checkpoint reconstruction, and future activation-compression/sparse boundaries.

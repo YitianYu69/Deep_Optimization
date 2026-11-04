@@ -87,6 +87,42 @@ See [data loading and both batch-skip interfaces](docs/data/README.md).
 To evaluate `best.pt` while keeping training weights and optimizer intact, follow the
 [best-model evaluation example](docs/checkpoints/README.md#evaluate-best-weights-in-a-direct-recipe).
 
+## FP8 training and model transformation
+
+Transform supported projections before constructing the trainer or wrapping the
+model in DDP. The returned model uses ordinary PyTorch parameters and optimizers:
+
+```python
+import torch
+from deepopt.opt import transform_model
+
+plan = {
+    "fp8_training": {
+        "backend": "reference",
+        "fp8_dtypes": {
+            "activation": torch.float8_e4m3fn,
+            "weight": torch.float8_e4m3fn,
+            "grad": torch.float8_e5m2,
+        },
+    },
+    "block_shapes": {role: None for role in ("activation", "weight", "grad")},
+}
+model, report = transform_model(model, plan=plan, trace_mode="modules")
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+```
+
+The reference backend emulates FP8 quantization with FP32 matrix multiplication;
+it runs on CPU or CUDA. Actual FP8 GEMM uses `backend="triton"`, an NVIDIA GPU
+with compute capability 9.0 or newer, and the same FP8 dtype for all three roles.
+Use `"full"` for a rewritten FX graph, `"modules"` to retain the root class and
+methods such as `generate()`, or `"auto"` to try full tracing before fallback.
+Always use the returned model and inspect the report for partial conversion.
+
+Run the offline example with `python examples/optimization/fp8_training.py`.
+The [FP8 guide](docs/fp8/README.md) covers plans, supported adapters, checkpoints,
+DDP, real-model tests, CUDA requirements, and future compression/sparse extension
+boundaries. Activation compression and sparse execution are not implemented yet.
+
 ## Choose a guide
 
 The [documentation index](docs/README.md) gives a reading order and a feature
@@ -98,6 +134,7 @@ map. Each topic has its own README and links to complete runnable examples.
 | [Data loading](docs/data/README.md) | Ordinary loaders, batch-skip sampler/loader, and worker-state resume |
 | [Training APIs](docs/training/README.md) | `fit`, custom steps, callbacks, evaluation, manual loops, optional tasks and wrappers |
 | [CUDA Graphs](docs/cuda/README.md) | Model/function capture, context/decorator APIs, replay lifetime and composition with training/DDP |
+| [FP8 and model transformation](docs/fp8/README.md) | FP8 autograd, full/submodule FX conversion, reference/Triton backends, model validation and extension boundaries |
 | [Losses and optimization](docs/optimization/README.md) | Loss reduction and weighting, accumulation, clipping, schedulers, custom optimizers and strategies |
 | [Scheduling and warmup](docs/scheduling/README.md) | Named coefficients, LR policies, update/epoch timing, compiled tensor values and exact resume |
 | [Metrics](docs/metrics/README.md) | TorchMetrics, custom `Metric` subclasses, input routing, reporting and synchronization |
@@ -138,7 +175,7 @@ Training uses a regular core for one process, or a separate DDP core for
 multi-process CPU/Gloo and CUDA/NCCL execution. See the
 [distributed guide](docs/distributed/README.md) for architecture, torchrun,
 sharded loaders, and per-rank step/epoch recovery. CPU uses fp32; CUDA supports
-fp32 or bf16. Fp16 and automatic GPU OOM retries are unsupported.
+fp32 or bf16. Trainer fp16 AMP and automatic GPU OOM retries are unsupported.
 Fake-tensor memory estimates exclude kernel
 workspaces, allocator overhead, metrics, and callbacks; validate your workload
 on its target hardware.

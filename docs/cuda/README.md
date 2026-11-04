@@ -219,8 +219,13 @@ python -m unittest discover -s tests/cuda -p '*white_box.py' -v
 python -m unittest discover -s tests/cuda -p '*black_box.py' -v
 ```
 
-White-box tests run on CPU with mocked CUDA boundaries. Black-box tests require
-a CUDA GPU; the DDP test requires two GPUs and NCCL. They compare replay values,
+CUDA Graph white-box tests run on CPU with mocked CUDA boundaries. Graph
+black-box tests require a CUDA GPU; the DDP test requires two GPUs and NCCL. They compare replay values,
 gradients, accumulation, optimizer updates and checkpoint reconstruction with
 eager PyTorch. Hardware skips do not establish GPU correctness or performance.
 The opt-in CUDA CI job runs this entire section.
+
+The same test folder also contains `test_fp8_*.py`: real Triton kernel, autograd,
+ViT/Hugging Face model, and two-GPU FP8/NCCL checkpoint checks. Both FP8 black-box
+and white-box tests require actual compatible hardware; they do not mock kernel
+execution. See the [FP8 validation commands and prerequisites](../fp8/README.md#black-box-and-white-box-validation).

@@ -211,6 +211,9 @@ serve a different purpose and do not replace measured workload validation.
 - The sibling `cuda_graph/core.py` owns CUDA capture/replay. Capture a model
   before constructing either training core; runtime/trainer state and DDP
   collectives remain eager. See [CUDA Graph APIs and tests](../cuda/README.md).
+- `opt/` owns FX transformation, DO operations, FP8 saved-state autograd, and
+  reference/Triton GEMM execution. Training/DDP cores stay independent of these
+  operation implementations. See [FP8 and future compression/sparse boundaries](../fp8/README.md).
 - Ordinary loaders are the default for epoch saving. Built-in index-skip
   sampler/loader utilities do not claim state recovery. The resumable loader
   supports rebatching and worker prefetch with a delivered-sample cursor;

@@ -13,6 +13,7 @@ dependencies = ["torch>=2.4,<3", "torchmetrics>=1.4,<2", "tqdm>=4.66,<5"]
 [project.optional-dependencies]
 workers = ["torchdata>=0.11,<0.12"]
 dev = ["build>=1,<2", "ruff>=0.5,<1", "mypy>=1.8,<2"]
+model-tests = ["torchvision>=0.19,<1", "transformers>=4.45,<5", "timm>=1,<2"]
 
 [project.scripts]
 deepopt = "deepopt.cli:main"
