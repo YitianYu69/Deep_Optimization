@@ -277,6 +277,14 @@ only reports a worker failure; inspect the earliest rank error and last phase.
 collective mismatch, but it changes PyTorch's process-group implementation and
 can expose version-specific native failures. Compare with a normal-mode run.
 
+The worker releases its model/trainer scope and collects remaining test-owned
+cycles before destroying the process group. On failure it first records the
+original traceback, then clears completed traceback frames so their local
+variables cannot retain DDP objects through teardown. Production runtime
+diagnostic callbacks borrow the runtime through weak references; they do not
+extend the lifetime of its native execution core. No collection or extra
+collective is added to the production training loop.
+
 One local run on macOS arm64 / Python 3.11.17, with 10,000 updates and five
 repeats, measured median costs of **1.22 µs/update** for one Python coefficient
 and **2.18 µs/update** for one bound CPU tensor. These are isolated controller

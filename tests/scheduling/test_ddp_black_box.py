@@ -1,6 +1,7 @@
 """Real Gloo ranks: equal values and no added per-window collectives."""
 
 from datetime import timedelta
+import gc
 import os
 from pathlib import Path
 import sys
@@ -33,65 +34,77 @@ def _run_worker(rank, world, directory, record):
                             rank=rank, world_size=world, timeout=timedelta(seconds=45))
     record("process_group.init.complete")
     try:
-        for accumulation in (1, 2, 4, 8):
-            counts = []
-            for enabled in (False, True):
-                details = {"accumulation": accumulation, "enabled": enabled}
-                record("trainer.init.start", **details)
-                torch.manual_seed(11)
-                model = nn.Linear(1, 1)
-                curve = LinearWarmup(.1, 1., 10)
-                schedules = ScheduleController({"weight": curve}) if enabled else None
-                seen = []
-                def step(model, batch):
-                    weight = schedules["weight"] if enabled else curve.value_at(len(seen) // accumulation + 1)
-                    seen.append(weight)
-                    return model(batch).square().mean() * weight
-                trainer = Trainer(model, torch.optim.SGD(model.parameters(), lr=.01), step_fn=step,
-                                  schedules=schedules, accumulation_steps=accumulation, execution_mode="max_speed")
-                record("trainer.init.complete", **details)
-                with patch.object(dist, "all_reduce", wraps=dist.all_reduce) as reduce, \
-                        patch.object(dist, "all_gather_object", wraps=dist.all_gather_object) as gather:
-                    record("train_epoch.start", **details)
-                    trainer.train_epoch([torch.full((2, 1), (rank + 1) / 10)] * 9)
-                    counts.append((reduce.call_count, gather.call_count))
-                    record("train_epoch.complete", all_reduce=reduce.call_count,
-                           all_gather_object=gather.call_count, **details)
-                expected = [curve.value_at(i // accumulation + 1) for i in range(9)]
-                assert seen == expected, (rank, seen, expected)
-                if not enabled:
-                    reference = [p.detach().clone() for p in model.parameters()]
-                else:
-                    for actual, target in zip(model.parameters(), reference):
-                        torch.testing.assert_close(actual, target, rtol=0, atol=0)
-                    assert schedules.completed_update == trainer.state.optimizer_steps
-                    ranks = [None] * world
-                    record("schedule_state.gather.start", **details)
-                    dist.all_gather_object(ranks, schedules.state_dict())
-                    record("schedule_state.gather.complete", **details)
-                    assert all(state == ranks[0] for state in ranks)
-            assert counts[0] == counts[1], counts
-            record("accumulation.complete", accumulation=accumulation)
-        model = nn.Linear(1, 1)
-        record("inconsistent_schedule.init.start")
-        try:
-            Trainer(model, torch.optim.SGD(model.parameters(), lr=.01), loss_fn=nn.functional.mse_loss,
-                    schedules=ScheduleController({"x": LinearWarmup(0, rank + 1, 10)}))
-        except ValueError as exc:
-            record("inconsistent_schedule.rejected", error=str(exc))
-            assert "matching trainer settings" in str(exc), str(exc)
-        else:
-            raise AssertionError("Rank-inconsistent schedules were accepted")
-        record("inconsistent_schedule.complete")
+        _exercise_schedules(rank, world, record)
     except BaseException as exc:
         record("worker.error", error_type=type(exc).__name__, error=str(exc))
         traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
+        # Finished exercise frames otherwise retain trainers through teardown.
+        # Traceback locations and the original exception remain available.
+        traceback.clear_frames(exc.__traceback__)
         raise
     finally:
+        # The exercise scope has released its strong model/trainer references.
+        # Collect remaining cycles while their native process group is alive.
+        record("resources.release.start")
+        gc.collect()
+        record("resources.release.complete")
         record("process_group.destroy.start")
         dist.destroy_process_group()
         record("process_group.destroy.complete")
+
+
+def _exercise_schedules(rank, world, record):
+    for accumulation in (1, 2, 4, 8):
+        counts = []
+        for enabled in (False, True):
+            details = {"accumulation": accumulation, "enabled": enabled}
+            record("trainer.init.start", **details)
+            torch.manual_seed(11)
+            model = nn.Linear(1, 1)
+            curve = LinearWarmup(.1, 1., 10)
+            schedules = ScheduleController({"weight": curve}) if enabled else None
+            seen = []
+            def step(model, batch):
+                weight = schedules["weight"] if enabled else curve.value_at(len(seen) // accumulation + 1)
+                seen.append(weight)
+                return model(batch).square().mean() * weight
+            trainer = Trainer(model, torch.optim.SGD(model.parameters(), lr=.01), step_fn=step,
+                              schedules=schedules, accumulation_steps=accumulation, execution_mode="max_speed")
+            record("trainer.init.complete", **details)
+            with patch.object(dist, "all_reduce", wraps=dist.all_reduce) as reduce, \
+                    patch.object(dist, "all_gather_object", wraps=dist.all_gather_object) as gather:
+                record("train_epoch.start", **details)
+                trainer.train_epoch([torch.full((2, 1), (rank + 1) / 10)] * 9)
+                counts.append((reduce.call_count, gather.call_count))
+                record("train_epoch.complete", all_reduce=reduce.call_count,
+                       all_gather_object=gather.call_count, **details)
+            expected = [curve.value_at(i // accumulation + 1) for i in range(9)]
+            assert seen == expected, (rank, seen, expected)
+            if not enabled:
+                reference = [p.detach().clone() for p in model.parameters()]
+            else:
+                for actual, target in zip(model.parameters(), reference):
+                    torch.testing.assert_close(actual, target, rtol=0, atol=0)
+                assert schedules.completed_update == trainer.state.optimizer_steps
+                ranks = [None] * world
+                record("schedule_state.gather.start", **details)
+                dist.all_gather_object(ranks, schedules.state_dict())
+                record("schedule_state.gather.complete", **details)
+                assert all(state == ranks[0] for state in ranks)
+        assert counts[0] == counts[1], counts
+        record("accumulation.complete", accumulation=accumulation)
+    model = nn.Linear(1, 1)
+    record("inconsistent_schedule.init.start")
+    try:
+        Trainer(model, torch.optim.SGD(model.parameters(), lr=.01), loss_fn=nn.functional.mse_loss,
+                schedules=ScheduleController({"x": LinearWarmup(0, rank + 1, 10)}))
+    except ValueError as exc:
+        record("inconsistent_schedule.rejected", error=str(exc))
+        assert "matching trainer settings" in str(exc), str(exc)
+    else:
+        raise AssertionError("Rank-inconsistent schedules were accepted")
+    record("inconsistent_schedule.complete")
 
 
 @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "Gloo is required")
