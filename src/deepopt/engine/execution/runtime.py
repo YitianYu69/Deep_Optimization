@@ -8,6 +8,7 @@ from collections.abc import Callable
 from math import isfinite
 from numbers import Real
 from typing import Any, TypeVar
+from weakref import proxy
 
 from deepopt.observers import CheckObservers, FiniteCheck, TensorStatistics
 from deepopt.engine.execution.policy import DiagnosticPolicy, ExecutionMode, ModeController
@@ -74,7 +75,9 @@ class TrainingRuntime:
                 raise ValueError("ddp_options requires an initialized multi-rank process group")
             self.core = TrainingCore(model, self.device)
         if self._stepper is not None:
-            self._stepper.checks = self
+            # The stepper borrows its owner for diagnostics; owning it back
+            # would keep native DDP resources alive until cyclic collection.
+            self._stepper.checks = proxy(self)
         self._configure_checks()
 
     @property

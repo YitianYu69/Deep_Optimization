@@ -1,6 +1,7 @@
 """Batch iteration and metric collection, without run state or file I/O."""
 
 from time import perf_counter
+from weakref import proxy
 
 import torch
 from torch.utils.data import BatchSampler, DataLoader, IterableDataset
@@ -15,7 +16,14 @@ class EpochRunner:
         self.runtime, self.steps = runtime, steps
         self.accumulation_steps, self.loss_strategy = accumulation_steps, loss_strategy
         self.metric_factory = metric_factory
-        self.metrics = MetricLifecycle(runtime.device, observe=runtime.observe)
+        # Metrics may outlive an epoch. Their diagnostic callback borrows the
+        # runtime rather than extending the lifetime of its native DDP core.
+        runtime_proxy = proxy(runtime)
+
+        def observe(kind, tensors, *, name=""):
+            return runtime_proxy.observe(kind, tensors, name=name)
+
+        self.metrics = MetricLifecycle(runtime.device, observe=observe)
 
     def new_metrics(self):
         return self.metrics.create(self.steps, self.metric_factory)
