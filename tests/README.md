@@ -82,6 +82,15 @@ python -m unittest discover -s tests/distributed -p '*black_box.py' -v
 
 ## FP8, real models, and CUDA
 
+For a fresh Linux/Windows CPU environment, first install matching CPU binaries:
+
+```bash
+python -m pip install 'torch>=2.4,<3' 'torchvision>=0.19,<1' --index-url https://download.pytorch.org/whl/cpu
+```
+
+For macOS/CUDA installation and troubleshooting `torchvision::nms` import errors,
+see the [FP8 dependency setup](../docs/fp8/README.md#black-box-and-white-box-validation).
+
 ```bash
 python -m pip install -e '.[model-tests]'
 DEEPOPT_REQUIRE_MODEL_TESTS=1 python -m unittest discover -s tests/opt -v

@@ -170,6 +170,24 @@ DEEPOPT_REQUIRE_MODEL_TESTS=1 python -m unittest discover -s tests/opt -v
 python -m unittest discover -s tests/distributed -p 'test_fp8_*.py' -v
 ```
 
+For a fresh Linux/Windows CPU environment, install PyTorch and torchvision
+together from the CPU wheel index **before** installing the model-test extra:
+
+```bash
+python -m pip install 'torch>=2.4,<3' 'torchvision>=0.19,<1' --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e '.[model-tests]'
+python -m pip check
+```
+
+Mixing CPU PyTorch with a torchvision binary from a different build channel can
+cause `RuntimeError: operator torchvision::nms does not exist`. That import error
+also affects timm, Transformers and TorchMetrics. Recreate the environment with
+a matching pair instead of skipping the model tests or registering a fake NMS
+operator. For macOS or CUDA, use the corresponding matching pair from the
+[official PyTorch installation commands](https://pytorch.org/get-started/previous-versions/).
+The CPU CI job installs both wheels from the CPU index and executes real NMS
+before running the test groups.
+
 The tiny randomly initialized real architectures are torchvision ViT, timm ViT,
 HF GPT-2, and HF Llama. Black-box tests compare outputs/gradients against dense or
 independently quantized references, perform optimizer updates, and verify exact
