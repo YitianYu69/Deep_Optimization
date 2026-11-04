@@ -180,9 +180,12 @@ and core dispatch. For DDP, keep forwards inside `compute()`; the standalone
 context by itself does not install a DDP wrapper or synchronize gradients.
 
 CPU correctness tests exercise `eager` and `aot_eager` compiled models across
-dense/FP8 context changes with `fullgraph=False`. FP8's data-dependent checks
-can cause graph breaks; this is not a guarantee of full-graph compilation,
-Inductor GPU performance, or CUDA Graph capture support.
+dense/FP8 context changes with `fullgraph=False`. The FP8 linear primitive is an
+explicit eager boundary: plan selection, quantized-tensor metadata and custom
+autograd stay outside Dynamo, while surrounding model operations can compile.
+Triton still compiles and runs its own FP8 kernels. Full-graph compilation of
+this path is unsupported; these checks do not establish Inductor GPU performance
+or CUDA Graph capture support.
 
 ## Use a projection directly
 

@@ -124,11 +124,19 @@ def validate_fp8_plan(plan: dict) -> dict:
 
 
 
+@torch.compiler.disable
 def do_linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
     *,
     plan: dict
 ) -> torch.Tensor:
+    """Run FP8 projection/autograd eagerly inside an otherwise compiled model.
+
+    Plan selection and quantized-tensor metadata use Python validation and
+    data-dependent checks. Keep this boundary out of Dynamo tracing, including
+    when a TorchFunctionMode is active; surrounding model operations can still
+    compile with fullgraph=False. Triton kernels retain their own compilation.
+    """
 
     active_plan = _get_fp8_plan(x.device.type) if isinstance(x, torch.Tensor) else None
     if active_plan is False:
