@@ -5,6 +5,25 @@
 Pass TorchMetrics instances directly. Every custom metric must inherit
 `torchmetrics.Metric`; a task or wrapper is optional.
 
+## Runnable recipes
+
+After installing the project, run these commands from the repository root.
+All use generated CPU data and write no files.
+
+| Goal | Command | Result to inspect |
+| --- | --- | --- |
+| Understand unequal-batch loss reports | `python examples/metrics/loss_reporting.py` | Plain loss is 50; explicitly weighted loss and MSE are about 33.33 |
+| Define registered metric state | `python examples/metrics/custom_metric.py` | MAE is 2 over three samples, then reset clears the count |
+| Route different update signatures | `python examples/metrics/metric_routing.py` | Nested `quality/absolute/mean` plus a separate prediction mean |
+| Weight variable-length sequences | `python examples/metrics/weighted_tokens.py` | Six optimizer updates across three epochs, with explicit valid-token weighting |
+
+Source: [loss reporting](../../examples/metrics/loss_reporting.py),
+[custom metric](../../examples/metrics/custom_metric.py),
+[routing](../../examples/metrics/metric_routing.py), and
+[weighted tokens](../../examples/metrics/weighted_tokens.py).
+
+## Add metrics to training
+
 ```python
 from torchmetrics import MeanAbsoluteError, MeanSquaredError
 from deepopt import Trainer
@@ -114,8 +133,16 @@ optional diagnostics are disabled.
 TorchMetrics owns synchronization through options such as `sync_on_compute`.
 Changing a parent's setting does not change its children's settings. Ranks
 using synchronized metrics must use consistent schemas and participate in
-compute. This metric capability does not make the current single-device
-trainer a distributed training engine.
+compute. With an initialized multi-rank process group, the trainer's DDP core
+handles gradient synchronization while TorchMetrics handles metric-state
+synchronization. Validation shards can have unequal batch counts, including
+an empty local shard; every rank still enters the final metric computation.
+See [distributed training](../distributed/README.md) for sampler and launch rules.
+
+For manual integration through `trainer.new_metrics()`, keep the trainer or its
+runtime alive while updating or computing that collection: its diagnostic
+callback borrows the runtime. A standalone `torchmetrics.Metric` has its own
+ordinary lifecycle.
 
 ## Loss reporting and sample counts
 

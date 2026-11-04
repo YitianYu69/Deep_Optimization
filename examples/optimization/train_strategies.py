@@ -23,18 +23,20 @@ def main():
     parser.add_argument("--weighting", choices=("samples", "microbatches"), default="samples")
     args = parser.parse_args()
     torch.manual_seed(42)
-    inputs = torch.randn(43, 4)
+    inputs = torch.randn(39, 4)
     targets = inputs.sum(dim=1, keepdim=True)
-    train = DataLoader(TensorDataset(inputs[:31], targets[:31]), batch_size=6)
-    validation = DataLoader(TensorDataset(inputs[31:], targets[31:]), batch_size=6)
+    # Five microbatches (6, 6, 6, 6, 3) exercise unequal sizes and a final
+    # partial window of unequal microbatches when accumulation_steps=3.
+    train = DataLoader(TensorDataset(inputs[:27], targets[:27]), batch_size=6)
+    validation = DataLoader(TensorDataset(inputs[27:], targets[27:]), batch_size=6)
     module = TrainingModule(nn.Linear(4, 1), task=RegressionTask())
     optimizer = torch.optim.AdamW(module.parameters(), lr=0.05)
     runtime = TrainingRuntime(module, optimizer, gradient_strategy=ClipGradValue(1.0))
     loss_strategy = ExplicitObjective() if args.weighting == "samples" else MicrobatchMean()
 
     if args.api == "fit":
-        trainer = Trainer(runtime, accumulation_steps=2, loss_strategy=loss_strategy)
-        trainer.fit(train, validation, epochs=3)
+        trainer = Trainer(runtime, accumulation_steps=3, loss_strategy=loss_strategy)
+        trainer.fit(train, validation, epochs=3, progress_bar=False)
         log_output("Validation loss:", trainer.evaluate(validation)["loss"])
     else:
         for _ in range(3):
@@ -43,13 +45,13 @@ def main():
             # Optional: reuse accumulation while owning the outer loop.
             # For custom backward/update algorithms, omit OptimizationWindow
             # and use runtime.backward(), runtime.step(), or the optimizer.
-            window = OptimizationWindow(runtime, accumulation_steps=2, loss_strategy=loss_strategy)
+            window = OptimizationWindow(runtime, accumulation_steps=3, loss_strategy=loss_strategy)
             for batch in train:
                 window.backward(runtime.compute(batch, module.training_step))
             window.flush()  # Apply a final partial accumulation window.
         module.eval()
         with torch.no_grad():
-            loss = (module(inputs[31:]) - targets[31:]).square().mean()
+            loss = (module(inputs[27:]) - targets[27:]).square().mean()
         log_output("Validation loss:", loss.item())
 
 

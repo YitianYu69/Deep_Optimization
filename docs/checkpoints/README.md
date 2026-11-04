@@ -200,6 +200,26 @@ from your recipe and its recorded settings. Non-Torch random generators or
 stochastic data transforms need their own state contract; global NumPy RNG state
 is not part of these checkpoint helpers.
 
+Automatic FP8 settings from `Trainer(..., fp8=...)` or `TrainingRuntime(...,
+fp8=...)` are recorded in trainer compatibility metadata. Configured runs also
+save `[runtime.fp8]` in the experiment configuration. Reconstruct with the same
+enabled settings before restoring; changed formats, scaling, backend, or tracing
+policy are rejected. Master parameters and optimizer state remain ordinary
+floating-point checkpoint tensors; temporary FP8 operands are not stored.
+Older checkpoints without FP8 metadata remain compatible when automatic FP8 is
+disabled.
+
+An explicit `transform_model(..., plan=...)` call without automatic FP8 settings
+still leaves plan reconstruction with the recipe. Record a recipe/plan version
+in `experiment_identity` when it must be checked; matching tensor keys alone
+cannot detect a changed manual plan. Custom conversion rules and Python code
+are not reconstructed from checkpoint metadata. See
+[automatic FP8 configuration](../runs/README.md#configure-fp8).
+
+Compiled code and captured CUDA Graph objects are also not serialized. Recreate
+their execution setup through the corresponding [execution](../execution/README.md)
+and [CUDA Graph](../cuda/README.md) APIs.
+
 ## Restore compatibility
 
 The helper validates the following before enabling training:
@@ -209,7 +229,8 @@ The helper validates the following before enabling training:
 | Same component types, model state keys/shapes/dtypes, and functional computation metadata | Restore state into compatible computation |
 | Same optimizer parameter names/order/groups and child routing | Avoid loading state into a different same-shaped layer |
 | Same precision, accumulation, clipping, scheduler timing, and compatible strategy configuration | Preserve the optimization policy |
-| Same resolved device and exact PyTorch version; same visible CUDA device count for CUDA runs | Match runtime/RNG state |
+| Same enabled automatic FP8 configuration | Preserve operand formats, scaling, backend, and transformation policy |
+| Same resolved device and exact PyTorch version; same visible CUDA device count for single-process CUDA runs | Match runtime/RNG state; DDP records each rank's current-device RNG |
 | Same named generator keys | Restore each generator to its intended role |
 | For step resume: same loader type, metric classes/registered state structure, and exact TorchMetrics version | Restore the active phase and next data position |
 
@@ -228,7 +249,7 @@ fingerprint. Git observations are cached per process, are informational, and do
 not prove external data or generated code identity. Supply required versions for
 the compatibility guarantees your experiment needs.
 
-The reader accepts current format 4. Some older format-4 files without named
+The reader accepts formats 4 and 5. Some older format-4 files without named
 optimizer topology cannot be resumed safely and are rejected. The built-in
 loader's current snapshot format 3 records `drop_last` and can read its legacy
 format 1 and 2 snapshots as `drop_last=False`;
@@ -337,3 +358,25 @@ The configured runner accepts `last.pt` and `last_step.pt` for continuation;
 the current `last.pt`, it is stale and the runner rejects it. Direct helpers
 leave filename selection and staleness checks to the application. Keep one
 writer per run directory and keep its files together.
+
+## Example artifacts and replay expectations
+
+All checkpoint examples use generated CPU data and download nothing. Run them
+from the repository root after installing the package. With no `--output`, files
+live in a temporary directory and disappear on normal completion.
+
+| Recipe | Persistent output with `--output NEW_DIRECTORY` |
+| --- | --- |
+| [Ready-made callback](../../examples/checkpointing/checkpoint_resume.py) | `last.pt`, `best.pt`, `metrics.jsonl`; step mode also leaves `last_step.pt` |
+| [Low-level saves](../../examples/checkpointing/checkpoint_resume_low_level.py) | `last.pt`; step mode also leaves `last_step.pt`; history is stored inside the checkpoint |
+
+Both examples print a final JSON result with restored update count, completed
+epochs, batch size, and samples per epoch. The ready-made callback example also
+evaluates the best weights with an independently reconstructed evaluator. These
+direct examples do not create configured-run decision files or persistent text
+logs; wrap them in [logging_session](../logging/README.md) when those are needed.
+
+For an unchanged-batching replay example, use `--resume-batch-size 4`. The
+default of six deliberately changes update grouping while preserving the
+sample cursor. A matching seed and checkpoint do not promise bitwise results
+across different devices, kernels, batching, or software versions.

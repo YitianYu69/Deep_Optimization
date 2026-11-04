@@ -18,6 +18,17 @@ DeepOpt implements its own scoped file routing; vLLM is not a dependency.
 Messages go to stderr, with terminal color when available. Every line of a
 multiline message or traceback gets a prefix. Files are plain UTF-8 text.
 
+Run the offline CPU recipe from the repository root after installing the package:
+
+```bash
+python examples/observability/logging_recipe.py --log-dir runs/logging-demo --epochs 2
+```
+
+It retains a configuration-named `.log` file in the requested directory and
+prints that path through the logger. It creates no checkpoint or structured
+training-history files. Repeating identical arguments appends another session;
+choose a new directory when you want independent artifacts.
+
 ## Save a recipe's logs
 
 Wrap your recipe once. No trainer subclass, callback, or logger wrapper is needed:
@@ -42,6 +53,11 @@ any JSON-serializable mapping or dataclass instance; it neither prescribes a
 model schema nor inspects tensors. Include all recipe settings you want to
 identify. Keep credentials out of the configuration because the resolved
 configuration is recorded at DEBUG level.
+
+Use strings for non-JSON settings such as `torch.dtype`, `torch.device`, and
+`Path` values in this logging metadata. In particular, an FP8 execution plan
+contains dtype objects; record a JSON-friendly description or plan version
+instead of passing that plan directly to `logging_session`.
 
 The session includes framework logs, your `init_logger()` messages, and exceptions
 that escape the context. It flushes each record and closes the file on exit,
@@ -132,6 +148,13 @@ loggers remain unchanged. Nested sessions restore the outer routing on exit;
 each thread starting its own session gets its own destination. Context does not
 automatically propagate to newly created threads or worker processes. Do not
 share a run directory between independent writers.
+
+DeepOpt's router and `log_output()` emit only on global rank zero when a
+distributed group is active (or `RANK` identifies a nonzero worker). A session
+on other ranks has no file and `session.path` remains `None`. Run training and
+checkpoint collectives on every rank; only reporting is filtered. For separate
+per-rank diagnostics, explicitly own a different logger/file per rank instead
+of expecting this router to capture all worker output.
 
 This API does not intercept arbitrary `print()`, Python warnings, third-party
 stdout/stderr, subprocess output, or native CUDA messages. Use `init_logger()`

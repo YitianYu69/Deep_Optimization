@@ -62,6 +62,10 @@ src/deepopt/
 │   └── _process.py     # Internal process-group helpers
 ├── cuda_graph/         # Independent graph capture/replay service
 │   └── core.py         # CUDA Graph core, composed with either training core
+├── opt/                # FX model transformation and optimized operations
+│   ├── fx/             # Tracing, conversion registry, matching and rewriting
+│   ├── do_nn/          # DO modules and first-order projection autograd
+│   └── backends/       # Reference FP8 execution and Triton CUDA GEMM
 ├── scheduling/         # Pure curves, coefficient lifecycle and native LR factory
 ├── optimizer_factory.py # PyTorch/custom optimizer construction
 ├── optim.py            # Reserved optimizer algorithms; lazy legacy factory aliases
@@ -90,6 +94,8 @@ for focused commands. The usual recursive test discovery covers all groups.
 | Packaging | [pyproject.toml](../../pyproject.toml): dependencies, `src` layout, `deepopt` console entry point |
 | Public exports | [src/deepopt/__init__.py](../../src/deepopt/__init__.py): lazily load training APIs; configuration can be imported without loading Torch |
 | CUDA Graphs | [cuda_graph/core.py](../../src/deepopt/cuda_graph/core.py): model/function capture, raw blocks and inference decorators; graph lifetime stays separate from training and DDP |
+| FP8 and model conversion | [opt/transform.py](../../src/deepopt/opt/transform.py): full/submodule FX orchestration; [opt/do_nn/](../../src/deepopt/opt/do_nn/) owns operation semantics and autograd, while [opt/backends/](../../src/deepopt/opt/backends/) owns GEMM execution |
+| Compilation | [engine/execution/compilation.py](../../src/deepopt/engine/execution/compilation.py): optional model-only compilation before DDP wrapping; runtime and optimizer remain eager |
 | Application configuration | [config.py](../../src/deepopt/config.py): typed settings, strict common keys, application-owned metadata |
 | Model storage summary | [memory/statistics.py](../../src/deepopt/memory/statistics.py): parameter counts/percentages, current storage and initialization logging without fake execution |
 | Recipe callbacks | [checkpoint.py](../../src/deepopt/checkpoint.py): history, discovery and checkpoint files; [callbacks.py](../../src/deepopt/callbacks.py): scheduled update callbacks |
@@ -206,8 +212,10 @@ serve a different purpose and do not replace measured workload validation.
 - `engine/core.py` owns regular single-process execution;
   `distributed/ddp.py` owns multi-rank DDP execution. The distributed package
   is the parent namespace for distributed cores. Both share runtime/trainer
-  orchestration. CPU uses fp32; CUDA supports fp32/bf16. There is no fp16 gradient
-  scaler. See [DDP architecture and launch instructions](../distributed/README.md).
+  orchestration. For trainer-level AMP, CPU/CUDA support FP32 with AMP disabled,
+  and CUDA additionally supports BF16 AMP. There is no FP16 AMP gradient scaler.
+  Operation-level FP8 is owned by `opt/` below.
+  See [DDP architecture and launch instructions](../distributed/README.md).
 - The sibling `cuda_graph/core.py` owns CUDA capture/replay. Capture a model
   before constructing either training core; runtime/trainer state and DDP
   collectives remain eager. See [CUDA Graph APIs and tests](../cuda/README.md).

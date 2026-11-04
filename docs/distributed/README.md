@@ -1,6 +1,6 @@
 # Regular and distributed training cores
 
-[Documentation index](../README.md) · [Data loading](../data/README.md) · [Checkpoints](../checkpoints/README.md)
+[Documentation index](../README.md) · [Runnable DDP example](../../examples/distributed/ddp_training.py) · [Data loading](../data/README.md) · [Checkpoints](../checkpoints/README.md)
 
 DeepOpt has two execution cores with the same runtime-facing interface:
 
@@ -25,8 +25,40 @@ deepopt/
 
 `runtime.core` exposes the selected core. It is `TrainingCore` for a single
 process and `DDPCore` when the default process group has multiple ranks. Both
-cores preserve `runtime.model` as the caller's original model, so checkpoint
-keys do not acquire a `module.` prefix.
+cores expose the training model as `runtime.model`, so checkpoint keys do not
+acquire a `module.` prefix. With automatic FP8 enabled, a root projection or
+explicit full trace may replace the root; use `runtime.model` after setup.
+
+For FP8 projections, use the [FP8 DDP example](../fp8/README.md#train-with-the-ddp-core),
+which shows automatic FP8 preparation before wrapping, `Trainer`/runtime integration,
+and direct `DDPCore` forward/backward calls.
+
+## Run the Python example
+
+From the repository root, after `python -m pip install -e .`:
+
+```bash
+# Two local CPU ranks; generated data, no downloads or files.
+torchrun --standalone --nproc-per-node=2 examples/distributed/ddp_training.py
+
+# One process per GPU; requires two CUDA devices and NCCL.
+torchrun --standalone --nproc-per-node=2 examples/distributed/ddp_training.py --device cuda
+
+# Optional checkpoint writes, then continuation to a total of three epochs.
+torchrun --standalone --nproc-per-node=2 examples/distributed/ddp_training.py --output runs/ddp-example
+torchrun --standalone --nproc-per-node=2 examples/distributed/ddp_training.py --output runs/ddp-example --resume --epochs 3
+```
+
+The example builds the same deterministic regression dataset on every rank,
+lets `build_loaders` shard it, and runs an unwrapped model through `Trainer`.
+Rank zero prints the initialization metadata, optimizer-update count, and global
+validation result. Its default batch size is 8 **per rank**, with accumulation 2.
+The optional callback writes `last.pt`, `best.pt`, `last_step.pt`, and
+`metrics.jsonl` into the requested shared directory. Use a fresh directory for a
+new run; `--resume` reconstructs the same recipe and restores the newest progress.
+
+Running the script with ordinary `python` also works, but uses the regular
+single-process core and does not validate DDP.
 
 ## Launch a configured run
 
@@ -57,25 +89,34 @@ automatically. Partial final windows use their actual normalization weights.
 ## Use the Python API
 
 ```python
+import gc
+import traceback
+
 import torch
 from deepopt import Trainer, Checkpoint, initialize_distributed, shutdown_distributed
 from deepopt.data import build_loaders
 
+def train(context):
+    train_loader, valid_loader, _ = build_loaders(
+        train_dataset, valid_dataset, batch_size=16, seed=7,
+        resumable=True, num_workers=2, prefetch_factor=2,
+    )
+    model = make_model().to(context.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    trainer = Trainer(model, optimizer, device=context.device, loss_fn=loss_fn,
+                      accumulation_steps=2)
+    checkpoint = Checkpoint("runs/python-ddp", every_steps=10)
+    trainer.fit(train_loader, valid_loader, epochs=3, callbacks=[checkpoint])
+
 def main():
     context = initialize_distributed("auto")
-    device = context.device
     try:
-        train, valid, _ = build_loaders(
-            train_dataset, valid_dataset, batch_size=16, seed=7,
-            resumable=True, num_workers=2, prefetch_factor=2,
-        )
-        model = make_model().to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        trainer = Trainer(model, optimizer, device=device, loss_fn=loss_fn,
-                          accumulation_steps=2)
-        checkpoint = Checkpoint("runs/python-ddp", every_steps=10)
-        trainer.fit(train, valid, epochs=3, callbacks=[checkpoint])
+        train(context)
+    except BaseException as exc:
+        traceback.clear_frames(exc.__traceback__)
+        raise
     finally:
+        gc.collect()
         shutdown_distributed()
 
 if __name__ == "__main__":
@@ -87,6 +128,14 @@ moving the model. Caller-initialized process groups are reused and remain
 caller-owned. Pass an **unwrapped** model; `DDPCore` wraps the complete step,
 so functional steps and `TrainingModule` hooks both run inside DDP's forward.
 Custom steps may access the original model's attributes and submodules.
+
+This snippet assumes your datasets, `make_model`, and `loss_fn` already exist;
+the linked example is self-contained. Keep model/trainer/callback ownership in
+the training function so it ends **before** process-group destruction. The final
+collection releases remaining Python cycles while the native group is alive.
+On errors, clearing completed traceback frames releases their local references
+while preserving the exception and traceback locations. Do not retain trainers,
+DDP wrappers, or callbacks in application globals past shutdown.
 
 Initialization returns an immutable `DistributedContext`, also exported from
 `deepopt`, with these fields:
@@ -209,6 +258,18 @@ updates, module hooks, exact step/epoch recovery with dropout, rank-local state,
 uneven validation, malformed training lengths, and nonfinite losses. CLI tests
 launch torchrun, resume a configured run, and evaluate its weights in one process.
 A two-GPU NCCL variant is skipped unless two CUDA devices are available.
+
+```bash
+python -m unittest discover -s tests/distributed -v
+DEEPOPT_EXTENDED_DDP=1 python -m unittest tests.scheduling.test_ddp_black_box -v
+```
+
+For persistent scheduling-worker diagnostics, set
+`DEEPOPT_DDP_LOG_DIR=/path/to/logs`. Each invocation writes a distinct directory
+containing rank stdout/stderr, fatal-signal Python traces, and initialization,
+training, resource-release, and teardown milestones. Failures still fail the
+test. CI repeats the four-rank scheduling case and uploads these logs; logging
+does not add recovery, retries, or suppress native failures.
 
 This implements fixed-world-size DDP, not FSDP, tensor/pipeline parallelism,
 elastic world-size changes, or arbitrary process subgroups. Model-specific

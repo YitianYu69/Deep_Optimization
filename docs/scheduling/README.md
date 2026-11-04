@@ -6,6 +6,28 @@ Coefficient schedules change caller-named values at training boundaries. They
 do not infer a loss, change arbitrary attributes, or own an optimizer. Ordinary
 PyTorch LR schedulers remain independent and use their existing timing.
 
+## Choose what changes
+
+| Value | API | Who applies it? |
+| --- | --- | --- |
+| A loss weight or another named coefficient | `ScheduleController` plus a curve | Your step reads the value; the trainer prepares and commits its position |
+| An optimizer's learning rate | Native PyTorch scheduler, optionally built from `training.lr_schedule` | The trainer calls `scheduler.step()` after an update or training epoch |
+| Diagnostic overhead | `execution_mode` / `mode_schedule` | The runtime selects checks; see [execution policies](../execution/README.md) |
+
+Run the small offline CPU examples from the repository root after installation:
+
+```bash
+python examples/scheduling/coefficients.py
+python examples/scheduling/learning_rate.py --interval step
+python examples/scheduling/learning_rate.py --interval epoch
+```
+
+The [coefficient example](../../examples/scheduling/coefficients.py) reports six
+updates across two epochs, including partial accumulation windows. The
+[LR example](../../examples/scheduling/learning_rate.py) uses warmup/cosine over
+nine updates (`step`) or three epochs (`epoch`). They use separate generated
+training/validation data and create no files.
+
 ## Direct training
 
 ```python
@@ -132,6 +154,11 @@ API is unchanged. Step schedulers advance after optimizer success. Epoch
 schedulers advance after a training epoch that had updates. Neither runs during
 validation. Metric-based `ReduceLROnPlateau` remains a manual-loop concern.
 
+At a step callback, the scheduler has already advanced: the optimizer's current
+`lr` is the next update's value. Epoch rows store the LR at the epoch's start,
+which can differ from later updates when using a step scheduler. The runnable
+LR example labels these values explicitly.
+
 Without `training.lr_schedule`, the factory retains legacy ExponentialLR with
 `training.lr_gamma`. New policies use native PyTorch classes:
 
@@ -210,6 +237,10 @@ Python floats can cause recompilation. Tensor caching may occur during validatio
 without changing schedule state, but bind before graph capture for fixed addresses.
 Existing CUDA Graph constraints still apply. Default float32 storage can round
 values; request a suitable floating dtype for the computation.
+
+The model/runtime layers do not advance coefficient schedules during graph
+replay. Prepare and commit them in the outer training loop, and use the
+[CUDA Graph guide](../cuda/README.md) for capture order and replay constraints.
 
 DDP validates initial definitions/state once with trainer settings. It uses the
 shared update boundary to stay consistent, adding no per-update collectives.

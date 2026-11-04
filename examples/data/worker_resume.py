@@ -63,15 +63,20 @@ def interrupted_run(directory):
         logger.info("Saved two updates; reconstructing trainer and workers")
 
 
+def resumed_run(directory):
+    trainer, loader = components()
+    checkpoint = Checkpoint(directory, every_steps=2)
+    checkpoint.restore(trainer, loader)
+    trainer.fit(loader, epochs=1, callbacks=[checkpoint], progress_bar=False)
+    logger.info("Completed epoch: %s", checkpoint.history[-1])
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="deepopt-workers-") as directory:
         interrupted_run(Path(directory))
         gc.collect()  # Release interrupted loader workers before reconstructing.
-        trainer, loader = components()
-        checkpoint = Checkpoint(directory, every_steps=2)
-        checkpoint.restore(trainer, loader)
-        trainer.fit(loader, epochs=1, callbacks=[checkpoint], progress_bar=False)
-        logger.info("Completed epoch: %s", checkpoint.history[-1])
+        resumed_run(Path(directory))
+        gc.collect()  # Release completed worker resources before removing files.
 
 
 if __name__ == "__main__":

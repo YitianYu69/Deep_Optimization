@@ -17,7 +17,8 @@ def main():
     torch.manual_seed(42)
     features = torch.randn(80, 4)
     targets = features.sum(dim=1, keepdim=True)
-    train = DataLoader(TensorDataset(features[:64], targets[:64]), batch_size=8, shuffle=True)
+    train = DataLoader(TensorDataset(features[:64], targets[:64]), batch_size=8,
+                       shuffle=True, generator=torch.Generator().manual_seed(43))
     validation = DataLoader(TensorDataset(features[64:], targets[64:]), batch_size=8)
     model = nn.Sequential(nn.Linear(4, 16), nn.SiLU(), nn.Linear(16, 1))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.03)

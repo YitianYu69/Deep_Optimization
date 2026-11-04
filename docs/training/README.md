@@ -7,6 +7,27 @@ file, model schema, task subclass, or wrapper is required. Choose `Trainer.fit()
 when DeepOpt should control training, or `TrainingRuntime` when your recipe owns
 the loop and update order.
 
+## Choose an entry point
+
+| Your computation | Entry point | Runnable example |
+| --- | --- | --- |
+| `model(inputs)` and one scalar loss | `Trainer(..., loss_fn=...)` | [regression.py](../../examples/training/regression.py) |
+| Arbitrary batches, multiple forwards, or combined losses | `Trainer(..., step_fn=...)` | [train_functional.py](../../examples/training/train_functional.py), `--mode custom` |
+| Reusable methods on a model wrapper | `TrainingModule.training_step()` | [train_module.py](../../examples/training/train_module.py), `--mode fit` |
+| A recipe that controls backward and updates | `TrainingRuntime` | [train_module.py](../../examples/training/train_module.py), `--mode manual` |
+
+From the repository root, after `python -m pip install -e .`:
+
+```bash
+python examples/training/regression.py
+python examples/training/train_functional.py --mode custom --epochs 2
+python examples/training/train_module.py --mode manual
+python examples/training/multimodal.py
+```
+
+These examples run on CPU with generated data and write no files. The module
+example also accepts `--mode wrapper` for ordinary inference with no trainer.
+
 ## Train with a loss function
 
 For batches containing exactly `(inputs, targets)`:
@@ -170,7 +191,8 @@ stops after epoch two, and continues the same trainer to a total of three epochs
 | `model, optimizer` | Ready-made components; alternatively pass an existing `TrainingRuntime` as `model` |
 | `loss_fn` / `step_fn` / `task` | Choose one computation route; a `TrainingModule` may supply its own hooks |
 | `validation_step_fn` | Separate validation computation with the functional loss/step route |
-| `device`, `precision` | CPU/fp32 or CUDA/fp32/bf16; see below |
+| `device`, `precision` | Trainer-level AMP: FP32 without AMP on CPU/CUDA, or BF16 AMP on CUDA; see below |
+| `fp8` | Opt-in automatic projection conversion and FP8 execution; `True` or `FP8Config(enabled=True, ...)` |
 | `accumulation_steps` | Positive number of microbatches per optimizer update |
 | `grad_clip_norm` / `gradient_strategy` | Choose a built-in clipping convenience or custom gradient processing |
 | `loss_strategy` | Optional replacement for objective normalization |
@@ -181,10 +203,10 @@ stops after epoch two, and continues the same trainer to a total of three epochs
 | `execution_mode` / `diagnostics` | Select a diagnostic preset or immutable custom policy |
 | `mode_schedule` | Apply mode transitions at optimizer-update boundaries |
 | `non_blocking` | Request nonblocking transfers through nested batches |
-| `experiment_identity` | Required caller-declared recipe/data/code versions for resume |
+| `experiment_identity` | Optional caller-declared recipe/data/code versions, checked for equality on resume |
 | `schedules` | Optional shared `ScheduleController`; prepare coefficients at accumulation-window boundaries; see [scheduling](../scheduling/README.md) |
 
-When passing an existing runtime, configure optimizer, device, precision,
+When passing an existing runtime, configure optimizer, device, precision, FP8,
 clipping/gradient strategy, and checks on that runtime. Do not supply those
 options again to `Trainer`. Configure metrics, loss computation, accumulation,
 and scheduling on the trainer.
@@ -198,9 +220,18 @@ trainer = Trainer(model, optimizer, device="cuda:0", precision="bf16",
                   loss_fn=loss_function)
 ```
 
-This example requires a CUDA device supporting bf16. CPU training supports
-fp32; CUDA supports fp32 or bf16 autocast. Fp16 and gradient scaling are not
-implemented. Precision controls autocast; `TrainingRuntime.backward()` owns
+This section describes **trainer-level automatic mixed precision (AMP)**.
+The example requires a CUDA device supporting BF16. CPU uses FP32 with AMP
+disabled; CUDA supports FP32 with AMP disabled or BF16 with AMP enabled.
+Trainer-level FP16 AMP and gradient scaling are not implemented.
+[FP8 projection training](../fp8/README.md) is a separate operation-level feature,
+configured through its FP8 plan rather than `precision="fp8"`.
+Enable automatic preparation with `Trainer(..., fp8=True)` or
+`TrainingRuntime(..., fp8=True)`; `runtime.autocast()` combines its AMP and FP8
+policies. Custom loops can use `deepopt.autocast(..., fp8=True)` directly.
+The [FP8 engine example](../fp8/README.md#train-with-the-regular-engine-core)
+shows `Trainer`, a manual runtime loop and direct `TrainingCore` usage.
+`TrainingRuntime.backward()` owns
 backward through the selected execution core. The regular core uses one device;
 the [DDP core](../distributed/README.md) runs one process per device with shared
 trainer/runtime orchestration.
@@ -211,15 +242,23 @@ trainer/runtime orchestration.
 from deepopt import TrainingRuntime
 
 runtime = TrainingRuntime(model, optimizer)
+
+def compute_loss(batch):
+    inputs, targets = batch
+    return loss_function(model(inputs), targets)
+
 model.train()
 for batch in train_loader:
-    inputs, targets = runtime.prepare_batch(batch)
     runtime.zero_grad()
-    with runtime.autocast():
-        loss = loss_function(model(inputs), targets)
+    loss = runtime.compute(batch, compute_loss)
     runtime.backward(loss)
     runtime.step()
 ```
+
+`compute()` applies transfer and autocast and enters the selected execution core.
+Use this form for loops that may run under DDP: calling the raw model and then
+`runtime.backward()` would bypass the DDP forward contract. Direct
+`prepare_batch()`/`autocast()` remain available for single-device integrations.
 
 | Runtime method | Responsibility |
 | --- | --- |
@@ -242,7 +281,7 @@ helper reuses accumulation without taking over the outer loop.
 
 Use ordinary `optimizer.step(closure)` in your own loop for closure-based
 optimizers. The [alternating-update recipe](../../examples/optimization/alternating_updates.py)
-shows two runtimes, parameter freezing, and the detach needed between updates.
+shows two runtimes, parameter freezing, and gradient isolation between updates.
 Do not interleave independent manual updates with an active `fit()` lifecycle.
 
 A failed backward, observer, or optimizer update clears owned gradients and
@@ -289,6 +328,8 @@ computations. When omitted, their own metric methods remain active.
 
 ## Next guides
 
+- [Execution modes and compilation](../execution/README.md), [FP8 transformation](../fp8/README.md), and [CUDA Graphs](../cuda/README.md)
+- [Distributed training](../distributed/README.md): the same trainer with the DDP core
 - [Optimization, loss weights, and strategies](../optimization/README.md)
 - [Metrics and reporting](../metrics/README.md)
 - [Observers and diagnostics](../observers/README.md)

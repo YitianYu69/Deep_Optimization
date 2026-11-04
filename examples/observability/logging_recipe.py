@@ -1,6 +1,8 @@
 """Console + configuration-named file logs without custom Trainer wrappers.
 
 Run: python examples/observability/logging_recipe.py --log-dir logs
+This offline CPU example retains append-only logs. Identical settings append
+to the same file; use a different --log-dir for a separate experiment.
 """
 
 import argparse
@@ -17,7 +19,7 @@ logger = init_logger(__name__)
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=8)

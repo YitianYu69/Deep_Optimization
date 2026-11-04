@@ -53,13 +53,14 @@ def run(mode, device="cpu"):
         log_output(json.dumps({"mode": mode, "train_loss": row["train"]["loss"],
                           "validation_loss": row["validation"]["loss"]}))
 
-    trainer.fit(train, validation, epochs=1, callbacks=[report_epoch])
+    trainer.fit(train, validation, epochs=1, callbacks=[report_epoch], progress_bar=False)
     log_output(f"{mode}: {trainer.state.optimizer_steps} optimizer updates")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("default", "off", "selective", "all"), default="all")
+    parser.add_argument("--mode", choices=("default", "off", "selective", "all"), default="all",
+                        help="Observer configuration to demonstrate; separate from execution_mode")
     parser.add_argument("--device", default="cpu", help="Training device: cpu, cuda, or cuda:N")
     args = parser.parse_args()
     try:

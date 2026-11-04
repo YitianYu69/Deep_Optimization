@@ -35,6 +35,8 @@ class Trainer:
     TrainingModule hooks remain available. Strategies own loss normalization
     and gradient processing. For arbitrary backward/update order, own the loop
     and call TrainingRuntime directly instead of overriding trainer internals.
+    fp8=True (or an enabled FP8Config) prepares supported operations through
+    either core; use trainer.model and runtime.transformation_report afterward.
     """
 
     def __init__(self, model: nn.Module | TrainingRuntime, optimizer=None, *,
@@ -45,14 +47,14 @@ class Trainer:
                  loss_strategy: LossStrategy | None = None, gradient_strategy: GradientStrategy | None = None,
                  loss_fn=None, step_fn=None, validation_step_fn=None, metrics=None, metric_inputs=None,
                  checks=None, ddp_options=None, execution_mode=None, diagnostics=None, mode_schedule=None,
-                 non_blocking=None, experiment_identity=None, schedules=None):
+                 non_blocking=None, experiment_identity=None, schedules=None, fp8=None):
         if metric_factory is not None and (metrics is not None or metric_inputs is not None):
             raise ValueError("Choose metrics/metric_inputs or metric_factory, not both")
         if scheduler_interval not in ("epoch", "step"):
             raise ValueError("scheduler_interval must be epoch or step")
         if isinstance(model, TrainingRuntime):
             if any(value is not None for value in (optimizer, device, precision, grad_clip_norm, gradient_strategy, checks,
-                                                   ddp_options, execution_mode, diagnostics, mode_schedule, non_blocking)):
+                                                   ddp_options, execution_mode, diagnostics, mode_schedule, non_blocking, fp8)):
                 raise ValueError("Configure optimizer, device, precision, gradients, and checks on the supplied runtime")
             self.runtime = model
         else:
@@ -61,7 +63,7 @@ class Trainer:
                                            grad_clip_norm=grad_clip_norm, gradient_strategy=gradient_strategy,
                                            checks=True if checks is None else checks, ddp_options=ddp_options,
                                            execution_mode=execution_mode, diagnostics=diagnostics, mode_schedule=mode_schedule,
-                                           non_blocking=False if non_blocking is None else non_blocking)
+                                           non_blocking=False if non_blocking is None else non_blocking, fp8=fp8)
         if self.runtime.optimizer is None:
             raise ValueError("Trainer requires a runtime with an optimizer")
         self.runtime.require_complete_optimizer()

@@ -194,3 +194,19 @@ complete runnable save/resume/best-evaluation example.
 
 Read [data loading](../data/README.md), [checkpoints](../checkpoints/README.md),
 and [memory planning](../memory/README.md) only when those features are needed.
+
+## Continue with your workload
+
+- Multiple processes: [DDP guide](../distributed/README.md) and the
+  [torchrun recipe](../../examples/distributed/ddp_training.py).
+- Compiler and diagnostics: [execution guide](../execution/README.md),
+  [model compilation](../../examples/execution/compile_training.py), and
+  [update-based diagnostic modes](../../examples/execution/execution_modes.py).
+- FP8 projections: [FP8 guide](../fp8/README.md) and the
+  [reference/Triton recipe](../../examples/optimization/fp8_training.py).
+  FP8 operand formats are separate from trainer-level AMP.
+- Objective coefficients and learning rates: [scheduling guide](../scheduling/README.md).
+- Managed configuration/artifacts: [configured runs](../runs/README.md).
+
+The [example catalog](../../examples/README.md) lists prerequisites and output
+files for every program, including CUDA-only paths and optional worker recovery.

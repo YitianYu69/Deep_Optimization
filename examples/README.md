@@ -11,8 +11,8 @@ python examples/training/regression.py
 ```
 
 Alternatively, use `PYTHONPATH=src python ...` with an environment that already
-has the dependencies. Examples use small generated data (CUDA examples require a GPU) and
-requires no downloads. Data shapes, class counts and architectures belong to
+has the dependencies. Examples use small generated data and do not download
+datasets or pretrained weights. CUDA execution requires a GPU. Data shapes, class counts and architectures belong to
 the examples; they are not framework requirements. Reported numbers can vary
 with the installed PyTorch version and environment.
 
@@ -21,9 +21,11 @@ Examples are grouped by the feature they teach:
 | Folder | Start here for |
 | --- | --- |
 | `training/` | Standard losses, custom steps and optional module hooks |
+| `distributed/` | [DDP training and recovery](distributed/ddp_training.py), rank metadata and sharded loaders |
+| `execution/` | [Model compilation](execution/compile_training.py) and [diagnostic-mode scheduling](execution/execution_modes.py) |
 | `cuda/` | [CUDA Graph capture](cuda/graphs.py): models, functions, decorators, contexts and runtime composition; run `python examples/cuda/graphs.py` |
 | `metrics/` | Custom metrics, routing and explicit loss weighting |
-| `optimization/` | Multiple optimizers, custom updates and strategies |
+| `optimization/` | Multiple optimizers, custom updates, strategies and [FP8 projections](optimization/fp8_training.py) |
 | `scheduling/` | [Named coefficient warmup](scheduling/coefficients.py); run `python examples/scheduling/coefficients.py` |
 | `checkpointing/` | Save, resume and evaluate best weights |
 | `data/` | Batch skipping and worker-aware recovery |
@@ -31,8 +33,28 @@ Examples are grouped by the feature they teach:
 | `observability/` | Logging, callbacks and diagnostic observers |
 | `configured/` | Configuration and reconstruction factories |
 
-The progressive walkthrough remains at the examples root. Earlier example
+The [progressive walkthrough](progressive_training.py) remains at the examples root. Earlier example
 scripts have moved into these folders; use the updated commands below.
+
+| Example category | Environment | Files written |
+| --- | --- | --- |
+| Ordinary training, metrics, schedules, execution modes | Base install; CPU by default | None |
+| Compilation | Default `aot_eager` works on CPU; Inductor needs a compiler toolchain | PyTorch may create its normal compiler cache |
+| DDP | Run with `torchrun`; Gloo for CPU, NCCL for CUDA | None unless `--output` is supplied |
+| Built-in worker prefetch/rebatching | Base install and multiprocessing support | None |
+| Stateful worker recovery | Install `.[workers]` | Temporary checkpoints, removed on exit |
+| CUDA Graphs | CUDA required to execute; `--help` works on CPU | None |
+| FP8 | Reference emulation on CPU/CUDA; Triton needs NVIDIA CC >= 9 | None |
+| Configured runs, progressive logging/checkpoints | Base install; use fresh named output directories | Logs/checkpoints at the specified path |
+| Checkpoint/memory demonstrations | Base install | Temporary runs by default; retained with `--output` where supported |
+
+Trainer-level AMP and FP8 operand formats are separate: CUDA examples can use
+BF16 AMP, while FP8 examples select a quantized GEMM backend. Reference FP8
+execution is emulation, not proof that the CUDA kernel ran.
+The FP8 recipe now enables preparation through `Trainer(fp8=...)`; configured
+runs can use [fp8.toml](../configs/fp8.toml). The
+[combined AMP/FP8 context](../docs/fp8/README.md#combine-fp8-with-amp-in-a-context)
+also supports native linear calls in a custom loop without model transformation.
 
 ## Follow one recipe end to end
 
@@ -126,7 +148,8 @@ worker-prefetch loaders, different input shapes, or a GPU workload.
 ## Focused API examples
 
 Advanced checkpoint integration is separate:
-`python examples/checkpointing/checkpoint_resume_low_level.py --kind step` manually
+[checkpoint_resume_low_level.py](checkpointing/checkpoint_resume_low_level.py), run with
+`python examples/checkpointing/checkpoint_resume_low_level.py --kind step`, manually
 owns history, generator registration and saves. Prefer
 [checkpoint_resume.py](checkpointing/checkpoint_resume.py) for ordinary recipes.
 
@@ -137,6 +160,10 @@ owns history, generator registration and saves. Prefer
 | [optimization/train_strategies.py](optimization/train_strategies.py) | `python examples/optimization/train_strategies.py --api fit --weighting samples` | Explicit sample weights and gradient-value clipping |
 | [optimization/train_strategies.py](optimization/train_strategies.py) | `python examples/optimization/train_strategies.py --api manual --weighting microbatches` | Reusing `OptimizationWindow` while owning the loop |
 | [optimization/fp8_training.py](optimization/fp8_training.py) | `python examples/optimization/fp8_training.py` or `--device cuda --backend triton` | FP8 model conversion, report, and three optimizer updates; reference emulation by default, actual Triton requires NVIDIA CC >= 9 |
+| [scheduling/coefficients.py](scheduling/coefficients.py) | `python examples/scheduling/coefficients.py` | Named objective coefficients applied at optimizer boundaries, with validation reading the last values |
+| [scheduling/learning_rate.py](scheduling/learning_rate.py) | `python examples/scheduling/learning_rate.py --interval step` or `--interval epoch` | Warmup/cosine LR policies with an explicit update/epoch horizon and partial accumulation window |
+| [execution/compile_training.py](execution/compile_training.py) | `python examples/execution/compile_training.py` | Three updates through a compiled model; `--backend inductor` selects native kernel generation |
+| [execution/execution_modes.py](execution/execution_modes.py) | `python examples/execution/execution_modes.py` | Four updates use max_speed/analyze/analyze/balanced, followed by an explicit boundary-safe switch |
 | [observability/train_observers.py](observability/train_observers.py) | `python examples/observability/train_observers.py --mode all` | Default checks, checks off, and selective finite/activation observers |
 | [metrics/custom_metric.py](metrics/custom_metric.py) | `python examples/metrics/custom_metric.py` | Standalone registered metric states: MAE is `2.0`, then reset count is zero |
 | [configured/read_config.py](configured/read_config.py) | `python examples/configured/read_config.py` | Read and validate the baseline TOML, then print selected fields |
@@ -173,6 +200,35 @@ interrupts after two updates, reconstructs components, and completes the epoch.
 It is the only example requiring the optional `workers` dependency; it is not
 part of the base-install smoke commands.
 
+Built-in deterministic item replay with custom dictionary collation needs no
+TorchData dependency:
+
+```bash
+python examples/data/resumable_prefetch.py
+python examples/data/resumable_prefetch.py --workers 2
+```
+
+[resumable_prefetch.py](data/resumable_prefetch.py) checkpoints the delivered
+cursor after four samples, then restores with a different batch size (and worker
+count with `--workers 2`). It asserts that seeded item augmentations match the remaining sequence.
+Prefetched but undelivered batches do not advance the restored cursor. This is
+deterministic item replay; mutable worker state belongs to the TorchData recipe.
+
+## Distributed training
+
+```bash
+torchrun --standalone --nproc-per-node=2 examples/distributed/ddp_training.py
+torchrun --standalone --nproc-per-node=2 examples/distributed/ddp_training.py --output runs/ddp-example
+torchrun --standalone --nproc-per-node=2 examples/distributed/ddp_training.py --output runs/ddp-example --resume --epochs 3
+```
+
+[ddp_training.py](distributed/ddp_training.py) uses rank-aware loaders, reports
+initialization metadata, and releases training objects before process-group
+shutdown. Default execution is CPU/Gloo with no files. `--device cuda` selects
+CUDA/NCCL with one device per rank. `--batch-size` is per rank; `--epochs` is the
+total target. Optional checkpoint operations run on every rank while the callback
+coordinates shared writes. Use a fresh output directory for the first saved run.
+
 ## Configured custom recipes
 
 These existing examples add reconstruction factories, application-owned data
@@ -186,6 +242,9 @@ python examples/configured/train_regression.py --resume runs/regression/last.pt 
 python examples/configured/train_multi_optimizer.py --output runs/multi --epochs 2
 python examples/configured/train_multi_optimizer.py --resume runs/multi/last.pt --epochs 3
 ```
+
+Both configured scripts accept `--no-progress`. Resume reads saved settings and
+changes only explicit overrides; it does not rebuild a fresh default config.
 
 [configured/train_regression.py](configured/train_regression.py) owns its model and generated data
 schema. [configured/train_multi_optimizer.py](configured/train_multi_optimizer.py) supplies a full-model
@@ -209,7 +268,8 @@ manual loop when update order changes; no Task or TrainingModule inheritance
 is required for the functional recipes.
 
 CUDA adaptation requires moving the model before optimizer construction and
-using the matching runtime device; bf16 is the only supported AMP mode.
-The examples here are CPU demonstrations, not GPU performance measurements.
+using the matching runtime device; BF16 is the only enabled trainer AMP format.
+FP32 disables AMP, and FP8 operation formats are configured separately.
+CPU runs validate behavior, not GPU performance or CUDA kernel correctness.
 For framework tests and the separate CPU benchmark, see
 [architecture and development](../docs/architecture/README.md).

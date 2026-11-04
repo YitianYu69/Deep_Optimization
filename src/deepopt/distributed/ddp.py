@@ -2,11 +2,13 @@
 
 import torch
 from contextlib import nullcontext
+from dataclasses import asdict
 from math import isfinite
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from . import _process as distributed
+from deepopt.opt.policy import resolve_fp8_config, prepare_fp8_model
 
 
 class _StepModule(nn.Module):
@@ -21,7 +23,7 @@ class _StepModule(nn.Module):
 
 
 class DDPCore:
-    """Own DDP execution while preserving the user's model and state-dict names.
+    """Prepare optional FP8 and own DDP while preserving parameter/state names.
 
     TrainingRuntime delegates compute/backward and gradient normalization here.
     The complete step runs inside DDP, including custom functions that access
@@ -32,7 +34,7 @@ class DDPCore:
 
     distributed = True
 
-    def __init__(self, model, device, options=None):
+    def __init__(self, model, device, options=None, *, fp8=None):
         self.model, self.device = model, torch.device(device)
         self.forward_pending = False
         self.wrapper = None
@@ -56,6 +58,12 @@ class DDPCore:
                     raise ValueError("DDP bucket_cap_mb must be positive and finite")
             elif type(value) is not bool:
                 raise ValueError(f"DDP {name} must be a boolean")
+        with distributed.collective_errors("FP8 configuration"):
+            self.fp8 = resolve_fp8_config(model, fp8)
+        distributed.require_equal(asdict(self.fp8), "FP8 configuration")
+        with distributed.collective_errors("FP8 model preparation"):
+            self.model, self.transformation_report = prepare_fp8_model(model, self.fp8)
+        model = self.model
         if any(parameter.requires_grad for parameter in model.parameters()):
             self.wrapper = DistributedDataParallel(
                 _StepModule(model), device_ids=[self.device.index] if self.device.type == "cuda" else None,
@@ -64,12 +72,15 @@ class DDPCore:
             self.options["validation_sync_buffers"] = False
 
     def compute(self, batch, step):
-        if self.wrapper is not None and self.model.training and torch.is_grad_enabled():
-            result = self.wrapper(batch, step)
-            self.forward_pending = True
-            return result
-        # Validation can have unequal or empty shards: no per-forward collective.
-        return step(batch)
+        from deepopt.opt._autocast import fp8_context
+
+        with fp8_context(self.device.type, self.fp8 if self.fp8.enabled else None):
+            if self.wrapper is not None and self.model.training and torch.is_grad_enabled():
+                result = self.wrapper(batch, step)
+                self.forward_pending = True
+                return result
+            # Validation can have unequal or empty shards: no per-forward collective.
+            return step(batch)
 
     def backward(self, loss, **kwargs):
         with distributed.collective_errors("backward preconditions"):

@@ -53,6 +53,7 @@ model, loader, and optimizer already exist unless the snippet constructs them.
 | Estimate storage from a sample batch or select auto/manual batching before a fresh start or resume | [Memory and batch sizing](memory/README.md) |
 | Turn numerical checks on/off or add activation, gradient, weight, or custom events | [Observers and checks](observers/README.md) |
 | Select max_speed/balanced/analyze, schedule diagnostics, or inspect performance/replay contracts | [Execution policies](execution/README.md) |
+| Configure model-only `torch.compile` or try an offline compilation example | [Execution and compilation](execution/README.md) · [compile recipe](../examples/execution/compile_training.py) |
 | Save all framework/recipe messages to a configuration-named file | [Logging](logging/README.md) |
 | Locate a module, run tests, or compare CPU execution costs | [Architecture and development](architecture/README.md) |
 
@@ -68,6 +69,23 @@ model, loader, and optimizer already exist unless the snippet constructs them.
 The CLI is a concrete demo application, not a model registry. General tasks do
 not need to inherit a wrapper or implement a configuration schema. Custom
 models and datasets belong to recipes.
+
+## Execution requirements
+
+| Feature | CPU path | Additional requirements |
+| --- | --- | --- |
+| Training, checkpointing, metrics, scheduling, observers | FP32 with trainer AMP disabled | CUDA supports FP32 without AMP or BF16 AMP |
+| DDP | Gloo with multiple local processes | CUDA/NCCL uses one device per rank |
+| Model compilation | `aot_eager` example; Inductor needs a compiler toolchain | Performance depends on backend and workload |
+| CUDA Graphs | `--help` and CPU white-box checks only | CUDA device and capture-compatible operations |
+| FP8 projections | Reference quantization/emulation | Actual Triton kernels need NVIDIA CC >= 9 and compatible Triton |
+| Worker recovery | Built-in deterministic item replay | Stateful worker recovery uses the optional `workers` extra |
+| Real-model validation | Tiny random ViTs/GPT-2/Llama with `model-tests` extra | No pretrained downloads; CUDA validation remains separate |
+
+Guides describe supported behavior and boundaries. The [example catalog](../examples/README.md)
+provides runnable programs, required dependencies, and expected artifacts.
+Future activation compression and sparse operations are documented as extension
+points in the [FP8 guide](fp8/README.md), not as currently enabled features.
 
 ## Compatibility with earlier documentation links
 

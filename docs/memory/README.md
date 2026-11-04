@@ -11,7 +11,9 @@ lives outside the trainer's epoch loop.
 
 | Need | API |
 | --- | --- |
+| Inspect current model/optimizer tensor storage | `deepopt.memory.summarize_model_memory(model, optimizer)` |
 | Estimate one supplied batch shape | `deepopt.memory.estimate_training_memory(trainer, sample_batch)` |
+| Prepare a caller-owned loader before training | `deepopt.memory.prepare_batch_size(trainer, train_loader, ...)` |
 | Automatically size a fresh configured run | `deepopt.run.train(config, output=..., sample_batch_fn=...)` |
 | Automatically size a resumed configured run | `deepopt.run.train(resume=..., epochs=..., sample_batch_fn=...)` |
 | Keep a specified physical batch size | `train(..., batch_size_mode="manual", batch_size=...)` |
@@ -114,6 +116,12 @@ Run the complete [estimation example](../../examples/memory/estimate_memory.py):
 ```bash
 python examples/memory/estimate_memory.py
 ```
+
+This seeded CPU example uses meta tensors for the sample batch, so no sample
+payload is allocated. Its JSON report contains byte counts and assumptions;
+it creates no files. [model_memory.py](../../examples/memory/model_memory.py)
+instead performs two real updates and prints the currently allocated storage,
+including AdamW's newly created state. These answer different questions.
 
 ## Read the report
 
@@ -260,6 +268,18 @@ communication/external allocations, metrics, observers, schedulers, and Trainer
 callbacks. These may require additional memory. Python code still executes;
 fake-tensor mode cannot undo arbitrary closure/global mutations or external
 I/O. Custom components must support independent copying.
+
+The current [FP8 path](../fp8/README.md) performs data-dependent amax/finite-value
+operations, and its Triton kernels require real CUDA execution. Do not assume
+those computations can be traced by this estimator: use manual batch sizing for
+the FP8 examples and measure them on the target GPU. This guide's sparse storage
+accounting describes inspection only; sparse training kernels and activation
+compression are not implemented by the FP8 adapters.
+
+For ordinary models using `torch.compile`, the estimator traces an eager copy;
+it does not predict compiler workspaces or CUDA Graph pools. Perform any
+supported memory planning before CUDA Graph capture and choose a fixed batch
+shape for replay. See [CUDA Graph capture](../cuda/README.md).
 
 Function closures and globals are not automatically rebound to copied objects.
 For example, a step that captures a separate live runtime and calls its

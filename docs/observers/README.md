@@ -10,6 +10,19 @@ For `max_speed`, periodic `balanced` checks, detailed `analyze` diagnostics,
 or boundary-safe mode schedules, see [execution policies](../execution/README.md).
 Omitting a mode preserves the legacy `checks=True` behavior below.
 
+Run the small offline CPU examples after installing the package:
+
+```bash
+python examples/observability/train_observers.py --mode all
+python examples/observability/callbacks.py
+```
+
+The first prints activation summaries only for the selective observer recipe
+and a final loss/update summary for each configuration. The second reports
+every fifth update, stops after two completed epochs, and continues to a total
+of three. Neither creates files. The example's `--mode` selects its observer
+demonstration; it is separate from the trainer's `execution_mode` policy.
+
 ## Choose the checks
 
 ```python
@@ -110,6 +123,24 @@ window can produce several gradient observations at its update boundary.
 Use [Trainer callbacks](../training/README.md) for epoch or optimizer-update
 logging tied to training progress.
 
+Declare periodic callback cadence with `EveryNSteps` so skipped updates avoid
+callback-related synchronization:
+
+```python
+from deepopt import EveryNSteps
+from deepopt.logger import log_output
+
+def report_update(trainer, event):
+    log_output(event["optimizer_step"])
+
+trainer.fit(train_loader, epochs=3,
+            step_callbacks=[EveryNSteps(report_update, 100)])
+```
+
+Observers inspect tensors; callbacks handle update/epoch reports and actions.
+An observer's own sampling counter is not restored by a training checkpoint,
+whereas `EveryNSteps` uses the trainer's restored global update count.
+
 `FiniteCheck(kinds=None, enabled=True)` checks for NaN/Inf in the default event
 kinds. Supply a collection of strings to select kinds; a single string is not
 a valid collection here. Add `"weights"`, `"activation"`, or your own event name
@@ -149,6 +180,12 @@ predictions = head(hidden)  # Keep the original differentiable tensor.
 tensors. It prepares an event only when an observer is interested. The same
 API leaves room for attention scores, regularizer inputs, or other tensor
 categories defined by a recipe.
+
+The [observer recipe](../../examples/observability/train_observers.py) captures
+its live runtime in a custom step to emit activations. That is appropriate for
+execution but not for fake-tensor memory estimation, whose copied step would
+still reference the original runtime. Use manual batch sizing for that recipe,
+or remove external callbacks from the computation you want to estimate.
 
 A forward hook is useful when a module produces the activation you need:
 
@@ -195,6 +232,12 @@ Use selected kinds and a caller-owned sampling cadence for expensive diagnostics
 The internal finite checker combines accelerator flags before a host read and
 avoids full-size finite masks for suitable large real CPU tensors; this does
 not make arbitrary observers free.
+
+Immediate finite checks and Python scalar logging are not CUDA Graph replay
+operations. Keep them outside a captured region; the runtime's execution APIs
+reject use during capture. Capture the model computation through the
+[CUDA Graph APIs](../cuda/README.md), and observe its outputs afterward. Remove
+forward hooks that call `runtime.observe()` before capturing that model.
 
 ## What disabling checks does and does not change
 

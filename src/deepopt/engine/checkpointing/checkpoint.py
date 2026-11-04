@@ -79,6 +79,8 @@ def _trainer_settings(trainer) -> dict:
                 "loss_scaling": LOSS_SCALING_VERSION}
     if trainer.runtime.distributed:
         settings["ddp"] = trainer.runtime.core.options
+    if trainer.runtime.fp8.enabled:
+        settings["fp8"] = asdict(trainer.runtime.fp8)
     # Earlier checkpoints already used epoch scheduling. Keep that default's
     # metadata unchanged while rejecting a changed per-update schedule.
     if trainer.scheduler_interval != "epoch":
@@ -329,6 +331,8 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
             # equivalent; enabled settings remain strict for reproducibility.
             if not settings["runtime"].get("compile", {}).get("enabled", False):
                 settings["runtime"].pop("compile", None)
+            if not settings["runtime"].get("fp8", {}).get("enabled", False):
+                settings["runtime"].pop("fp8", None)
         if not settings.get("experiment_identity"):
             settings.pop("experiment_identity", None)
     if saved != requested:

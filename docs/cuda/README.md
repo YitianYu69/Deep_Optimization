@@ -18,6 +18,22 @@ convenience instance using the current CUDA device; use `CUDAGraphCore(device)`
 to select a device explicitly. CUDA is required at capture time; there is no
 silent CPU fallback.
 
+## Run a complete example
+
+```bash
+python examples/cuda/graphs.py --help
+python examples/cuda/graphs.py
+python examples/cuda/graphs.py --device cuda:1
+```
+
+The [graph example](../../examples/cuda/graphs.py) needs no dataset or downloads.
+It performs three captured model-training updates, captures a differentiable
+function, and checks callable inference, decorator replay, and a raw capture
+block against eager tensor expressions. The help command works on CPU-only
+machines; actual execution requires a CUDA-enabled PyTorch build and a CUDA GPU.
+Each handle is explicitly closed after its work completes. These are correctness
+examples, not timing measurements.
+
 ## Capture a model or function
 
 Both `capture_model` and its alias `capture_callable` accept an `nn.Module` or
@@ -184,7 +200,7 @@ Additional contracts:
   Python state. Plain-function closure state is caller-owned and is not restored.
 - Train/eval changes, child mode changes and autocast changes use the original
   callable eagerly. Returning to the captured settings uses the graph again.
-  Capture under the intended autocast precision (BF16 where supported); the
+  Capture under the intended AMP/autocast precision (BF16 where supported); the
   helper disables autocast caching during setup.
 - Model parameters/buffers must keep their identity, storage and metadata.
   In-place optimizer updates and ordinary `load_state_dict` copies are allowed.

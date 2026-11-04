@@ -18,11 +18,13 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from deepopt.logger import log_output
+from deepopt.logger import init_logger, log_output
 from deepopt import Trainer
-from deepopt.data.resumable import ResumableDataLoader
+from deepopt.data import ResumableDataLoader
 from deepopt.engine.checkpointing.checkpoint import read_checkpoint, restore_checkpoint, save_checkpoint
 from deepopt.runtime import seed_everything
+
+logger = init_logger(__name__)
 
 
 class CheckpointSaved(Exception):
@@ -77,6 +79,7 @@ def demonstrate(directory, kind, resume_batch_size):
     history = restore_checkpoint(payload, trainer, config, generators=generators,
                                  train_loader=train_loader, validation_loader=validation_loader,
                                  batch_size_mode="manual")
+    del payload  # The restored components now own their state.
     # The callback closes over the replacement loader, generator map, and history.
     trainer.fit(train_loader, validation_loader, epochs=2, callbacks=[record_epoch], progress_bar=False)
     log_output(json.dumps({"restored_kind": kind, "saved_optimizer_steps": saved_updates,
@@ -101,6 +104,7 @@ def main():
     else:
         args.output.mkdir(parents=True, exist_ok=False)
         demonstrate(args.output, args.kind, args.resume_batch_size)
+        logger.info("Checkpoint artifacts retained in %s", args.output.resolve())
 
 
 if __name__ == "__main__":

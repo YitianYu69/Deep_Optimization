@@ -19,10 +19,12 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import MeanSquaredError
 
-from deepopt.logger import log_output
+from deepopt.logger import init_logger, log_output
 from deepopt import Checkpoint, Trainer
-from deepopt.data.resumable import ResumableDataLoader
+from deepopt.data import ResumableDataLoader
 from deepopt.runtime import seed_everything
+
+logger = init_logger(__name__)
 
 
 class CheckpointSaved(Exception):
@@ -105,6 +107,7 @@ def main():
     else:
         args.output.mkdir(parents=True, exist_ok=False)
         demonstrate(args.output, args.kind, args.resume_batch_size)
+        logger.info("Checkpoint artifacts retained in %s", args.output.resolve())
 
 
 if __name__ == "__main__":

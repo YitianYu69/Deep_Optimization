@@ -1,5 +1,7 @@
 """Connect independently defined components; no training or model logic here."""
 
+from dataclasses import asdict
+
 from .config import ExperimentConfig
 from .data.loaders import build_loaders
 from .engine import Trainer
@@ -7,9 +9,10 @@ from .optimizer_factory import build_optimizer
 from .scheduling.lr import build_scheduler
 from .scheduling import ScheduleController
 from .runtime import resolve_device, seed_everything
-from .distributed._process import initialize_distributed, rank, world_size
+from .distributed._process import initialize_distributed, rank, world_size, collective_errors, require_equal
 from .engine.execution.policy import DiagnosticPolicy
 from .engine.execution.compilation import compile_model
+from .opt.policy import resolve_fp8_config, prepare_fp8_model
 
 
 def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory,
@@ -50,6 +53,11 @@ def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory
     train_loader, validation_loader, generators = loader_factory(
         train_data, validation_data, batch_size=config.training.batch_size, seed=config.seed, **loader_options)
     model = model_factory().to(device)
+    with collective_errors("FP8 configuration"):
+        fp8 = resolve_fp8_config(model, config.runtime.fp8)
+    require_equal(asdict(fp8), "FP8 configuration")
+    with collective_errors("FP8 model preparation"):
+        model, _ = prepare_fp8_model(model, fp8)
     compile_model(model, config.runtime.compile)
     optimizer = optimizer_factory(model, config.training)
     scheduler = scheduler_factory(optimizer, config.training)
@@ -68,6 +76,8 @@ def build_experiment(config: ExperimentConfig, *, model_factory, dataset_factory
         options["mode_schedule"] = {int(step): mode for step, mode in config.runtime.mode_schedule.items()}
     if config.runtime.non_blocking:
         options["non_blocking"] = True
+    if fp8.enabled:
+        options["fp8"] = fp8
     if config.experiment_identity:
         options["experiment_identity"] = config.experiment_identity
     if schedules is not None:
