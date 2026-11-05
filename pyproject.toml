@@ -22,4 +22,4 @@ deepopt = "deepopt.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"deepopt.configs" = ["*.toml"]
+"deepopt.configs" = ["*.toml", "templates/*.toml"]

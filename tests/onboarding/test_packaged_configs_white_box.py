@@ -14,6 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class PackagedConfigWhiteBoxTests(unittest.TestCase):
+    def test_complete_template_is_packaged_separately_from_named_presets(self):
+        resource = files("deepopt.configs").joinpath("templates", "complete.toml")
+        self.assertEqual(resource.read_bytes(), (ROOT / "configs/templates/complete.toml").read_bytes())
+        self.assertNotIn("complete", list_presets())
+
     def test_checkout_examples_and_package_resources_are_byte_identical(self):
         names = list_presets()
         self.assertEqual(names, ("baseline", "ddp", "fp8", "scheduling"))

@@ -144,6 +144,44 @@ Resume without explicit configuration uses the saved checkpoint as authority;
 loading unrelated defaults beforehand does not change the resumed computation.
 See [checkpoint compatibility](../checkpoints/README.md).
 
+## Generate a complete configuration template
+
+The template covers training, runtime diagnostics, compilation, FP8, DDP, CUDA
+Graph capture, loaders, logging, coefficient schedules, and application/identity
+metadata. Optional execution features start disabled, with CPU FP32 selected.
+
+```python
+import deepopt
+
+config = deepopt.load_config_template()  # A fresh, editable dictionary.
+config["training"]["epochs"] = 10
+config["runtime"]["fp8"]["enabled"] = True
+deepopt.load_config(config)  # Explicitly activate the edited settings.
+
+path = deepopt.write_config_template("experiments/training.toml")
+# Edit the generated TOML, then activate it when ready:
+deepopt.load_config(path)
+```
+
+Neither template helper reads or replaces global defaults, imports PyTorch,
+or initializes execution. Repeated dictionary loads return independent nested
+containers. The writer returns a `Path`, creates missing parent directories,
+and raises `FileExistsError` if the destination already exists.
+
+TOML has no null value, so inactive nullable fields appear as commented examples
+in the file and as `None` in the dictionary. Mutually exclusive diagnostic and
+LR policies have commented alternatives; arbitrary application settings,
+compiler options, and named coefficient schedules start as empty tables.
+Activate only the alternatives appropriate for your workload. The template
+contains supported configuration fields; runtime Python objects such as models,
+datasets, custom callables, and CUDA streams remain API arguments.
+
+The [repository template](../../configs/templates/complete.toml) and
+[installed resource](../../src/deepopt/configs/templates/complete.toml) are kept
+identical. These APIs work after installation from a wheel or source
+distribution and do not depend on the current directory. The template is
+separate from the four named `builtin:` presets.
+
 ## Packaged presets and local input contracts
 
 The repository has two preset locations:

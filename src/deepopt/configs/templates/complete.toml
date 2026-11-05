@@ -1,0 +1,190 @@
+# DeepOpt complete configuration template.
+# All framework sections are shown. Defaults keep ordinary CPU training:
+# FP8, compilation, diagnostics presets, and coefficient schedules are opt-in.
+# Edit a copy for your experiment; loading this file does not start training,
+# initialize CUDA/DDP, capture graphs, or create log/checkpoint files.
+#
+# TOML has no null literal. Omitted optional fields use their documented defaults.
+# Nullable fields without a preset default resolve to Python None.
+# Alternative examples are commented: uncomment only the policy you want.
+# Python callables, models, datasets, samplers, streams, and pools stay in code.
+
+name = "experiment"
+seed = 42
+
+[training]
+epochs = 5                         # Total target, including resumed epochs.
+batch_size = 32                    # Physical microbatch size; per rank for DDP.
+learning_rate = 0.001
+accumulation_steps = 1
+optimizer = "adamw"                 # adamw, sgd, or custom (requires a factory).
+weight_decay = 0.0
+momentum = 0.9                      # Used by the configured SGD factory.
+lr_gamma = 1.0                     # Legacy exponential policy; keep 1 with lr_schedule.
+# grad_clip_norm = 1.0             # Omit for no configured clipping.
+monitor = "loss"                   # Metric name, or false to disable best selection.
+monitor_mode = "min"               # min or max.
+checkpoint_every_steps = 0         # Zero disables step saves; positive needs a resumable loader.
+scheduler_interval = "epoch"       # epoch or step (completed optimizer updates).
+
+# training.lr_schedule is None while all examples below remain commented.
+# Choose ONE inline policy. Horizons use scheduler_interval units.
+# Do not combine lr_schedule with a non-default lr_gamma.
+# lr_schedule = { type = "constant" }
+# lr_schedule = { type = "step_decay", step_size = 10, gamma = 0.5 }
+# lr_schedule = { type = "exponential_decay", gamma = 0.95 }
+# lr_schedule = { type = "piecewise", milestones = [10, 20], gamma = 0.5 }
+# lr_schedule = { type = "linear_warmup", warmup_steps = 5, start_factor = 0.1 }
+# lr_schedule = { type = "cosine_decay", total_steps = 100, eta_min = 0.00001 }
+# lr_schedule = { type = "warmup_cosine", warmup_steps = 5, total_steps = 100, start_factor = 0.1, eta_min = 0.00001 }
+
+[runtime]
+device = "cpu"                     # cpu, cuda, cuda:N, or auto.
+precision = "fp32"                 # fp32; bf16 AMP requires CUDA at trainer level.
+deterministic = true
+checks = true                      # Legacy finite checks when no diagnostic policy is selected.
+non_blocking = false
+
+# execution_mode and diagnostics are alternatives; leave BOTH omitted for legacy checks.
+# execution_mode = "balanced"      # max_speed, balanced, or analyze.
+
+# A custom diagnostic policy supplies only the overrides you need.
+# Uncomment this whole table as an alternative to execution_mode:
+# [runtime.diagnostics]
+# mode = "balanced"
+# loss_finite_every = 100
+# gradient_finite_every = 100
+# inspect_weights = false
+# inspect_activations = false
+# Python None disables an individual check interval. TOML omission retains the
+# selected mode's defaults (100 for both intervals in balanced mode).
+# max_speed disables passive diagnostics and cannot enable these check fields.
+
+# Optional diagnostic transitions at positive optimizer-update numbers:
+# [runtime.mode_schedule]
+# "100" = "analyze"
+# "200" = "max_speed"
+
+[runtime.compile]
+enabled = false
+backend = "inductor"               # Any available torch.compile backend, e.g. eager or aot_eager.
+fullgraph = false
+# dynamic = true                  # Omit for PyTorch's automatic shape handling.
+# mode = "default"                 # default, reduce-overhead, max-autotune, max-autotune-no-cudagraphs.
+
+[runtime.compile.options]
+# runtime.compile.options accepts backend-specific scalar options.
+# Use nonempty options OR mode, not both.
+# "triton.cudagraphs" = false
+
+[runtime.fp8]
+enabled = false
+backend = "reference"              # reference emulation or triton native CUDA FP8 GEMM.
+trace_mode = "modules"             # modules, full, or auto.
+activation_dtype = "e4m3fn"         # e4m3fn or e5m2.
+weight_dtype = "e4m3fn"             # e4m3fn or e5m2.
+grad_dtype = "e4m3fn"               # e4m3fn or e5m2; Triton requires all three to match.
+num_stages = 3                     # Triton pipeline stages: 1, 2, 3, or 4.
+# out_dtype = "fp32"               # fp32, bf16, fp16; omit to follow active AMP/input dtype.
+
+[runtime.fp8.block_shapes]
+# Omitted operands use tensorwise scaling (None in Python).
+# Each block shape contains two positive integers.
+# Triton requires both dimensions to be multiples of 32.
+# activation = [32, 32]
+# weight = [32, 32]
+# grad = [32, 32]
+
+[runtime.ddp]
+# Applied by the DDP core. Launch/group/rank/device assignment remains external.
+find_unused_parameters = false
+broadcast_buffers = true
+gradient_as_bucket_view = true
+bucket_cap_mb = 25.0
+static_graph = false
+validation_sync_buffers = true
+
+[runtime.cuda_graph]
+# Defaults for explicit capture calls; these fields never trigger capture.
+# device = "cuda"                  # cuda or cuda:N; omit for the core's normal device selection.
+warmup = 3                         # Positive number of warmup iterations.
+allow_unused_input = false
+autograd = true
+capture_error_mode = "global"      # global, thread_local, or relaxed.
+
+[loader]
+num_workers = 0
+pin_memory = false
+persistent_workers = false
+drop_last = false
+# prefetch_factor = 2              # Requires num_workers > 0; omitted means None in the template.
+# persistent_workers = true also requires num_workers > 0.
+# Dataset selection, transforms, custom collation, and samplers remain Python-owned.
+
+[logging]
+level = "INFO"                     # Level name or nonnegative integer; Python None uses environment/default.
+file_level = "DEBUG"
+# Logging sessions write files only when an explicit destination is supplied.
+
+[application]
+# Caller-owned JSON-compatible model/dataset/task options; no fixed data schema.
+
+[experiment_identity]
+# Optional semantic versions checked on resume:
+# recipe_version = "v1"
+# dataset_version = "split-v1"
+
+[schedules]
+# Named coefficient schedules are independent of the optimizer's learning rate.
+# Your step reads a coefficient from its ScheduleController; names have no automatic binding.
+# Built-in curves use one-based positions and interval = "update" or "epoch".
+# All examples below are inactive. Uncomment the desired complete table(s).
+
+# [schedules.constant_weight]
+# type = "constant"
+# value = 0.1
+# interval = "update"
+
+# [schedules.warmup_weight]
+# type = "linear_warmup"
+# start = 0.0
+# end = 0.1
+# duration = 100
+# interval = "update"
+
+# [schedules.decaying_weight]
+# type = "linear_decay"
+# start = 1.0
+# end = 0.1
+# duration = 100
+# interval = "update"
+
+# [schedules.cosine_weight]
+# type = "cosine_decay"
+# start = 1.0
+# end = 0.0
+# duration = 100
+# interval = "update"
+
+# [schedules.exponential_weight]
+# type = "exponential_decay"
+# start = 1.0
+# gamma = 0.99
+# duration = 100                   # Omit duration for uncapped decay.
+# interval = "update"
+
+# [schedules.piecewise_weight]
+# type = "piecewise"
+# milestones = [10, 20]            # Strictly increasing integers >= 2.
+# values = [0.0, 0.5, 1.0]         # One more value than milestones.
+# interval = "update"
+
+# [schedules.sequential_weight]
+# type = "sequential"
+# durations = [10, 90]             # One positive segment duration per child.
+# interval = "update"
+# schedules = [
+#   { type = "linear_warmup", start = 0.0, end = 1.0, duration = 10, interval = "update" },
+#   { type = "cosine_decay", start = 1.0, end = 0.1, duration = 90, interval = "update" },
+# ]
+# Sequential child intervals must match their parent's interval.
