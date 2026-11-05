@@ -130,6 +130,22 @@ uses the saved configuration rather than whichever global defaults are active.
 `config_from_dict()` and `load_preset()` remain pure loaders: they return settings
 without activating them. See the [configuration guide](docs/runs/README.md).
 
+To start from a complete template, choose a dictionary or an annotated TOML file:
+
+```python
+config = deepopt.load_config_template()
+config["training"]["epochs"] = 10
+deepopt.load_config(config)
+
+# Writes a new file, including comments for optional settings.
+deepopt.write_config_template("experiments/training.toml")
+```
+
+Both template helpers leave the active configuration unchanged. The writer
+creates missing parent directories and refuses to overwrite an existing file.
+See the [complete template](configs/templates/complete.toml) for every supported
+framework setting and examples of alternative policies.
+
 ## Add checkpoints without factories
 
 Replace the earlier `fit()` call with this version when starting a fresh run:

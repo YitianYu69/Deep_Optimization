@@ -62,6 +62,8 @@ print(json.dumps({"wheel": wheel, "sdist": sdist}))
         with zipfile.ZipFile(self.wheel) as wheel:
             self.assertIn("deepopt/config.py", wheel.namelist())
             self.assertIn("deepopt/configs/__init__.py", wheel.namelist())
+            self.assertEqual(wheel.read("deepopt/configs/templates/complete.toml"),
+                             (ROOT / "configs/templates/complete.toml").read_bytes())
             for name in PRESETS:
                 with self.subTest(archive="wheel", preset=name):
                     member = f"deepopt/configs/{name}.toml"
@@ -70,6 +72,11 @@ print(json.dumps({"wheel": wheel, "sdist": sdist}))
         with tarfile.open(self.sdist) as sdist:
             names = sdist.getnames()
             self.assertTrue(any(name.endswith("/src/deepopt/config.py") for name in names))
+            template_members = [name for name in names
+                                if name.endswith("/src/deepopt/configs/templates/complete.toml")]
+            self.assertEqual(len(template_members), 1)
+            with sdist.extractfile(template_members[0]) as stream:
+                self.assertEqual(stream.read(), (ROOT / "configs/templates/complete.toml").read_bytes())
             for preset in PRESETS:
                 with self.subTest(archive="sdist", preset=preset):
                     members = [name for name in names if name.endswith(f"/src/deepopt/configs/{preset}.toml")]
@@ -112,6 +119,16 @@ for name in names:
     assert isinstance(load_preset(name, as_dict=True), dict)
 assert load_config("builtin:fp8").runtime.fp8.enabled
 assert load_preset("fp8.toml").runtime.fp8.enabled
+assert "torch" not in sys.modules
+active = deepopt.get_config()
+template = deepopt.load_config_template()
+assert isinstance(template, dict) and "prefetch_factor" in template["loader"]
+assert not template["runtime"]["fp8"]["enabled"]
+template_path = deepopt.write_config_template("exported/complete.toml")
+assert template_path.is_file()
+assert deepopt.get_config() == active
+import tomllib
+assert deepopt.config_from_dict(tomllib.loads(template_path.read_text())).name == template["name"]
 assert "torch" not in sys.modules
 
 captured = io.StringIO()
@@ -185,6 +202,11 @@ assert Path(deepopt.__loader__.archive).resolve() == wheel
 loaded = {name: load_preset(name, as_dict=True)["name"] for name in list_presets()}
 assert loaded["baseline"] == "baseline"
 assert loaded["fp8"] == "fp8-reference"
+template = deepopt.load_config_template()
+assert template["runtime"]["cuda_graph"]["warmup"] == 3
+path = deepopt.write_config_template("from-zip/template.toml")
+assert path.is_file()
+assert deepopt.get_config() is None
 assert "torch" not in sys.modules
 print(json.dumps(loaded))
 """

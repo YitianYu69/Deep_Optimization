@@ -473,3 +473,37 @@ def reset_config() -> None:
     from ._config_state import reset_config as clear_config
 
     clear_config()
+
+
+def _config_template_text() -> str:
+    from importlib.resources import files
+
+    return files("deepopt.configs").joinpath("templates", "complete.toml").read_text(encoding="utf-8")
+
+
+def load_config_template() -> dict[str, Any]:
+    """Return a fresh, complete configuration dictionary without activating it.
+
+    Optional policies are disabled with None or empty tables. The annotated
+    TOML template shows examples for their fields and alternative policies.
+    Neither this helper nor write_config_template imports PyTorch.
+    """
+    template = asdict(config_from_dict(tomllib.loads(_config_template_text())))
+    # TOML cannot represent null; expose these optional dictionary fields too.
+    template["runtime"]["cuda_graph"].setdefault("device", None)
+    template["loader"].setdefault("prefetch_factor", None)
+    return template
+
+
+def write_config_template(path: str | Path) -> Path:
+    """Write the complete annotated TOML template and return its Path.
+
+    Create missing parent directories. Raise FileExistsError rather than
+    overwrite an existing file. This does not activate global configuration.
+    """
+    destination = Path(path)
+    text = _config_template_text()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(text)
+    return destination
