@@ -28,6 +28,62 @@ python examples/training/multimodal.py
 These examples run on CPU with generated data and write no files. The module
 example also accepts `--mode wrapper` for ordinary inference with no trainer.
 
+## Use shared configuration defaults
+
+`load_config(source)` validates and installs process-local defaults. A source can
+be a full dictionary, `ExperimentConfig`, TOML path, or `builtin:NAME`. Loading
+does not construct models/loaders, seed random generators, start training, or
+create files. `get_config()` returns a copy; `reset_config()` clears defaults.
+
+This complete CPU recipe uses global defaults for its loader, optimizer, and
+epoch target while keeping the model, data, and loss in Python:
+
+```python
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.data import TensorDataset
+from deepopt import Trainer, load_config
+from deepopt.data import build_loaders
+
+load_config({
+    "name": "shared-defaults", "seed": 7,
+    "training": {"epochs": 2, "batch_size": 4, "learning_rate": 0.03,
+                 "optimizer": "sgd", "momentum": 0.0},
+    "runtime": {"device": "cpu", "precision": "fp32"},
+})
+torch.manual_seed(7)  # The recipe still owns model/data randomness.
+inputs = torch.randn(12, 3)
+dataset = TensorDataset(inputs, inputs.sum(dim=1, keepdim=True))
+loader, _, _ = build_loaders(dataset, None)
+trainer = Trainer(nn.Linear(3, 1), loss_fn=F.mse_loss)
+trainer.fit(loader, progress_bar=False)
+```
+
+For newly constructed components, explicit arguments win over `config=`, which
+wins over loaded defaults. `config=None` uses those defaults. A partial dictionary
+merges into them; a typed experiment, selected TOML file, or built-in preset is
+a complete source. Passing `config=` does not replace the process-global state.
+See the [configuration guide](../runs/README.md) for the schema and presets.
+
+Trainer/runtime/core objects retain their own snapshots. Later `load_config()`
+calls affect new objects, not existing ones; `.config` returns an owned copy.
+With no loaded defaults, direct APIs keep their ordinary behavior. Required
+information is still required: an automatic optimizer needs a learning rate,
+and `fit()` needs an epoch target either explicitly or in the trainer snapshot.
+
+`Trainer(model, optimizer=None, ...)` can create the configured optimizer after
+device placement, FP8 preparation, and compilation. A supplied optimizer is
+retained, including its parameter groups and learning rates. Omitted schedulers
+are built when an LR policy is configured; `scheduler=None` explicitly disables
+that construction. Similarly, `schedules=None` disables inherited coefficients
+and `grad_clip_norm=None` disables inherited norm clipping.
+
+`TrainingRuntime` and the bare cores do not create optimizers. When passing a
+runtime to `Trainer`, that runtime keeps ownership of its device, precision,
+FP8, diagnostics, and optimizer; configure those on the runtime. Trainer-level
+epochs, accumulation, metrics, and scheduling remain trainer responsibilities.
+
 ## Train with a loss function
 
 For batches containing exactly `(inputs, targets)`:
@@ -48,8 +104,9 @@ framework does not infer the scalar's original denominator. See
 [loss and accumulation rules](../optimization/README.md#losses-and-gradient-accumulation).
 
 Move the model to the chosen device **before** constructing its optimizer, then
-pass that device to `Trainer`. A direct trainer defaults to CPU; it does not
-select a GPU or seed your run automatically. The optimizer must contain every
+pass that device to `Trainer`. Without configured defaults, a direct trainer
+uses CPU; configured device selection also applies to direct construction.
+Direct construction does not seed your run. The optimizer must contain every
 trainable model parameter exactly once and may not contain outside parameters.
 Frozen model parameters may remain in its groups.
 
@@ -110,6 +167,18 @@ self-supervised step with two forward passes and no classification labels.
 | `progress_bar=False` | Disable the default tqdm epoch bar on stderr |
 | `request_stop()` | Stop after the current epoch completes |
 | `new_metrics()` | Create a fresh phase metric collection for advanced integration |
+
+Omitted `epochs`, `monitor`, and `monitor_mode` use the trainer's snapshot, not
+defaults loaded later. A call can override only these fit controls:
+
+```python
+trainer.fit(train_loader, config={"training": {"epochs": 4}},
+            monitor=None, progress_bar=False)
+```
+
+Explicit fit arguments have priority over that per-call configuration. It cannot
+change the existing runtime, optimizer, batch size, or accumulation policy.
+The existing run's monitor/direction compatibility checks still apply.
 
 `fit(train_loader, epochs=N)` supports training without validation; validation
 results are empty and best-score selection is disabled. An explicit monitor
@@ -188,7 +257,8 @@ stops after epoch two, and continues the same trainer to a total of three epochs
 
 | Options | Purpose |
 | --- | --- |
-| `model, optimizer` | Ready-made components; alternatively pass an existing `TrainingRuntime` as `model` |
+| `model, optimizer` | Supply an optimizer, or let Trainer build it from configured learning rate/settings; an existing `TrainingRuntime` may be supplied as `model` |
+| `config` | Partial overrides or a full configuration source; `None` inherits defaults when constructing the trainer |
 | `loss_fn` / `step_fn` / `task` | Choose one computation route; a `TrainingModule` may supply its own hooks |
 | `validation_step_fn` | Separate validation computation with the functional loss/step route |
 | `device`, `precision` | Trainer-level AMP: FP32 without AMP on CPU/CUDA, or BF16 AMP on CUDA; see below |

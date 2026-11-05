@@ -167,7 +167,9 @@ def _clone_training(trainer, sample_batch, mode):
     runtime._checks_spec = False
     # Trace only local model/optimizer execution. Never copy a process group,
     # reducer or collective into FakeTensorMode.
-    runtime.core = TrainingCore(runtime.model, runtime.device)
+    from deepopt._config_resolution import ResolvedConfig
+    runtime.core = TrainingCore(runtime.model, runtime.device, fp8=runtime.fp8,
+                                config=ResolvedConfig())
     if runtime._stepper is not None:
         runtime._stepper = copy(runtime._stepper)
         runtime._stepper.checks = runtime.checks

@@ -8,13 +8,14 @@ __all__ = ["Trainer", "TrainingRuntime", "TrainingModule", "MultiOptimizer", "Fi
            "initialize_distributed", "shutdown_distributed", "is_main_process", "DistributedContext", "TrainingCore", "DDPCore",
            "DiagnosticPolicy", "ExecutionMode", "CUDAGraphCore", "cuda_graph_core", "ScheduleController",
            "autocast", "FP8Config", "ConfigError", "ExperimentConfig", "TrainingConfig", "RuntimeConfig", "CompileConfig",
-           "load_config", "config_from_dict", "load_preset", "list_presets"]
+           "load_config", "get_config", "reset_config", "config_from_dict", "load_preset", "list_presets"]
 
 _MODULES = {"Trainer": ".engine", "TrainingRuntime": ".engine",
             "autocast": ".opt._autocast", "FP8Config": ".config",
             "ConfigError": ".config", "ExperimentConfig": ".config", "TrainingConfig": ".config",
             "RuntimeConfig": ".config", "CompileConfig": ".config",
             "load_config": ".config", "config_from_dict": ".config",
+            "get_config": ".config", "reset_config": ".config",
             "load_preset": ".configs", "list_presets": ".configs",
             "ScheduleController": ".scheduling",
             "CUDAGraphCore": ".cuda_graph", "cuda_graph_core": ".cuda_graph",

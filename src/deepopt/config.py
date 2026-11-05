@@ -1,7 +1,8 @@
 """Validated experiment settings; this module does not import PyTorch."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,8 @@ class RuntimeConfig:
     non_blocking: bool = False
     compile: CompileConfig = field(default_factory=CompileConfig)
     fp8: FP8Config = field(default_factory=FP8Config)
+    ddp: dict[str, Any] = field(default_factory=dict)
+    cuda_graph: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,8 @@ class ExperimentConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     experiment_identity: dict[str, Any] = field(default_factory=dict)
     schedules: dict[str, Any] = field(default_factory=dict)
+    loader: dict[str, Any] = field(default_factory=dict)
+    logging: dict[str, Any] = field(default_factory=dict)
 
 
 def _require_keys(table: Any, expected: set[str], location: str,
@@ -193,7 +198,8 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
         raise ConfigError("The fixed [data] schema was removed. Supply datasets through dataset_factory(); "
                           "store caller-owned options under [application]. For the synthetic demo only, "
                           "move the old [data] fields to [application.synthetic].")
-    _require_keys(raw, {"name", "seed", "training"}, "config", {"application", "runtime", "experiment_identity", "schedules"})
+    _require_keys(raw, {"name", "seed", "training"}, "config",
+                  {"application", "runtime", "experiment_identity", "schedules", "loader", "logging"})
     raw = _copy_tables(raw)
     name = raw["name"]
     if not isinstance(name, str) or not name.strip():
@@ -213,7 +219,7 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
     application = _application_value(application, "application")
     r = raw.get("runtime", {})
     _require_keys(r, set(), "runtime", {"device", "precision", "deterministic", "checks", "execution_mode",
-                                          "diagnostics", "mode_schedule", "non_blocking", "compile", "fp8"})
+                                          "diagnostics", "mode_schedule", "non_blocking", "compile", "fp8", "ddp", "cuda_graph"})
     device, precision = r.get("device", "cpu"), r.get("precision", "fp32")
     if not isinstance(device, str) or not (
         device in ("cpu", "cuda", "auto") or
@@ -233,7 +239,7 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
     mode = r.get("execution_mode")
     modes = ("max_speed", "balanced", "analyze")
     if mode is not None and mode not in modes:
-        raise ConfigError("runtime.execution_mode must be max_speed, balanced, or analyze")
+        raise ConfigError(f"runtime.execution_mode must be max_speed, balanced, or analyze; got {mode!r}")
     diagnostics = r.get("diagnostics")
     if diagnostics is not None:
         if mode is not None:
@@ -266,14 +272,87 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
         raise ConfigError("runtime.non_blocking must be a boolean")
     compilation = compile_config_from_dict(r.get("compile", {}))
     fp8 = fp8_config_from_dict(r.get("fp8", {}))
+    ddp = _ddp_config_from_dict(r.get("ddp", {}))
+    cuda_graph = _cuda_graph_config_from_dict(r.get("cuda_graph", {}))
+    loader = _loader_config_from_dict(raw.get("loader", {}))
+    logging = _logging_config_from_dict(raw.get("logging", {}))
     identity = raw.get("experiment_identity", {})
     if not isinstance(identity, dict):
         raise ConfigError("experiment_identity must be a table")
     identity = _application_value(identity, "experiment_identity")
     return ExperimentConfig(name, seed, training, application=application,
                             runtime=RuntimeConfig(device, precision, deterministic, checks, mode, diagnostics, schedule,
-                                                  non_blocking, compilation, fp8),
-                            experiment_identity=identity, schedules=schedules)
+                                                  non_blocking, compilation, fp8, ddp, cuda_graph),
+                            experiment_identity=identity, schedules=schedules, loader=loader, logging=logging)
+
+
+def _ddp_config_from_dict(raw: Mapping[str, Any]) -> dict:
+    _require_keys(raw, set(), "runtime.ddp", {
+        "find_unused_parameters", "broadcast_buffers", "gradient_as_bucket_view",
+        "bucket_cap_mb", "static_graph", "validation_sync_buffers",
+    })
+    result = dict(raw)
+    for key, value in result.items():
+        if key == "bucket_cap_mb":
+            result[key] = _number(value, f"runtime.ddp.{key}", 0, positive=True)
+        elif type(value) is not bool:
+            raise ConfigError(f"runtime.ddp.{key} must be a boolean")
+    return result
+
+
+def _cuda_graph_config_from_dict(raw: Mapping[str, Any]) -> dict:
+    _require_keys(raw, set(), "runtime.cuda_graph", {
+        "device", "warmup", "allow_unused_input", "autograd", "capture_error_mode",
+    })
+    result = dict(raw)
+    device = result.get("device")
+    if device is not None and not (isinstance(device, str) and
+            (device == "cuda" or (device.startswith("cuda:") and device[5:].isdigit()))):
+        raise ConfigError("runtime.cuda_graph.device must be cuda, cuda:N, or null")
+    if "warmup" in result:
+        _integer(result["warmup"], "runtime.cuda_graph.warmup", 1)
+    for key in ("allow_unused_input", "autograd"):
+        if key in result and type(result[key]) is not bool:
+            raise ConfigError(f"runtime.cuda_graph.{key} must be a boolean")
+    if result.get("capture_error_mode", "global") not in ("global", "thread_local", "relaxed"):
+        raise ConfigError("runtime.cuda_graph.capture_error_mode must be global, thread_local, or relaxed")
+    return result
+
+
+def _loader_config_from_dict(raw: Mapping[str, Any]) -> dict:
+    _require_keys(raw, set(), "loader", {
+        "num_workers", "pin_memory", "persistent_workers", "prefetch_factor", "drop_last",
+    })
+    result = dict(raw)
+    workers = _integer(result.get("num_workers", 0), "loader.num_workers", 0)
+    for key in ("pin_memory", "persistent_workers", "drop_last"):
+        if key in result and type(result[key]) is not bool:
+            raise ConfigError(f"loader.{key} must be a boolean")
+    prefetch = result.get("prefetch_factor")
+    if prefetch is not None:
+        _integer(prefetch, "loader.prefetch_factor", 1)
+        if workers == 0:
+            raise ConfigError("loader.prefetch_factor requires num_workers > 0")
+    if result.get("persistent_workers", False) and workers == 0:
+        raise ConfigError("loader.persistent_workers requires num_workers > 0")
+    return result
+
+
+def _logging_config_from_dict(raw: Mapping[str, Any]) -> dict:
+    import logging
+
+    _require_keys(raw, set(), "logging", {"level", "file_level"})
+    result = dict(raw)
+    for key, value in result.items():
+        if key == "level" and value is None:
+            continue
+        if isinstance(value, str):
+            if value.upper() not in logging.getLevelNamesMapping():
+                raise ConfigError(f"logging.{key} must be a logging level name or nonnegative integer")
+            result[key] = value.upper()
+        elif type(value) is not int or value < 0:
+            raise ConfigError(f"logging.{key} must be a logging level name or nonnegative integer")
+    return result
 
 
 def compile_config_from_dict(raw: Mapping[str, Any]) -> CompileConfig:
@@ -361,7 +440,7 @@ def normalize_training_config(value: TrainingConfig | Mapping[str, Any]) -> Trai
     return value if isinstance(value, TrainingConfig) else training_config_from_dict(value)
 
 
-def load_config(path: str | Path | ExperimentConfig | Mapping[str, Any]) -> ExperimentConfig:
+def _read_config(path: str | Path | ExperimentConfig | Mapping[str, Any]) -> ExperimentConfig:
     """Read a TOML path, explicit builtin preset, or supplied configuration."""
     if isinstance(path, (ExperimentConfig, Mapping)):
         return normalize_config(path)
@@ -371,3 +450,26 @@ def load_config(path: str | Path | ExperimentConfig | Mapping[str, Any]) -> Expe
         return load_preset(path.removeprefix("builtin:"))
     with Path(path).open("rb") as file:
         return config_from_dict(tomllib.load(file))
+
+
+def load_config(path: str | Path | ExperimentConfig | Mapping[str, Any]) -> ExperimentConfig:
+    """Validate and install process-local defaults, returning an independent copy."""
+    from ._config_state import install_config
+
+    validated = config_from_dict(asdict(_read_config(path)))
+    install_config(validated)
+    return deepcopy(validated)
+
+
+def get_config() -> ExperimentConfig | None:
+    """Return a copy of the active process-global configuration, if one was loaded."""
+    from ._config_state import get_config as current_config
+
+    return current_config()
+
+
+def reset_config() -> None:
+    """Clear process-global defaults; already constructed objects keep their snapshots."""
+    from ._config_state import reset_config as clear_config
+
+    clear_config()

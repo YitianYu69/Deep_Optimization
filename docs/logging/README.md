@@ -29,6 +29,41 @@ prints that path through the logger. It creates no checkpoint or structured
 training-history files. Repeating identical arguments appends another session;
 choose a new directory when you want independent artifacts.
 
+## Shared defaults without implicit files
+
+`load_config()` can supply logging policy through a `logging` table:
+
+```toml
+[logging]
+level = "WARNING"
+file_level = "DEBUG"
+```
+
+`logging_session(config=None)` inherits current metadata and levels, but its
+default `directory=None` creates **no file**. Pass a destination explicitly:
+
+```python
+from deepopt import load_config
+from deepopt.logger import logging_session
+
+load_config("builtin:baseline")
+with logging_session(directory="runs/my-recipe/logs", level="WARNING"):
+    trainer.fit(train_loader, epochs=2)
+```
+
+Explicit level arguments override a session's metadata/configuration, which
+overrides global defaults. A partial dictionary can also add arbitrary
+JSON-compatible recipe metadata; it is not restricted to the experiment schema.
+Full experiment/file sources select their own configuration. A session owns a
+snapshot, so changing globals while it is active does not change its policy or
+filename. Creating a session or asking `log_filename()` does not activate a
+global configuration or create a file.
+
+Outside a session, the shared logger uses the current configured console level.
+When no level is configured, `DEEPOPT_LOGGING_LEVEL` (or INFO) applies. Explicit
+`level=None` selects that environment/default behavior even if a global level
+exists. File output still requires a directory or a later `session.bind(...)`.
+
 ## Save a recipe's logs
 
 Wrap your recipe once. No trainer subclass, callback, or logger wrapper is needed:
@@ -90,7 +125,8 @@ resolved configuration's log. Existing `metrics.jsonl`, `batch_size.jsonl`, and
 
 A resumed run with changed settings gets another file in the same `logs/`
 directory. Evaluation appends to the file identified by its resolved config,
-including device overrides. `inspect-config` writes to `./logs/`.
+including device overrides. `inspect-config` prints resolved configuration and
+does not create an implicit log directory.
 
 When a configured run fails during reconstruction, restore, or memory planning
 before opening its normal log, its buffered messages and traceback go to
@@ -109,14 +145,14 @@ DEEPOPT_LOGGING_COLOR=0 python examples/observability/logging_recipe.py
 
 | Setting | Default | Behavior |
 | --- | --- | --- |
-| `DEEPOPT_LOGGING_LEVEL` | `INFO` | Console threshold; DEBUG, INFO, WARNING, ERROR, or CRITICAL |
+| `DEEPOPT_LOGGING_LEVEL` | `INFO` | Console fallback when no configuration/explicit level is selected |
 | `DEEPOPT_LOGGING_COLOR` | `auto` | `1` forces color; `0` disables it; auto uses a terminal check |
 | `NO_COLOR` | unset | A nonempty value disables terminal color |
 | `DEEPOPT_LOGGING_PREFIX` | empty | Adds a console prefix, such as `[experiment] ` |
-| `logging_session(..., level="WARNING")` | environment default | Override the console threshold for this context |
-| `logging_session(..., file_level="INFO")` | `DEBUG` | File threshold, independent of console verbosity |
+| `logging_session(..., level="WARNING")` | `logging.level`, then environment/INFO | Override the console threshold for this context |
+| `logging_session(..., file_level="INFO")` | `logging.file_level`, then `DEBUG` | File threshold, independent of console verbosity |
 
-The default file captures DEBUG diagnostics even when the console uses INFO.
+With the default file level, an explicitly opened file captures DEBUG diagnostics even when the console uses INFO.
 Checkpoint-save messages use DEBUG. Standard logger methods (`warning`, `error`,
 `exception`, etc.) work normally, including lazy `%s` formatting.
 

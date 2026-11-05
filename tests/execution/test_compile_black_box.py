@@ -12,7 +12,7 @@ import torch
 from torch import nn
 from torch.utils.data import TensorDataset
 
-from deepopt.config import config_from_dict, load_config
+from deepopt.config import config_from_dict, _read_config as load_config, reset_config
 from deepopt.engine.checkpointing.checkpoint import read_checkpoint, restore_checkpoint
 from deepopt.experiment import build_experiment
 from deepopt.memory import estimate_training_memory
@@ -35,6 +35,8 @@ def recipe(config):
 
 class CompileBlackBoxTests(unittest.TestCase):
     def setUp(self):
+        reset_config()
+        self.addCleanup(reset_config)
         # Independent tests must not consume each other's Dynamo cache budget.
         torch.compiler.reset()
         self.addCleanup(torch.compiler.reset)

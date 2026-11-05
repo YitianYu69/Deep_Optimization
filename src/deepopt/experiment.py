@@ -4,7 +4,8 @@ from dataclasses import asdict
 from collections.abc import Mapping
 from pathlib import Path
 
-from .config import ExperimentConfig, load_config
+from .config import ExperimentConfig, config_from_dict
+from ._config_resolution import config_scope, resolve_config
 from .data.loaders import build_loaders
 from .engine import Trainer
 from .optimizer_factory import build_optimizer
@@ -13,11 +14,10 @@ from .scheduling import ScheduleController
 from .runtime import resolve_device, seed_everything
 from .distributed._process import initialize_distributed, rank, world_size, collective_errors, require_equal
 from .engine.execution.policy import DiagnosticPolicy
-from .engine.execution.compilation import compile_model
-from .opt.policy import resolve_fp8_config, prepare_fp8_model
+from .opt.policy import resolve_fp8_config
 
 
-def build_experiment(config: ExperimentConfig | Mapping | str | Path, *, model_factory, dataset_factory,
+def build_experiment(config: ExperimentConfig | Mapping | str | Path | None = None, *, model_factory, dataset_factory,
                      loader_factory=build_loaders,
                      optimizer_factory=build_optimizer, scheduler_factory=build_scheduler,
                      task_factory=None, metric_factory=None, trainer_factory=Trainer,
@@ -37,7 +37,22 @@ def build_experiment(config: ExperimentConfig | Mapping | str | Path, *, model_f
     before any factories run; custom factories still receive typed settings.
     A TOML path or builtin:NAME reference may be supplied directly as well.
     """
-    config = load_config(config)
+    snapshot = resolve_config(config, require_complete=True)
+    resolved = config_from_dict(snapshot)
+    with config_scope(snapshot):
+        return _build_experiment(
+            resolved, model_factory=model_factory, dataset_factory=dataset_factory,
+            loader_factory=loader_factory, optimizer_factory=optimizer_factory,
+            scheduler_factory=scheduler_factory, task_factory=task_factory,
+            metric_factory=metric_factory, trainer_factory=trainer_factory,
+            loss_fn=loss_fn, step_fn=step_fn, validation_step_fn=validation_step_fn,
+            metrics=metrics, metric_inputs=metric_inputs, schedules=schedules, step_factory=step_factory)
+
+
+def _build_experiment(config, *, model_factory, dataset_factory, loader_factory,
+                      optimizer_factory, scheduler_factory, task_factory, metric_factory,
+                      trainer_factory, loss_fn, step_fn, validation_step_fn, metrics,
+                      metric_inputs, schedules, step_factory):
     seed_everything(config.seed, config.runtime.deterministic)
     context = initialize_distributed(config.runtime.device)
     device = resolve_device(str(context.device))
@@ -59,12 +74,13 @@ def build_experiment(config: ExperimentConfig | Mapping | str | Path, *, model_f
     train_loader, validation_loader, generators = loader_factory(
         train_data, validation_data, batch_size=config.training.batch_size, seed=config.seed, **loader_options)
     model = model_factory().to(device)
+    from .engine.execution.configuration import prepare_execution_model
+    snapshot = resolve_config(config)
     with collective_errors("FP8 configuration"):
-        fp8 = resolve_fp8_config(model, config.runtime.fp8)
+        fp8 = resolve_fp8_config(model, config.runtime.fp8, config=snapshot)
     require_equal(asdict(fp8), "FP8 configuration")
     with collective_errors("FP8 model preparation"):
-        model, _ = prepare_fp8_model(model, fp8)
-    compile_model(model, config.runtime.compile)
+        model, fp8, _ = prepare_execution_model(model, snapshot, fp8)
     optimizer = optimizer_factory(model, config.training)
     scheduler = scheduler_factory(optimizer, config.training)
     options = {name: value for name, value in {

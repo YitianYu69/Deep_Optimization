@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import MeanSquaredError
 
 from deepopt import Checkpoint, EveryNSteps, LossResult, Trainer
-from deepopt.config import config_from_dict, load_config
+from deepopt.config import config_from_dict, _read_config as load_config, reset_config
 from deepopt.data import ResumableDataLoader, build_loaders
 from deepopt.engine.checkpointing.checkpoint import read_checkpoint, save_checkpoint
 from deepopt.experiment import build_experiment
@@ -36,6 +36,8 @@ def components(resumable=False, accumulation=1):
 
 class OnboardingTests(unittest.TestCase):
     def setUp(self):
+        reset_config()
+        self.addCleanup(reset_config)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)

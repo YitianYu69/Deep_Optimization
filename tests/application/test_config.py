@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from deepopt.config import ConfigError, config_from_dict, load_config
+from deepopt.config import ConfigError, config_from_dict, load_config, reset_config
 
 
 VALID = '''
@@ -23,6 +23,8 @@ learning_rate = 0.001
 
 class ConfigTests(unittest.TestCase):
     def setUp(self) -> None:
+        reset_config()
+        self.addCleanup(reset_config)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.path = Path(self.temp_dir.name) / "config.toml"

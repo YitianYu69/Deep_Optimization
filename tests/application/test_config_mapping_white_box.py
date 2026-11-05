@@ -14,7 +14,7 @@ from unittest.mock import patch
 from deepopt.config import (
     ConfigError, ExperimentConfig, TrainingConfig, compile_config_from_dict,
     config_from_dict, fp8_config_from_dict, load_config, normalize_config,
-    normalize_training_config, training_config_from_dict,
+    normalize_training_config, reset_config, training_config_from_dict,
 )
 
 
@@ -27,12 +27,18 @@ def experiment_table():
 
 
 class ConfigMappingWhiteBoxTests(unittest.TestCase):
+    def setUp(self):
+        reset_config()
+        self.addCleanup(reset_config)
+
     def test_typed_normalizers_preserve_existing_object_identity(self):
         training = TrainingConfig(2, 4, .01)
         config = ExperimentConfig("mapping", 7, training)
         self.assertIs(normalize_training_config(training), training)
         self.assertIs(normalize_config(config), config)
-        self.assertIs(load_config(config), config)
+        loaded = load_config(config)
+        self.assertEqual(loaded, config)
+        self.assertIsNot(loaded, config)
         self.assertIs(config.training, training)
 
     def test_training_table_parses_without_inventing_experiment_fields(self):
@@ -144,7 +150,9 @@ class ConfigMappingWhiteBoxTests(unittest.TestCase):
     def test_only_explicit_builtin_prefix_uses_the_package_loader(self):
         expected = normalize_config(experiment_table())
         with patch("deepopt.configs.load_preset", return_value=expected) as preset:
-            self.assertIs(load_config("builtin:baseline"), expected)
+            loaded = load_config("builtin:baseline")
+            self.assertEqual(loaded, expected)
+            self.assertIsNot(loaded, expected)
             preset.assert_called_once_with("baseline")
             preset.reset_mock()
             with tempfile.TemporaryDirectory() as directory:

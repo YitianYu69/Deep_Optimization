@@ -86,6 +86,50 @@ updates. Return a scalar with the reduction you want. For alternating updates
 or other custom update order, use a
 [manual loop](docs/training/README.md) instead.
 
+## Set process-wide defaults
+
+Global configuration is optional. Load a complete dictionary, TOML path, or
+installed preset once, then let newly constructed components inherit it:
+
+```python
+import deepopt
+
+deepopt.load_config({
+    "name": "configured-regression",
+    "seed": 7,
+    "training": {"epochs": 2, "batch_size": 8, "learning_rate": 0.01},
+    "runtime": {"device": "cpu", "precision": "fp32"},
+})
+
+model = nn.Linear(3, 1)
+trainer = deepopt.Trainer(model, loss_fn=F.mse_loss)  # Builds the configured optimizer.
+trainer.fit(train_loader, validation_loader, progress_bar=False)  # Inherits two epochs.
+current = deepopt.get_config()  # An independent ExperimentConfig copy.
+deepopt.reset_config()         # Existing trainer/runtime snapshots remain unchanged.
+```
+
+This fragment reuses the imports and loaders from the earlier regression recipe.
+`deepopt.load_config("training.toml")` and `deepopt.load_config("builtin:fp8")`
+activate file or packaged defaults. A failed load leaves the previous defaults
+intact; reset is safe to repeat. Loading configuration does not initialize
+PyTorch, CUDA, DDP, or a logging session. Each distributed process owns its own
+configuration and must load equivalent settings.
+
+Precedence is **explicit arguments → per-call configuration → global defaults
+→ existing API defaults**. A per-call `config={...}` recursively overrides the
+global snapshot; lists replace lists. A complete `ExperimentConfig`, TOML path,
+or `builtin:NAME` selects an independent complete source. Explicit `False` and
+meaningful `None` values are retained, such as `checks=False` and
+`fit(..., monitor=None)`. Conflicting final options raise an error instead of
+silently removing inherited settings.
+
+Supplied optimizers and schedulers remain caller-owned. Global changes do not
+reconfigure existing trainers, runtimes, or captured CUDA graphs. Checkpoints
+record the trainer's effective snapshot; resume without an explicit override
+uses the saved configuration rather than whichever global defaults are active.
+`config_from_dict()` and `load_preset()` remain pure loaders: they return settings
+without activating them. See the [configuration guide](docs/runs/README.md).
+
 ## Add checkpoints without factories
 
 Replace the earlier `fit()` call with this version when starting a fresh run:

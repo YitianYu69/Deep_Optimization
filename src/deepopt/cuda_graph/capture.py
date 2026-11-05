@@ -5,6 +5,8 @@ from functools import update_wrapper
 
 import torch
 
+from deepopt._config_resolution import _UNSET
+
 from ._validation import (arguments, autocast_spec, capture_guard, check_arguments,
                           cuda_device, static_arguments, warmup_count)
 
@@ -17,7 +19,14 @@ class CapturedGraph:
     records work; it does not run the recorded CUDA kernels until replay.
     """
 
-    def __init__(self, *, device=None, pool=None, stream=None, capture_error_mode="global", warmup=3):
+    def __init__(self, *, device=_UNSET, pool=None, stream=None, capture_error_mode=_UNSET,
+                 warmup=_UNSET, config=None):
+        from .core import _capture_settings
+
+        self.config, options = _capture_settings(config, device=device, warmup=warmup,
+                                                capture_error_mode=capture_error_mode)
+        device, warmup = options["device"], options["warmup"]
+        capture_error_mode = options["capture_error_mode"]
         if capture_error_mode not in ("global", "thread_local", "relaxed"):
             raise ValueError("capture_error_mode must be global, thread_local or relaxed")
         warmup_count(warmup)
@@ -83,7 +92,7 @@ class CapturedGraph:
         if self._state != "new":
             raise RuntimeError("Use a fresh capture configuration for a decorator")
         return CapturedFunction(function, device=self.device, pool=self.pool, stream=self.stream,
-                                capture_error_mode=self.capture_error_mode, warmup=self.warmup)
+                                capture_error_mode=self.capture_error_mode, warmup=self.warmup, config=self.config)
 
 
 class CapturedFunction:
@@ -100,6 +109,7 @@ class CapturedFunction:
         update_wrapper(self, function)
         self.function = function
         self._capture = CapturedGraph(**options)
+        self.config = self._capture.config
         self._inputs = self._outputs = self._specs = self._autocast = None
 
     @property

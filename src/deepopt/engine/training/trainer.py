@@ -10,6 +10,8 @@ import torch
 from torch import nn
 from torchmetrics import Metric
 from deepopt.distributed import _process as distributed
+from deepopt._config_resolution import _UNSET, ResolvedConfig, config_scope, resolve_config
+from deepopt.engine.execution.configuration import execution_config, prepare_execution_model, runtime_signature
 
 from deepopt.tasks.base import Task
 from deepopt.logger import init_logger
@@ -41,60 +43,128 @@ class Trainer:
 
     def __init__(self, model: nn.Module | TrainingRuntime, optimizer=None, *,
                  device: str | torch.device | None = None, precision: str | None = None,
-                 accumulation_steps: int = 1, grad_clip_norm: float | None = None,
-                 task: Task | None = None, scheduler=None, scheduler_interval: str = "epoch",
+                 accumulation_steps=_UNSET, grad_clip_norm=_UNSET,
+                 task: Task | None = None, scheduler=_UNSET, scheduler_interval=_UNSET,
                  metric_factory: Callable[[], Metric] | None = None,
                  loss_strategy: LossStrategy | None = None, gradient_strategy: GradientStrategy | None = None,
                  loss_fn=None, step_fn=None, validation_step_fn=None, metrics=None, metric_inputs=None,
-                 checks=None, ddp_options=None, execution_mode=None, diagnostics=None, mode_schedule=None,
-                 non_blocking=None, experiment_identity=None, schedules=None, fp8=None):
-        if metric_factory is not None and (metrics is not None or metric_inputs is not None):
-            raise ValueError("Choose metrics/metric_inputs or metric_factory, not both")
-        if scheduler_interval not in ("epoch", "step"):
-            raise ValueError("scheduler_interval must be epoch or step")
-        if isinstance(model, TrainingRuntime):
-            if any(value is not None for value in (optimizer, device, precision, grad_clip_norm, gradient_strategy, checks,
-                                                   ddp_options, execution_mode, diagnostics, mode_schedule, non_blocking, fp8)):
-                raise ValueError("Configure optimizer, device, precision, gradients, and checks on the supplied runtime")
-            self.runtime = model
-        else:
-            self.runtime = TrainingRuntime(model, optimizer, device=device if device is not None else "cpu",
-                                           precision=precision if precision is not None else "fp32",
-                                           grad_clip_norm=grad_clip_norm, gradient_strategy=gradient_strategy,
-                                           checks=True if checks is None else checks, ddp_options=ddp_options,
-                                           execution_mode=execution_mode, diagnostics=diagnostics, mode_schedule=mode_schedule,
-                                           non_blocking=False if non_blocking is None else non_blocking, fp8=fp8)
-        if self.runtime.optimizer is None:
-            raise ValueError("Trainer requires a runtime with an optimizer")
-        self.runtime.require_complete_optimizer()
-        if type(accumulation_steps) is not int or accumulation_steps < 1:
-            raise ValueError("accumulation_steps must be a positive integer")
-        if scheduler is not None and getattr(scheduler, "optimizer", None) is not self.optimizer:
-            raise ValueError("Scheduler must belong to the trainer's optimizer")
-        if scheduler is not None:
-            try:
-                inspect.signature(scheduler.step).bind()
-            except (AttributeError, TypeError, ValueError) as exc:
-                raise ValueError("Automatic training requires scheduler.step() with no required arguments; "
-                                 "use a manual loop for metric-based or custom scheduling") from exc
-        loss_strategy = loss_strategy if loss_strategy is not None else ExplicitObjective()
-        if not isinstance(loss_strategy, LossStrategy):
-            raise TypeError("loss_strategy must inherit LossStrategy")
-        self.scheduler = scheduler
-        self.scheduler_interval = scheduler_interval
-        self._steps = StepAdapter(self.model, task, loss_fn=loss_fn, step_fn=step_fn,
-                                  validation_step_fn=validation_step_fn, metrics=metrics, metric_inputs=metric_inputs)
-        self._epochs = EpochRunner(self.runtime, self._steps, accumulation_steps=accumulation_steps,
-                                   loss_strategy=loss_strategy, metric_factory=metric_factory)
+                 checks=None, ddp_options=_UNSET, execution_mode=_UNSET, diagnostics=_UNSET, mode_schedule=_UNSET,
+                 non_blocking=None, experiment_identity=_UNSET, schedules=_UNSET, fp8=_UNSET, config=None):
+        with distributed.collective_errors("trainer configuration"):
+            explicit_training = {"accumulation_steps": accumulation_steps,
+                                 "scheduler_interval": scheduler_interval}
+            if scheduler is None:
+                explicit_training.update(lr_schedule=None, lr_gamma=1.0)
+            if isinstance(model, TrainingRuntime):
+                base = resolve_config()
+                base["runtime"] = model.config.get("runtime", {})
+                base.setdefault("training", {})["grad_clip_norm"] = model.grad_clip_norm
+                self._config_snapshot = resolve_config(config, base=base,
+                                                       overrides={"training": explicit_training})
+                if config is not None and runtime_signature(self._config_snapshot) != runtime_signature(model.config):
+                    raise ValueError("Configure runtime-owned settings on the supplied runtime")
+            else:
+                self._config_snapshot = execution_config(
+                    config, device=device if device is not None else _UNSET,
+                    precision=precision if precision is not None else _UNSET,
+                    checks=checks if checks is not None else _UNSET, grad_clip_norm=grad_clip_norm,
+                    execution_mode=execution_mode, diagnostics=diagnostics, mode_schedule=mode_schedule,
+                    non_blocking=non_blocking if non_blocking is not None else _UNSET,
+                    fp8=fp8, model=model, ddp_options=ddp_options, training_overrides=explicit_training)
+            training = self._config_snapshot.get("training", {})
+            scheduler_was_explicit = scheduler is not _UNSET
+            accumulation_steps = (training.get("accumulation_steps", 1)
+                                  if accumulation_steps is _UNSET else accumulation_steps)
+            scheduler_interval = (training.get("scheduler_interval", "epoch")
+                                  if scheduler_interval is _UNSET else scheduler_interval)
+            if experiment_identity is _UNSET:
+                experiment_identity = self._config_snapshot.get("experiment_identity", {})
+            if schedules is _UNSET:
+                from deepopt.scheduling import ScheduleController
+                definitions = self._config_snapshot.get("schedules", {})
+                schedules = ScheduleController.from_config(definitions) if definitions else None
+            if metric_factory is not None and (metrics is not None or metric_inputs is not None):
+                raise ValueError("Choose metrics/metric_inputs or metric_factory, not both")
+            if scheduler_interval not in ("epoch", "step"):
+                raise ValueError("scheduler_interval must be epoch or step")
+            if isinstance(model, TrainingRuntime):
+                if (any(value is not None for value in (optimizer, device, precision, gradient_strategy, checks, non_blocking))
+                        or any(value is not _UNSET and value is not None for value in
+                               (grad_clip_norm, ddp_options, execution_mode, diagnostics, mode_schedule, fp8))):
+                    raise ValueError("Configure optimizer, device, precision, gradients, and checks on the supplied runtime")
+                self.runtime = model
+        if not isinstance(model, TrainingRuntime):
+            runtime_settings = self._config_snapshot.get("runtime", {})
+            context = distributed.initialize_distributed(runtime_settings.get("device", "cpu"))
+            with distributed.collective_errors("model device"):
+                if optimizer is None:
+                    if "learning_rate" not in training:
+                        raise ValueError("Trainer requires an optimizer or configured training.learning_rate")
+                    model = model.to(context.device)
+                else:
+                    if any(parameter.device != context.device for parameter in model.parameters()):
+                        raise ValueError("Move the model to the training device before constructing its optimizer")
+            with distributed.collective_errors("model preparation"):
+                model, prepared_fp8, _ = prepare_execution_model(model, self._config_snapshot, fp8)
+            with config_scope(self._config_snapshot):
+                with distributed.collective_errors("optimizer and scheduler setup"):
+                    if optimizer is None:
+                        from deepopt.optimizer_factory import build_optimizer
+                        optimizer = build_optimizer(model, self._config_snapshot)
+                    if scheduler is _UNSET and (training.get("lr_schedule") is not None or training.get("lr_gamma", 1.0) != 1.0):
+                        from deepopt.scheduling.lr import build_scheduler
+                        scheduler = build_scheduler(optimizer, self._config_snapshot)
+                self.runtime = TrainingRuntime(
+                    model, optimizer, grad_clip_norm=grad_clip_norm, gradient_strategy=gradient_strategy,
+                    checks=checks if checks is not None else _UNSET, ddp_options=ddp_options,
+                    fp8=prepared_fp8, config=self._config_snapshot)
+        with self.runtime.core.check_errors("trainer components"):
+            self._config_snapshot["runtime"] = self.runtime.config.get("runtime", {})
+            self._config_snapshot.setdefault("training", {}).update({
+                "accumulation_steps": accumulation_steps, "scheduler_interval": scheduler_interval,
+                "grad_clip_norm": self.runtime.grad_clip_norm,
+            })
+            if scheduler is _UNSET:
+                if training.get("lr_schedule") is not None or training.get("lr_gamma", 1.0) != 1.0:
+                    from deepopt.scheduling.lr import build_scheduler
+                    scheduler = build_scheduler(self.runtime.optimizer, self._config_snapshot)
+                else:
+                    scheduler = None
+            if scheduler_was_explicit and scheduler is None:
+                self._config_snapshot["training"].update(lr_schedule=None, lr_gamma=1.0)
+            if self.runtime.optimizer is None:
+                raise ValueError("Trainer requires a runtime with an optimizer")
+            self.runtime.require_complete_optimizer()
+            if type(accumulation_steps) is not int or accumulation_steps < 1:
+                raise ValueError("accumulation_steps must be a positive integer")
+            if scheduler is not None and getattr(scheduler, "optimizer", None) is not self.optimizer:
+                raise ValueError("Scheduler must belong to the trainer's optimizer")
+            if scheduler is not None:
+                try:
+                    inspect.signature(scheduler.step).bind()
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise ValueError("Automatic training requires scheduler.step() with no required arguments; "
+                                     "use a manual loop for metric-based or custom scheduling") from exc
+            loss_strategy = loss_strategy if loss_strategy is not None else ExplicitObjective()
+            if not isinstance(loss_strategy, LossStrategy):
+                raise TypeError("loss_strategy must inherit LossStrategy")
+            self.scheduler = scheduler
+            self.scheduler_interval = scheduler_interval
+            self._steps = StepAdapter(self.model, task, loss_fn=loss_fn, step_fn=step_fn,
+                                      validation_step_fn=validation_step_fn, metrics=metrics, metric_inputs=metric_inputs)
+            self._epochs = EpochRunner(self.runtime, self._steps, accumulation_steps=accumulation_steps,
+                                       loss_strategy=loss_strategy, metric_factory=metric_factory)
         from deepopt.engine.checkpointing.identity import validate_identity
         from deepopt.scheduling import ScheduleController
         with self.runtime.core.check_errors("experiment identity"):
             self.experiment_identity = validate_identity({} if experiment_identity is None else experiment_identity)
+            self._config_snapshot["experiment_identity"] = deepcopy(self.experiment_identity)
             if schedules is not None and not isinstance(schedules, ScheduleController):
                 raise TypeError("schedules must be a ScheduleController")
             if schedules is not None and schedules.completed_update != 0:
                 raise ValueError("Use a fresh schedule controller and restore trainer progress from a checkpoint")
             self.schedules = schedules if schedules is not None and len(schedules) else None
+            self._config_snapshot["schedules"] = self.schedules._input_config() if self.schedules is not None else {}
             schedule_state = self.schedules.state_dict() if self.schedules is not None else None
         self.runtime.core.require_equal({"accumulation_steps": accumulation_steps, "precision": self.precision,
                                          "experiment_identity": self.experiment_identity,
@@ -112,6 +182,11 @@ class Trainer:
         self._stop_requested = False
         self._schedule_report = None
         log_model_memory(self.model, self.optimizer)
+
+    @property
+    def config(self):
+        """Return the construction-time effective configuration as an owned copy."""
+        return deepcopy(self._config_snapshot)
 
     @property
     def model(self):
@@ -175,14 +250,15 @@ class Trainer:
                 raise RuntimeError("Change execution mode only at an optimizer-update or epoch boundary")
         self.runtime.set_execution_mode(mode)
 
-    def fit(self, train_loader, validation_loader=None, *, epochs: int,
-            monitor=_DEFAULT_MONITOR, monitor_mode: str = "min", callbacks=(), step_callbacks=(),
-            progress_bar: bool = True) -> TrainingState:
+    def fit(self, train_loader, validation_loader=None, *, epochs=_UNSET,
+            monitor=_DEFAULT_MONITOR, monitor_mode=_UNSET, callbacks=(), step_callbacks=(),
+            progress_bar: bool = True, config=None) -> TrainingState:
         """Control epochs and optional validation; delegate side effects to callbacks.
 
         Each callback(trainer, epoch_metrics) runs after validation and progress
-        updates. It can log, save, or call request_stop(). No paths or experiment
-        configuration objects enter this API. Epochs is the total target count.
+        updates. It can log, save, or call request_stop(). Omitted fit settings
+        inherit the trainer snapshot. A per-call config may change only epochs,
+        monitor and monitor_mode. Epochs is the total target count.
         Step callbacks receive (trainer, step_event) after an optimizer update,
         with no pending accumulated gradients. Stop requests remain epoch-based.
         Without a validation loader, validation results are empty and best-score
@@ -191,23 +267,41 @@ class Trainer:
         The optional progress bar reports completed epochs to stderr using only
         their computed metrics. Set progress_bar=False to disable it entirely.
         """
-        if type(epochs) is not int or epochs <= self.state.completed_epochs:
-            raise ValueError("Total epochs must exceed the number already completed")
-        if monitor_mode not in ("min", "max"):
-            raise ValueError("monitor_mode must be min or max")
-        if type(progress_bar) is not bool:
-            raise ValueError("progress_bar must be a boolean")
-        if monitor is _DEFAULT_MONITOR:
-            monitor = "loss" if validation_loader is not None else None
-        if monitor is not None and (not isinstance(monitor, str) or not monitor):
-            raise ValueError("monitor must be a nonempty metric name or None")
-        if validation_loader is None and monitor is not None:
-            raise ValueError("A monitored metric requires a validation loader; omit monitor or use monitor=None")
-        if self.state.monitor_mode is not None and (monitor, monitor_mode) != (self.state.monitor, self.state.monitor_mode):
-            raise ValueError("Cannot change the monitored metric within a training run")
+        with self.runtime.core.check_errors("fit configuration"):
+            base = resolve_config(ResolvedConfig(self._config_snapshot))
+            explicit_training = {"epochs": epochs, "monitor_mode": monitor_mode}
+            if monitor is not _DEFAULT_MONITOR:
+                explicit_training["monitor"] = monitor
+            selected = resolve_config(config, base=base, overrides={"training": explicit_training})
+            if config is not None:
+                before, after = deepcopy(base), deepcopy(selected)
+                for snapshot in (before, after):
+                    for field in ("epochs", "monitor", "monitor_mode"):
+                        snapshot.get("training", {}).pop(field, None)
+                if before != after:
+                    raise ValueError("fit config may only override training.epochs, monitor, and monitor_mode")
+            fit_settings = selected.get("training", {})
+            if epochs is _UNSET:
+                epochs = fit_settings.get("epochs")
+            if monitor_mode is _UNSET:
+                monitor_mode = fit_settings.get("monitor_mode", self.state.monitor_mode or "min")
+            if type(epochs) is not int or epochs <= self.state.completed_epochs:
+                raise ValueError("Total epochs must exceed the number already completed")
+            if monitor_mode not in ("min", "max"):
+                raise ValueError("monitor_mode must be min or max")
+            if type(progress_bar) is not bool:
+                raise ValueError("progress_bar must be a boolean")
+            if monitor is _DEFAULT_MONITOR:
+                monitor = fit_settings.get("monitor", "loss") if validation_loader is not None else None
+            if monitor is not None and (not isinstance(monitor, str) or not monitor):
+                raise ValueError("monitor must be a nonempty metric name or None")
+            if validation_loader is None and monitor is not None:
+                raise ValueError("A monitored metric requires a validation loader; omit monitor or use monitor=None")
+            if self.state.monitor_mode is not None and (monitor, monitor_mode) != (self.state.monitor, self.state.monitor_mode):
+                raise ValueError("Cannot change the monitored metric within a training run")
+            callbacks = tuple(callbacks)
+            step_callbacks = tuple(step_callbacks)
         self.state.monitor, self.state.monitor_mode = monitor, monitor_mode
-        callbacks = tuple(callbacks)
-        step_callbacks = tuple(step_callbacks)
         self.runtime.core.require_equal({"epochs": epochs, "monitor": monitor, "monitor_mode": monitor_mode,
                                          "callbacks": len(callbacks), "step_callbacks": len(step_callbacks),
                                          "validation": validation_loader is not None}, "fit settings")

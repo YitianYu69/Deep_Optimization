@@ -3,12 +3,14 @@
 import torch
 from contextlib import nullcontext
 from dataclasses import asdict
+from copy import deepcopy
 from math import isfinite
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from . import _process as distributed
-from deepopt.opt.policy import resolve_fp8_config, prepare_fp8_model
+from deepopt._config_resolution import _UNSET, ResolvedConfig, resolve_config
+from deepopt.opt.policy import resolve_fp8_config
 
 
 class _StepModule(nn.Module):
@@ -34,8 +36,22 @@ class DDPCore:
 
     distributed = True
 
-    def __init__(self, model, device, options=None, *, fp8=None):
-        self.model, self.device = model, torch.device(device)
+    def __init__(self, model, device=_UNSET, options=_UNSET, *, fp8=_UNSET, config=None):
+        from deepopt.engine.execution.configuration import execution_config, prepare_execution_model
+
+        with distributed.collective_errors("core configuration"):
+            self._config_snapshot = execution_config(config, device=device, fp8=fp8, model=model,
+                                                      ddp_options=options)
+            runtime = self._config_snapshot.get("runtime", {})
+            selected_device = runtime.get("device", "cpu")
+            if options is _UNSET:
+                options = runtime.get("ddp", {})
+            else:
+                self._config_snapshot.setdefault("runtime", {})["ddp"] = options or {}
+                self._config_snapshot = resolve_config(ResolvedConfig(self._config_snapshot))
+        self.model = model
+        self.device = (distributed.initialize_distributed("auto").device
+                       if selected_device == "auto" else torch.device(selected_device))
         self.forward_pending = False
         self.wrapper = None
         self.options = {"find_unused_parameters": False, "broadcast_buffers": True,
@@ -59,10 +75,13 @@ class DDPCore:
             elif type(value) is not bool:
                 raise ValueError(f"DDP {name} must be a boolean")
         with distributed.collective_errors("FP8 configuration"):
-            self.fp8 = resolve_fp8_config(model, fp8)
+            self.fp8 = resolve_fp8_config(model, fp8, config=self._config_snapshot)
         distributed.require_equal(asdict(self.fp8), "FP8 configuration")
+        distributed.require_equal({**self.options, "validation_sync_buffers": self.validation_sync_buffers},
+                                  "DDP options")
         with distributed.collective_errors("FP8 model preparation"):
-            self.model, self.transformation_report = prepare_fp8_model(model, self.fp8)
+            self.model, self.fp8, self.transformation_report = prepare_execution_model(
+                model, self._config_snapshot, self.fp8)
         model = self.model
         if any(parameter.requires_grad for parameter in model.parameters()):
             self.wrapper = DistributedDataParallel(
@@ -70,6 +89,12 @@ class DDPCore:
                 **self.options)
         if not self.validation_sync_buffers:
             self.options["validation_sync_buffers"] = False
+        self._config_snapshot.setdefault("runtime", {})["fp8"] = asdict(self.fp8)
+        self._config_snapshot["runtime"]["ddp"] = deepcopy(self.options)
+
+    @property
+    def config(self):
+        return deepcopy(self._config_snapshot)
 
     def compute(self, batch, step):
         from deepopt.opt._autocast import fp8_context

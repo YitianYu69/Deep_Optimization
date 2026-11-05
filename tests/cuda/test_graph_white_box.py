@@ -345,17 +345,27 @@ class ModelCaptureWhiteBoxTests(unittest.TestCase):
 
     def test_inference_capture_installs_native_handle_and_restores_model(self):
         model = nn.Linear(3, 2).requires_grad_(False)
-        # Simulate only the GPU capture boundary, leaving public dispatch real.
-        with patch.object(CapturedFunction, "_initialize") as initialize, \
-                patch.object(CapturedFunction, "__call__", return_value=torch.ones(2, 2)) as call:
+        # The fixture uses CPU tensors as stand-ins. Mock the native inference
+        # boundary as a whole; the real nested constructor correctly rejects CPU.
+        class InferenceCapture:
+            def __init__(self, function, **options):
+                self.graph = Mock()
+                self.call = Mock(return_value=torch.ones(2, 2))
+
+            def __call__(self, *args):
+                return self.call(*args)
+
+            def close(self):
+                self.graph.reset()
+
+        with patch("deepopt.cuda_graph.model.CapturedFunction", InferenceCapture):
             handle = cuda_graph_core.capture_model(model, (torch.ones(2, 3),), autograd=False)
-            handle._graphed._capture.graph = native = Mock()
-            handle._graphed._capture.device = torch.device("cuda:0")
+            captured = handle._graphed
+            native = captured.graph
             self.assertIs(handle.graph, native)
             self.assertIs(handle.model, model)
             model(torch.ones(2, 3))
-            self.assertEqual(call.call_count, 2)  # Capture setup and explicit model call.
-            initialize.assert_not_called()
+            self.assertEqual(captured.call.call_count, 2)  # Capture setup and explicit model call.
             handle.close()
             native.reset.assert_called_once()
             self.assertNotIn("forward", model.__dict__)

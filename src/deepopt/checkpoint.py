@@ -10,6 +10,7 @@ import tempfile
 
 import torch
 from deepopt.distributed import _process as distributed
+from deepopt._config_resolution import _UNSET, _merge, resolve_config
 
 from deepopt.memory.planning import loader_batch_size
 from deepopt.engine.checkpointing.checkpoint import (read_checkpoint, read_checkpoint_progress, require_step_loader,
@@ -52,17 +53,29 @@ class Checkpoint:
     Attach from epoch zero, or call restore() before attaching to a resumed run.
     """
 
-    def __init__(self, directory, *, every_steps: int = 0, config=None, generators=None):
-        if type(every_steps) is not int or every_steps < 0:
+    def __init__(self, directory, *, every_steps=_UNSET, config=None, generators=None):
+        if every_steps is not _UNSET and (type(every_steps) is not int or every_steps < 0):
             raise ValueError("every_steps must be a nonnegative integer; 0 disables step checkpoints")
         self.directory = Path(directory)
-        self.every_steps = every_steps
-        self.config = asdict(config) if is_dataclass(config) else deepcopy(config)
+        self._every_steps = every_steps
+        self.every_steps = 0 if every_steps is _UNSET else every_steps
+        if isinstance(config, (str, Path)):
+            self.config = dict(resolve_config(config))
+        else:
+            self.config = asdict(config) if is_dataclass(config) else deepcopy(config)
         self._explicit_generators = generators
         self.generators = {}
         self.history = []
         self._trainer = None
         self._train_loader = None
+
+    def _resolve_cadence(self, config):
+        value = (config.get("training", {}).get("checkpoint_every_steps", 0)
+                 if self._every_steps is _UNSET else self._every_steps)
+        if type(value) is not int or value < 0:
+            raise ValueError("checkpoint_every_steps must be a nonnegative integer")
+        self.every_steps = value
+        config.setdefault("training", {})["checkpoint_every_steps"] = value
 
     def _bind(self, trainer, train_loader, validation_loader):
         self._trainer, self._train_loader = trainer, train_loader
@@ -78,6 +91,10 @@ class Checkpoint:
         if self._trainer is None and any((self.directory / name).exists()
                                         for name in ("last.pt", "last_step.pt", "best.pt")):
             raise ValueError("Checkpoint directory already contains a run; call restore() or use a new directory")
+        if self._trainer is None:
+            effective = trainer.config
+            self.config = effective if self.config is None else _merge(effective, self.config)
+            self._resolve_cadence(self.config)
         if self.every_steps:
             require_step_loader(train_loader)
         distributed.rank_zero_call(lambda: self.directory.mkdir(parents=True, exist_ok=True))
@@ -153,7 +170,9 @@ class Checkpoint:
             if selected[1] < newest[1]:
                 raise ValueError("Selected checkpoint is older than available progress; restore the newest checkpoint")
         payload = read_checkpoint(selected[0])
-        config = deepcopy(payload["config"] if self.config is None else self.config)
+        config = (deepcopy(payload["config"]) if self.config is None
+                  else _merge(payload["config"], self.config))
+        self._resolve_cadence(config)
         requested_size = loader_batch_size(train_loader)
         if self.config is None and requested_size is not None and "batch_size" in config.get("training", {}):
             # Saved metadata is not a new batch-size request. The caller's

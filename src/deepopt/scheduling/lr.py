@@ -4,13 +4,14 @@ from collections.abc import Mapping
 
 from torch.optim import lr_scheduler as lr
 
-from deepopt.config import TrainingConfig, normalize_training_config
+from deepopt.config import TrainingConfig
+from deepopt._config_resolution import resolve_training_config
 from .lr_config import normalize_lr_schedule
 
 
-def build_scheduler(optimizer, config: TrainingConfig | Mapping):
-    """Accept TrainingConfig or its dictionary representation."""
-    config = normalize_training_config(config)
+def build_scheduler(optimizer, config: TrainingConfig | Mapping | None = None):
+    """Accept training settings, or inherit the current LR policy when omitted."""
+    config = resolve_training_config(config, defaults={"epochs": 1, "batch_size": 1, "learning_rate": 1.0})
     policy = normalize_lr_schedule(config.lr_schedule)
     if policy is None:
         return lr.ExponentialLR(optimizer, gamma=config.lr_gamma)

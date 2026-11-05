@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 import tempfile
 
-from .config import config_from_dict, load_config
+from .config import config_from_dict
+from ._config_resolution import _UNSET, ResolvedConfig, config_scope, resolve_config
 from deepopt.engine.checkpointing.checkpoint import environment, read_checkpoint, require_step_loader, restore_checkpoint, save_checkpoint
 from deepopt.engine.checkpointing.checkpoint import restore_schedules_for_evaluation
 from deepopt.memory.planning import apply_batch_size_plan, plan_batch_size
@@ -64,21 +65,19 @@ def train(config=None, *, output=None, resume=None, epochs=None, batch_size=None
     if memory_budget_bytes is not None and (type(memory_budget_bytes) is not int or memory_budget_bytes < 1):
         raise ValueError("memory_budget_bytes must be a positive integer")
     payload = read_checkpoint(resume) if resume is not None else None
-    if config is None:
-        if payload is None:
-            raise ValueError("A new run requires --config")
-        config = config_from_dict(payload["config"])
-    config = load_config(config)
-    if epochs is not None:
-        config = replace(config, training=replace(config.training, epochs=epochs))
-    if batch_size is not None:
-        config = replace(config, training=replace(config.training, batch_size=batch_size))
-    if checkpoint_every_steps is not None:
-        config = replace(config, training=replace(config.training, checkpoint_every_steps=checkpoint_every_steps))
+    training_overrides = {key: value for key, value in {
+        "epochs": epochs, "batch_size": batch_size,
+        "checkpoint_every_steps": checkpoint_every_steps,
+    }.items() if value is not None}
+    overrides = {"training": training_overrides} if training_overrides else {}
     if execution_mode is not None:
-        config = replace(config, runtime=replace(config.runtime, execution_mode=execution_mode,
-                                                 diagnostics=None, mode_schedule=None))
-    config = config_from_dict(asdict(config))
+        overrides["runtime"] = {"execution_mode": execution_mode}
+    snapshot = resolve_config(config, overrides=overrides,
+                              base=ResolvedConfig(payload["config"]) if payload is not None else _UNSET)
+    if not snapshot:
+        raise ValueError("A new run requires --config or deepopt.load_config()")
+    snapshot = resolve_config(snapshot, require_complete=True)
+    config = config_from_dict(snapshot)
     if sample_batch_fn is None and experiment_factory is build_baseline_experiment:
         sample_batch_fn = partial(baseline_sample_batch, config)
     if payload is not None:
@@ -108,7 +107,8 @@ def train(config=None, *, output=None, resume=None, epochs=None, batch_size=None
             raise ValueError(f"Output directory already exists: {run_dir}; use --resume or a new path")
 
     with logging_session(config, directory=None, failure_directory=run_dir.parent / "logs") as session:
-        trainer, train_loader, validation_loader, generators = experiment_factory(config)
+        with config_scope(snapshot):
+            trainer, train_loader, validation_loader, generators = experiment_factory(config)
         if config.training.checkpoint_every_steps and (payload is None or config.training.epochs > completed):
             require_step_loader(train_loader)
         if validation_loader is None:
@@ -194,7 +194,8 @@ def evaluate(checkpoint, *, device=None, experiment_factory=build_baseline_exper
         config = replace(config, runtime=replace(config.runtime, device=device, precision="fp32"))
         config = config_from_dict(asdict(config))
     with logging_session(config, Path(checkpoint).resolve().parent / "logs"):
-        trainer, _, validation_loader, _ = experiment_factory(config)
+        with config_scope(resolve_config(config)):
+            trainer, _, validation_loader, _ = experiment_factory(config)
         if validation_loader is None:
             raise ValueError("Evaluation requires a validation loader from experiment_factory")
         trainer.model.load_state_dict(payload["model"])

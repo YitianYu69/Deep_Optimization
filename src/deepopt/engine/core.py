@@ -1,10 +1,14 @@
 """Engine's single-process training core; no distributed collectives."""
 
 from contextlib import nullcontext
+from copy import deepcopy
+from dataclasses import asdict
 
 import torch
 
-from deepopt.opt.policy import resolve_fp8_config, prepare_fp8_model
+from deepopt._config_resolution import _UNSET
+from deepopt.engine.execution.configuration import execution_config, prepare_execution_model
+from deepopt.runtime import resolve_device
 
 
 class TrainingCore:
@@ -19,10 +23,17 @@ class TrainingCore:
 
     distributed = False
 
-    def __init__(self, model, device, *, fp8=None):
-        self.fp8 = resolve_fp8_config(model, fp8)
-        self.model, self.transformation_report = prepare_fp8_model(model, self.fp8)
-        self.device = torch.device(device)
+    def __init__(self, model, device=_UNSET, *, fp8=_UNSET, config=None):
+        self._config_snapshot = execution_config(config, device=device, fp8=fp8, model=model)
+        selected = self._config_snapshot.get("runtime", {}).get("device", "cpu")
+        self.device = resolve_device(selected) if selected == "auto" else torch.device(selected)
+        self.model, self.fp8, self.transformation_report = prepare_execution_model(
+            model, self._config_snapshot, fp8)
+        self._config_snapshot.setdefault("runtime", {})["fp8"] = asdict(self.fp8)
+
+    @property
+    def config(self):
+        return deepcopy(self._config_snapshot)
 
     def compute(self, batch, step):
         from deepopt.opt._autocast import fp8_context

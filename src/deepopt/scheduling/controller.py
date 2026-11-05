@@ -8,9 +8,10 @@ from types import MappingProxyType
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
+from deepopt._config_resolution import _UNSET, resolve_config
 
 from .base import Schedule, finite, interval, position
-from .factory import describe, serializable, schedule_from_config, stateless
+from .factory import TYPES, config_for, describe, serializable, schedule_from_config, stateless
 
 
 _fake_reads = ContextVar("deepopt_schedule_fake_reads", default=None)
@@ -33,9 +34,15 @@ class ScheduleController:
     loops the caller supplies that count. The controller records the last
     committed boundary for validation/restoration, never advances on reads,
     and never increments a separate clock on its own.
+
+    Omitting schedules builds the selected configuration's named curves.
+    An explicit schedule mapping, including {}, replaces those defaults.
     """
 
-    def __init__(self, schedules):
+    def __init__(self, schedules=_UNSET, *, config=None):
+        if schedules is _UNSET:
+            definitions = resolve_config(config).get("schedules", {})
+            schedules = {name: schedule_from_config(value) for name, value in definitions.items()}
         if not isinstance(schedules, Mapping) or any(not isinstance(n, str) or not n.strip() for n in schedules):
             raise ValueError("schedules must map nonempty names to Schedule instances")
         if any(not isinstance(s, Schedule) for s in schedules.values()):
@@ -54,7 +61,9 @@ class ScheduleController:
         self._tensors = {}
 
     @classmethod
-    def from_config(cls, config):
+    def from_config(cls, config=None):
+        if config is None:
+            return cls()
         return cls({name: schedule_from_config(value) for name, value in config.items()})
 
     def __len__(self):
@@ -75,6 +84,19 @@ class ScheduleController:
         if {name: describe(schedule) for name, schedule in self._schedules.items()} != self._definitions:
             raise ValueError("Schedule configurations are immutable; construct a new experiment to change them")
         return deepcopy(self._definitions)
+
+    def _input_config(self):
+        """Portable input defaults; custom identities live in checkpoint state."""
+        result = {}
+        for name, schedule in self._schedules.items():
+            if type(schedule) not in TYPES.values():
+                continue
+            try:
+                result[name] = config_for(schedule)
+            except ValueError:
+                # A built-in sequence can contain a Python-only custom curve.
+                continue
+        return result
 
     def _mutable(self):
         if self._readonly:

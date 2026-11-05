@@ -11,7 +11,7 @@ import unittest
 import torch
 
 from deepopt.baseline import build_baseline_experiment
-from deepopt.config import CompileConfig, FP8Config, load_config
+from deepopt.config import CompileConfig, FP8Config, _read_config as load_config, reset_config
 from deepopt.engine.checkpointing.checkpoint import read_checkpoint
 from deepopt.opt.do_nn.linear_module import DOLinear
 from deepopt.run import evaluate, train
@@ -19,6 +19,8 @@ from deepopt.run import evaluate, train
 
 class ConfiguredFP8RunTests(unittest.TestCase):
     def setUp(self):
+        reset_config()
+        self.addCleanup(reset_config)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
