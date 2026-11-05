@@ -17,6 +17,34 @@ For complete training examples, see the [regular engine core](#train-with-the-re
 and [DDP core](#train-with-the-ddp-core). Both include `Trainer` usage and direct
 core calls, with a manual `TrainingRuntime` loop between those levels.
 
+## Shared configuration defaults
+
+Load a complete recipe once to make its FP8 policy available to subsequently
+constructed trainers, runtimes, and cores:
+
+```python
+from deepopt import Trainer, load_config
+from torch.nn import functional as F
+
+load_config("builtin:fp8")
+trainer = Trainer(model, loss_fn=F.mse_loss)  # Uses the loaded optimizer/FP8 settings.
+trainer.fit(train_loader, epochs=2, progress_bar=False)
+```
+
+This fragment assumes your model and regression loader already exist; the preset
+supplies defaults, not a model or task. Construction takes an owned snapshot.
+Later `load_config()` calls do not modify that trainer's prepared operations,
+optimizer, or precision. `config=None` inherits defaults, a partial `config=`
+dictionary overrides selected fields, and a typed experiment/file selects a
+complete source. Explicit `fp8` arguments take priority. See
+[shared training configuration](../training/README.md#use-shared-configuration-defaults).
+
+Automatic preparation and compilation still occur before a trainer-owned
+optimizer and before DDP wrapping. If you supply an optimizer, its original
+parameter objects and settings are retained. Bare cores and `TrainingRuntime`
+keep caller-owned optimizer construction; use their exposed `.model` after
+preparation. Loading a configuration does not execute kernels or capture graphs.
+
 ## Start with reference execution
 
 ```bash
@@ -52,7 +80,9 @@ weight_dtype = "e4m3fn"
 grad_dtype = "e4m3fn"
 ```
 
-Omitting the table or setting `enabled = false` disables automatic preparation.
+With no inherited FP8 policy, omitting the table leaves automatic preparation
+disabled. In a partial configuration, omission inherits the existing defaults;
+set `enabled = false` explicitly to disable preparation for a fresh model.
 The [complete configuration example](../../configs/fp8.toml) runs on CPU. Set
 `backend = "triton"` on supported CUDA hardware for actual FP8 GEMM. These
 settings are independent of `runtime.precision`, which still selects
@@ -62,7 +92,8 @@ Python recipes accept `fp8=True` for defaults or
 `FP8Config(enabled=True, backend="reference", ...)` for explicit settings.
 Mappings use the same schema as the TOML table, including `enabled`.
 Optional `block_shapes` maps `activation`, `weight` and `grad` to positive
-two-dimensional shapes; omitted roles use tensorwise scaling. `num_stages`
+two-dimensional shapes; roles without inherited settings use tensorwise scaling.
+Partial overrides preserve unspecified inherited roles. `num_stages`
 defaults to 3 and `out_dtype=None` uses the active AMP/input dtype.
 
 Automatic preparation runs before DDP wrapping. Configured experiments also
@@ -73,10 +104,11 @@ a root projection becomes its DO adapter, and explicit `full`/`auto` tracing can
 return a GraphModule. The default `modules` mode preserves ordinary container
 root methods. Inspect `runtime.transformation_report` (or the core's report) for
 conversion coverage. Matching prepared models are reused during construction.
-Reusing an automatically prepared model without a new `fp8` argument inherits
-its recorded policy. Conflicting settings, including an explicit disabled
-policy, require reconstruction from the original model; disabling preparation
-does not undo an earlier conversion.
+With no conflicting selected configuration, reusing an automatically prepared
+model inherits its recorded policy. Explicit `fp8=None` preserves that prepared
+policy. Conflicting settings, including an explicit disabled policy, require
+reconstruction from the original model; disabling preparation does not undo
+an earlier conversion.
 
 ### Explicit operation plans
 
@@ -140,15 +172,16 @@ with autocast("cpu", enabled=False, fp8=True):
 loss.backward()  # Uses the FP8 operands/policy saved during forward.
 ```
 
-Here `enabled=False` disables **native AMP only**; `fp8=True` enables reference
-FP8. For BF16 AMP plus Triton FP8 on a supported CUDA GPU:
+Here `enabled=False` disables **native AMP only**; `fp8=True` enables FP8 using
+the selected backend (reference when no other backend is configured). For BF16
+AMP plus Triton FP8 on a supported CUDA GPU:
 
 ```python
 from deepopt import FP8Config, autocast
 
 model = model.to("cuda")
 inputs = inputs.to("cuda")
-with autocast("cuda", dtype=torch.bfloat16,
+with autocast("cuda", enabled=True, dtype=torch.bfloat16,
               fp8=FP8Config(enabled=True, backend="triton")):
     loss = model(inputs).square().mean()
 loss.backward()
@@ -162,10 +195,22 @@ def predict(model, inputs):
     return model(inputs)
 ```
 
-`fp8=None` inherits the surrounding FP8 policy; `fp8=False` explicitly disables
+Omitted FP8 policy inherits an outer scope, or otherwise uses the configuration
+snapshot captured when the context/decorator is created. Explicit `fp8=None`
+inherits only the surrounding scope; it does not activate a global FP8 policy
+when no scope exists. `fp8=False` explicitly disables
 FP8 in a nested scope, including on existing DO projections. Native AMP's
 `enabled` and `dtype` stay independent. Exiting the scope restores both policies,
 including on exceptions. Backward normally runs outside the forward context.
+
+Omitted AMP controls use selected `runtime.precision` when present; with no
+configured precision they retain PyTorch autocast defaults. An already enabled
+native AMP scope retains its dtype when those controls are omitted. Explicit
+`enabled` and `dtype` arguments override defaults. For a known BF16 computation,
+passing both `enabled=True` and `dtype=torch.bfloat16` makes the choice explicit.
+An FP8 dictionary passed to this context enables FP8 unless it includes
+`enabled=False`; omitted fields inherit selected configuration. A typed
+`FP8Config` supplies a complete operation policy.
 
 The standalone context intercepts eligible floating `F.linear` calls (including
 ordinary `nn.Linear`) and configures DO operations already present in the model.

@@ -1,6 +1,7 @@
 """Versioned, atomic checkpoints at epoch and optimizer-update boundaries."""
 
 from dataclasses import asdict, is_dataclass
+from copy import deepcopy
 from collections.abc import Mapping
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ from importlib.metadata import version
 
 import torch
 from deepopt.distributed import _process as distributed
+from deepopt._config_resolution import _merge, resolve_config
+from deepopt.config import compile_config_from_dict
 
 from deepopt.engine.training.state import TrainingState
 from deepopt.engine.training.progress import EpochProgress, type_name
@@ -60,7 +63,7 @@ def require_step_loader(loader) -> None:
 
 
 def _config_dict(config) -> dict:
-    return asdict(config) if is_dataclass(config) else dict(config)
+    return asdict(config) if is_dataclass(config) else deepcopy(dict(config))
 
 
 def _component_types(trainer) -> dict:
@@ -184,9 +187,15 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
     return payload
 
 
-def save_checkpoint(path, trainer, config, *, generators, history, kind="epoch", train_loader=None) -> None:
+def save_checkpoint(path, trainer, config=None, *, generators, history, kind="epoch", train_loader=None) -> None:
     """Collect rank-local resume state on all ranks; atomically write on rank zero."""
     with distributed.collective_errors("checkpoint snapshot"):
+        if config is None:
+            config = trainer.config
+        elif isinstance(config, (str, Path)):
+            config = resolve_config(config)
+        elif isinstance(config, Mapping):
+            config = _merge(trainer.config, config)
         payload = _checkpoint_payload(trainer, config, generators=generators, history=history,
                                       kind=kind, train_loader=train_loader)
         if distributed.world_size() > 1:
@@ -262,7 +271,7 @@ def _validate_checkpoint(payload) -> None:
         raise ValueError("Step checkpoint is missing loader or epoch progress")
 
 
-def restore_checkpoint(payload, trainer, config, *, generators, train_loader=None,
+def restore_checkpoint(payload, trainer, config=None, *, generators, train_loader=None,
                        validation_loader=None, batch_size_mode="auto", sample_batch_fn=None,
                        memory_budget_bytes=None) -> list[dict]:
     """Restore training state, then plan physical batching before continuing.
@@ -290,7 +299,15 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
         rank_buffers = local["buffers"]
     if batch_size_mode not in ("auto", "manual"):
         raise ValueError("batch_size_mode must be auto or manual")
-    saved, requested = dict(payload["config"]), _config_dict(config)
+    saved = deepcopy(payload["config"])
+    if config is None:
+        requested = deepcopy(saved)
+    elif isinstance(config, (str, Path)):
+        requested = dict(resolve_config(config))
+    elif isinstance(config, Mapping):
+        requested = _merge(saved, config)
+    else:
+        requested = _config_dict(config)
     saved_identity = payload.get("experiment_identity", {}).get("required", {})
     if saved_identity != validate_identity(trainer.experiment_identity):
         raise ValueError("Resume requires the same experiment_identity (recipe/data/code versions)")
@@ -322,6 +339,10 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
                 settings["training"].pop("lr_schedule", None)
         if not settings.get("schedules"):
             settings.pop("schedules", None)
+        if not settings.get("loader"):
+            settings.pop("loader", None)
+        # Logging is passive and can change without changing training state.
+        settings.pop("logging", None)
         if "runtime" in settings:
             # Passive diagnostics may be enabled after a resume. Their objects
             # and counters are not part of optimization or checkpoint state.
@@ -333,6 +354,19 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
                 settings["runtime"].pop("compile", None)
             if not settings["runtime"].get("fp8", {}).get("enabled", False):
                 settings["runtime"].pop("fp8", None)
+            defaults = {
+                "ddp": {"find_unused_parameters": False, "broadcast_buffers": True,
+                        "gradient_as_bucket_view": True, "static_graph": False,
+                        "validation_sync_buffers": True},
+                "cuda_graph": {"device": None, "warmup": 3, "allow_unused_input": False,
+                               "autograd": True, "capture_error_mode": "global"},
+            }
+            for field, values in defaults.items():
+                if field in settings["runtime"]:
+                    settings["runtime"][field] = {key: value for key, value in settings["runtime"][field].items()
+                                                  if key not in values or value != values[key]}
+                if not settings["runtime"].get(field):
+                    settings["runtime"].pop(field, None)
         if not settings.get("experiment_identity"):
             settings.pop("experiment_identity", None)
     if saved != requested:
@@ -340,6 +374,10 @@ def restore_checkpoint(payload, trainer, config, *, generators, train_loader=Non
                          "(only epochs, batch size, checkpoint cadence, and diagnostic checks may change)")
     if payload["components"] != _component_types(trainer) or payload["trainer_settings"] != _trainer_settings(trainer):
         raise ValueError("Resume requires the same component types and trainer settings")
+    saved_compile = compile_config_from_dict(payload["config"].get("runtime", {}).get("compile", {}))
+    actual_compile = compile_config_from_dict(trainer.config.get("runtime", {}).get("compile", {}))
+    if (saved_compile.enabled or actual_compile.enabled) and saved_compile != actual_compile:
+        raise ValueError("Resume requires the same model compilation settings")
     if "optimizer_topology" not in payload:
         raise ValueError("Checkpoint has no named optimizer topology; resume with the original code or start a new run")
     if payload["optimizer_topology"] != _optimizer_topology(trainer):

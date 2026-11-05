@@ -16,6 +16,9 @@ import re
 import sys
 from threading import RLock
 
+from ._config_resolution import _UNSET, ResolvedConfig, _merge, resolve_config
+from .config import ExperimentConfig
+
 
 _active = ContextVar("deepopt_logging_session", default=None)
 _lock = RLock()
@@ -39,7 +42,17 @@ def _config_dict(config):
     return json.loads(encoded), encoded
 
 
-def log_filename(config) -> str:
+def _metadata_snapshot(config=None, *, base=_UNSET):
+    # Logger metadata remains open-ended; only known complete configuration
+    # sources go through the experiment schema. Extra recipe keys stay valid.
+    if isinstance(config, (ResolvedConfig, ExperimentConfig, str, Path)):
+        return resolve_config(config)
+    inherited = resolve_config() if base is _UNSET else base
+    supplied = {} if config is None else _config_dict(config)[0]
+    return _merge(inherited, supplied)
+
+
+def _filename(config) -> str:
     """Stable readable name plus a digest of ALL JSON-serializable settings."""
     raw, encoded = _config_dict(config)
     training, runtime = raw.get("training", {}), raw.get("runtime", {})
@@ -51,6 +64,11 @@ def log_filename(config) -> str:
     readable = re.sub(r"[^a-zA-Z0-9_.-]+", "-", "-".join(parts)).strip(".-")[:100] or "training"
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
     return f"{readable}-{digest}.log"
+
+
+def log_filename(config=None) -> str:
+    """Name logs from an owned merge of current defaults and recipe metadata."""
+    return _filename(_metadata_snapshot(config))
 
 
 def _level(value):
@@ -99,7 +117,9 @@ class _Router(logging.Handler):
         if session is not None:
             session.emit(record)
         else:
-            _console(record, _level(os.getenv("DEEPOPT_LOGGING_LEVEL", "INFO")))
+            configured = resolve_config().get("logging", {}).get("level")
+            _console(record, _level(configured if configured is not None else
+                                   os.getenv("DEEPOPT_LOGGING_LEVEL", "INFO")))
 
 
 def init_logger(name: str) -> logging.Logger:
@@ -118,6 +138,12 @@ def init_logger(name: str) -> logging.Logger:
 class _Session:
     def __init__(self, config, level, file_level):
         self.config, _ = _config_dict(config)
+        options = self.config.get("logging", {})
+        options = options if isinstance(options, Mapping) else {}
+        if level is _UNSET:
+            level = options.get("level")
+        if file_level is _UNSET:
+            file_level = options.get("file_level", "DEBUG")
         self.level = _level(level if level is not None else os.getenv("DEEPOPT_LOGGING_LEVEL", "INFO"))
         self.file_level = _level(file_level)
         self.path = None
@@ -142,8 +168,8 @@ class _Session:
         if self._file is not None:
             raise RuntimeError("Logging session already has a file")
         if config is not None:
-            self.config, _ = _config_dict(config)
-        path = Path(directory) / log_filename(self.config)
+            self.config, _ = _config_dict(_metadata_snapshot(config, base=self.config))
+        path = Path(directory) / _filename(self.config)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._file = path.open("a", encoding="utf-8")
         self.path = path
@@ -160,15 +186,16 @@ class _Session:
 
 
 @contextmanager
-def logging_session(config, directory="logs", *, level=None, file_level="DEBUG", failure_directory=None):
-    """Route this context's logs to a config-named append-only UTF-8 file.
+def logging_session(config=None, directory=None, *, level=_UNSET, file_level=_UNSET, failure_directory=None):
+    """Snapshot logging policy; write a file only to an explicit destination.
 
+    Omitted metadata/levels inherit current configuration without activating it.
     directory=None buffers until session.bind(). Configured runs use this to
     record preflight messages under the final, selected batch size. A failed
     preflight can flush to failure_directory without creating a run directory.
     Nested sessions are isolated and restore the outer session on exit.
     """
-    session = _Session(config, level, file_level)
+    session = _Session(_metadata_snapshot(config), level, file_level)
     token = _active.set(session)
     logger = init_logger(__name__)
     failure = None

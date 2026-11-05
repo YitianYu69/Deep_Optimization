@@ -3,22 +3,29 @@
 from dataclasses import asdict
 
 from deepopt.config import FP8Config, fp8_config_from_dict
+from deepopt._config_resolution import _UNSET, ResolvedConfig, resolve_config
 
 
-def normalize_fp8_config(value: FP8Config | dict | bool | None) -> FP8Config:
-    """Normalize direct Python convenience forms using the configuration schema."""
+def normalize_fp8_config(value=_UNSET, *, config=None) -> FP8Config:
+    """Resolve omitted/partial policy fields against selected configuration.
+
+    A typed FP8Config is a complete replacement. Explicit None disables FP8;
+    the prepared-model helper separately preserves its None/inherit contract.
+    """
+    if isinstance(value, FP8Config):
+        return fp8_config_from_dict(asdict(value))
     if value is None:
-        value = {}
+        value = {"enabled": False}
     elif type(value) is bool:
         value = {"enabled": value}
-    elif isinstance(value, FP8Config):
-        value = asdict(value)
-    return fp8_config_from_dict(value)
+    overrides = None if value is _UNSET else {"runtime": {"fp8": value}}
+    snapshot = resolve_config(config, overrides=overrides)
+    return fp8_config_from_dict(snapshot.get("runtime", {}).get("fp8", {}))
 
 
-def fp8_plan(settings: FP8Config | dict | bool | None) -> dict:
+def fp8_plan(settings=_UNSET, *, config=None) -> dict:
     """Resolve dtype names only when an FP8 computation plan is requested."""
-    settings = normalize_fp8_config(settings)
+    settings = normalize_fp8_config(settings, config=config)
     import torch
 
     fp8_types = {"e4m3fn": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
@@ -35,23 +42,35 @@ def fp8_plan(settings: FP8Config | dict | bool | None) -> dict:
     }
 
 
-def resolve_fp8_config(model, settings) -> FP8Config:
+def resolve_fp8_config(model, settings=_UNSET, *, config=None) -> FP8Config:
     """Retain a prepared model's known policy, or reject conflicting settings."""
     previous = getattr(model, "_deepopt_fp8_config", None)
-    settings = normalize_fp8_config(previous if settings is None else settings)
+    if settings is None:
+        # Explicit None retains the prepared-model contract independently of
+        # configuration loaded after that model was created.
+        settings = normalize_fp8_config(previous, config=ResolvedConfig({}))
+    elif isinstance(settings, FP8Config):
+        settings = normalize_fp8_config(settings)
+    elif settings is _UNSET:
+        snapshot = resolve_config(config)
+        if previous is not None and "fp8" not in snapshot.get("runtime", {}):
+            settings = previous
+        settings = normalize_fp8_config(settings, config=snapshot)
+    else:
+        settings = normalize_fp8_config(settings, config=config)
     if previous is not None and previous != settings:
         raise ValueError("FP8 settings differ from the prepared model; reconstruct the original model first")
     return settings
 
 
-def prepare_fp8_model(model, settings: FP8Config | dict | bool | None):
+def prepare_fp8_model(model, settings=_UNSET, *, config=None):
     """Prepare an eager model once; use the returned model for subsequent calls.
 
     Module mode keeps an ordinary container root, converting supported children.
     An exact registered projection at the root is replaced by its DO adapter.
     Full/auto mode can return a GraphModule. Original parameters remain shared.
     """
-    settings = resolve_fp8_config(model, settings)
+    settings = resolve_fp8_config(model, settings, config=config)
     if not settings.enabled:
         return model, None
 

@@ -4,6 +4,6 @@ from .core import CUDAGraphCore
 from .capture import CapturedGraph, CapturedFunction
 from .model import CapturedCallable
 
-cuda_graph_core = CUDAGraphCore()
+cuda_graph_core = CUDAGraphCore._from_global_config()
 
 __all__ = ["CUDAGraphCore", "CapturedGraph", "CapturedFunction", "CapturedCallable", "cuda_graph_core"]

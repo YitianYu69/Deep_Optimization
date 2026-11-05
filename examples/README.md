@@ -231,6 +231,19 @@ coordinates shared writes. Use a fresh output directory for the first saved run.
 
 ## Configured custom recipes
 
+Start with the [global configuration example](configured/global_config.py) to
+see precedence and snapshot lifetime without creating run artifacts:
+
+```bash
+python examples/configured/global_config.py
+```
+
+Its first trainer keeps batch size 4, one epoch, and explicit accumulation 1
+after the global defaults change. A newly created trainer/loader uses batch
+size 8, two epochs, and accumulation 2. The final JSON reports four versus two
+optimizer updates, the independent learning rates, and successful global reset.
+See [global defaults and snapshots](../docs/runs/README.md#global-defaults-and-component-snapshots).
+
 Configuration can come from a dictionary, a selected TOML file, or an installed
 preset. The [configuration reader](configured/read_config.py) accepts all file
 choices through its command-line option:

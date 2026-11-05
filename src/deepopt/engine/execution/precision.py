@@ -6,7 +6,7 @@ import torch
 
 
 class PrecisionPolicy:
-    def __init__(self, device: torch.device, precision: str, *, fp8=None):
+    def __init__(self, device: torch.device, precision: str, *, fp8=None, config=None):
         if device.type not in ("cpu", "cuda"):
             raise ValueError("The training core supports cpu and cuda devices")
         if precision not in ("fp32", "bf16"):
@@ -19,6 +19,7 @@ class PrecisionPolicy:
                     raise ValueError("Selected CUDA device does not support bf16")
         self.device, self.precision = device, precision
         self.fp8 = fp8
+        self.config = config
 
     def autocast(self):
         if self.precision == "fp32" and self.fp8 is None:
@@ -26,5 +27,5 @@ class PrecisionPolicy:
         from deepopt.opt._autocast import autocast
 
         return autocast(self.device.type, dtype=torch.bfloat16,
-                        enabled=self.precision == "bf16", fp8=self.fp8)
+                        enabled=self.precision == "bf16", fp8=self.fp8, config=self.config)
 

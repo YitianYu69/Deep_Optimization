@@ -3,10 +3,14 @@
 from contextlib import ContextDecorator, ExitStack, contextmanager
 from contextvars import ContextVar
 from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import asdict
 
 import torch
 from torch.nn import functional as F
 from torch.overrides import TorchFunctionMode
+from deepopt._config_resolution import _UNSET, resolve_config
+from deepopt.config import FP8Config
 
 
 # Values are normalized operation plans or False (explicit dense override).
@@ -54,10 +58,11 @@ class _FP8LinearMode(TorchFunctionMode):
 
 
 @contextmanager
-def fp8_context(device_type, fp8):
+def fp8_context(device_type, fp8=_UNSET, *, config=None):
     """Apply only FP8 policy; preserve ambient native AMP for core composition.
 
-    None inherits the surrounding policy. False explicitly disables FP8, also
+    Omitted policy inherits an outer scope or the selected configuration.
+    None inherits only the surrounding policy. False explicitly disables FP8, also
     for existing DO modules. A dictionary enables FP8 unless enabled=False.
     """
     if fp8 is None:
@@ -66,7 +71,17 @@ def fp8_context(device_type, fp8):
 
     from .policy import fp8_plan, normalize_fp8_config
 
-    settings = normalize_fp8_config({"enabled": True, **fp8} if isinstance(fp8, Mapping) else fp8)
+    if fp8 is _UNSET and _get_fp8_plan(device_type) is not None:
+        yield
+        return
+    if isinstance(fp8, FP8Config):
+        settings = normalize_fp8_config(fp8)
+    else:
+        settings = normalize_fp8_config({"enabled": True, **fp8} if isinstance(fp8, Mapping) else fp8,
+                                        config=config)
+    if fp8 is _UNSET and not settings.enabled:
+        yield
+        return
     if settings.enabled and device_type not in ("cpu", "cuda"):
         raise ValueError("FP8 autocast supports CPU and CUDA devices")
     plan = fp8_plan(settings) if settings.enabled else False
@@ -92,27 +107,49 @@ class autocast(ContextDecorator):
     Other operations keep their normal PyTorch/AMP behavior. Backward uses the
     FP8 plan saved during forward, even when executed after leaving the scope.
 
+    Omitted AMP/FP8 settings use an owned configuration snapshot. An active
+    native AMP dtype and outer FP8 policy are preserved when their controls are
+    omitted. With no defaults loaded, native AMP keeps torch.autocast defaults.
+
     Like native AMP, use scopes within one thread's synchronous execution; do
     not suspend an active scope across interleaved async tasks or generators.
     """
 
-    def __init__(self, device_type, dtype=None, enabled=True, cache_enabled=None, fp8=None):
+    def __init__(self, device_type, dtype=_UNSET, enabled=_UNSET, cache_enabled=None, fp8=_UNSET, *, config=None):
         self.device_type = device_type
         self.dtype = dtype
         self.enabled = enabled
         self.cache_enabled = cache_enabled
-        self.fp8 = fp8
+        self.fp8 = _UNSET if fp8 is _UNSET else deepcopy(fp8)
+        explicit_fp8 = _UNSET
+        if isinstance(fp8, FP8Config):
+            explicit_fp8 = asdict(fp8)
+        elif isinstance(fp8, Mapping):
+            explicit_fp8 = {"enabled": True, **fp8}
+        elif type(fp8) is bool:
+            explicit_fp8 = {"enabled": fp8}
+        overrides = None if explicit_fp8 is _UNSET else {"runtime": {"fp8": explicit_fp8}}
+        self.config = resolve_config(config, overrides=overrides)
 
     def _recreate_cm(self):
         return type(self)(self.device_type, dtype=self.dtype, enabled=self.enabled,
-                          cache_enabled=self.cache_enabled, fp8=self.fp8)
+                          cache_enabled=self.cache_enabled, fp8=self.fp8, config=self.config)
 
     def __enter__(self):
         stack = ExitStack()
         try:
-            stack.enter_context(torch.autocast(self.device_type, dtype=self.dtype,
-                                               enabled=self.enabled, cache_enabled=self.cache_enabled))
-            stack.enter_context(fp8_context(self.device_type, self.fp8))
+            precision = self.config.get("runtime", {}).get("precision")
+            ambient_amp = torch.is_autocast_enabled(self.device_type)
+            enabled = self.enabled
+            if enabled is _UNSET:
+                enabled = ambient_amp or (precision == "bf16" if precision is not None else True)
+            dtype = self.dtype
+            if dtype is _UNSET:
+                dtype = (torch.get_autocast_dtype(self.device_type) if ambient_amp else
+                         torch.bfloat16 if precision == "bf16" else None)
+            stack.enter_context(torch.autocast(self.device_type, dtype=dtype,
+                                               enabled=enabled, cache_enabled=self.cache_enabled))
+            stack.enter_context(fp8_context(self.device_type, self.fp8, config=self.config))
         except BaseException:
             stack.close()
             raise

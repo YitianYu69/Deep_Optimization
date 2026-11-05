@@ -65,9 +65,10 @@ config = {
 }
 train(config, output="runs/dictionary-run", batch_size_mode="manual")
 
-# Alternatively, select your own file. Parsing it first is optional.
+# Activate file-based defaults when you want other components to inherit them.
 selected = load_config("./experiments/my-training.toml")
 train(selected, output="runs/selected-config")
+# Passing a path directly selects a complete source without changing defaults.
 train("./experiments/my-training.toml", output="runs/selected-file")
 ```
 
@@ -75,6 +76,75 @@ Dictionary keys follow the TOML tables. Inputs are validated and copied without
 adding defaults or applying overrides to the caller's dictionary. Existing
 `ExperimentConfig` and `TrainingConfig` objects remain supported. Factories and
 custom callbacks still receive typed settings after normalization.
+
+## Global defaults and component snapshots
+
+`load_config(source)` validates a complete configuration, copies it, and replaces
+the process-global defaults. It accepts a dictionary, `ExperimentConfig`, TOML
+path, or explicit `builtin:NAME`. It is an activation operation, not a pure file
+reader. A failed load leaves the preceding defaults intact.
+
+```python
+import deepopt
+
+deepopt.load_config("builtin:baseline")
+current = deepopt.get_config()  # Independent ExperimentConfig copy.
+deepopt.reset_config()         # Safe to repeat; get_config() now returns None.
+```
+
+`config_from_dict()` and `load_preset()` remain pure: they return settings without
+activating them. Passing a typed configuration or TOML path directly to
+`build_experiment()` or `train()` also leaves the global defaults unchanged.
+Configuration loading initializes neither PyTorch/CUDA/DDP nor log files. Each
+DDP process owns its own defaults and must resolve equivalent settings.
+
+Configuration-consuming APIs resolve settings once when constructing their
+owned components:
+
+| Priority | Meaning |
+| --- | --- |
+| Explicit function arguments | Win over configured values, including `False` and meaningful `None` |
+| Per-call `config={...}` | Recursively merges into the inherited snapshot; lists replace lists |
+| Loaded global configuration | Supplies omitted settings to new components |
+| Existing API defaults | Apply when a setting has not been provided |
+
+A complete `ExperimentConfig`, TOML path, or `builtin:NAME` is an independent
+source that bypasses global values. Only a per-call dictionary is a partial
+override. `load_config(dictionary)` itself still requires a complete configuration;
+loading a second dictionary replaces rather than merges the first global value.
+Missing required information is not invented. For example, constructing an
+optimizer automatically needs a configured learning rate, and `fit()` needs
+epochs from its snapshot or an explicit argument.
+
+The merged result is validated before use. If an inherited compile policy has
+`mode` and an override adds `options`, the conflict raises an error. Likewise,
+LR policy/gamma and execution-mode/diagnostics conflicts are not silently cleared.
+`monitor=None` explicitly disables fit monitoring; omission inherits it.
+
+`Trainer(..., config=...)` and `TrainingRuntime(..., config=...)` retain their
+resolved snapshots, available through copied `.config` properties. New global
+loads do not reconfigure those objects. A supplied optimizer, scheduler, or
+runtime keeps its ownership and execution settings. When the optimizer is
+omitted, the trainer can build it from the configured training policy.
+
+`trainer.fit(..., config={"training": {"epochs": 5}})` uses the trainer's original
+snapshot as its base, not current process defaults. Fit configuration can change
+only `epochs`, `monitor`, and `monitor_mode`; changing device, optimizer, or FP8
+policy requires new components. Explicit fit arguments take precedence over
+these fields, and total epochs must exceed the completed count.
+
+The shared `cuda_graph_core` reads defaults when creating a new capture.
+An ordinary `CUDAGraphCore` keeps its construction snapshot, and existing capture
+handles retain their settings. Capturing still requires an explicit operation.
+Logging sessions snapshot inherited levels and write files only to an explicit
+destination; logging outside a session uses current console defaults.
+
+Checkpoints use the trainer's effective snapshot rather than current globals.
+Resume without explicit configuration uses the saved checkpoint as authority;
+loading unrelated defaults beforehand does not change the resumed computation.
+See [checkpoint compatibility](../checkpoints/README.md).
+
+## Packaged presets and local input contracts
 
 The repository has two preset locations:
 
@@ -88,14 +158,15 @@ Installed presets use package resources, so loading them does not depend on the
 current directory or access to this repository:
 
 ```python
-from deepopt import load_config
+from deepopt import load_config, reset_config
 from deepopt.configs import list_presets, load_preset
 
 print(list_presets())  # baseline, ddp, fp8, scheduling
 typed = load_preset("fp8")
 config = load_preset("fp8", as_dict=True)
 config["training"]["epochs"] = 3
-same_preset = load_config("builtin:fp8")
+active = load_config("builtin:fp8")  # Explicitly activate the same preset.
+reset_config()
 ```
 
 Use `builtin:baseline`, `builtin:ddp`, `builtin:fp8`, or `builtin:scheduling` in
@@ -107,9 +178,10 @@ repository and packaged copies in sync.
 
 | API | Accepted configuration input |
 | --- | --- |
-| `load_config`, `train`, `build_experiment`, `build_baseline_experiment`, `baseline_sample_batch` | Full experiment dictionary, `ExperimentConfig`, selected TOML path, or `builtin:NAME` |
-| `build_optimizer`, `build_scheduler` | `TrainingConfig` or the `training` dictionary (including required epochs, batch size and learning rate) |
-| `compile_model` | `CompileConfig` or the `runtime.compile` dictionary |
+| `load_config` | Complete dictionary, `ExperimentConfig`, selected TOML path, or `builtin:NAME`; activates defaults |
+| `train`, `build_experiment`, `build_baseline_experiment`, `baseline_sample_batch` | Inherited defaults, partial full-schema dictionary, or a complete typed/file/preset source; do not activate defaults |
+| `build_optimizer`, `build_scheduler` | Inherit omitted settings; preserve existing `TrainingConfig` or explicit `training` table forms |
+| `compile_model` | Inherited compiler policy, `CompileConfig`, or the `runtime.compile` dictionary |
 | Trainer/runtime `diagnostics` | `DiagnosticPolicy` or a dictionary of mode/default overrides |
 | Trainer/runtime/core `fp8` | Existing bool, `FP8Config`, or FP8 settings dictionary |
 | Synthetic `build_datasets` | `SyntheticDataSettings` or a synthetic-data options dictionary |
@@ -143,6 +215,10 @@ precision = "fp32"
 | `runtime` | `device="cpu"`, `precision="fp32"`, `deterministic=true`, `checks=true`, optional execution/diagnostic policies, `non_blocking=false` |
 | `runtime.compile` | `enabled=false`, `backend="inductor"`, `fullgraph=false`, optional `mode`, `dynamic`, and scalar-valued `options` |
 | `runtime.fp8` | `enabled=false`, `backend="reference"`, `trace_mode="modules"`; operand formats and scaling described below |
+| `runtime.ddp` | Native DDP options: `find_unused_parameters`, `broadcast_buffers`, `gradient_as_bucket_view`, `static_graph`, optional `bucket_cap_mb` and `validation_sync_buffers` |
+| `runtime.cuda_graph` | Optional `device` (`cuda`/`cuda:N`), positive `warmup`, `allow_unused_input`, `autograd`, and `capture_error_mode` (`global`/`thread_local`/`relaxed`) |
+| `loader` | Optional `num_workers`, `pin_memory`, `persistent_workers`, `prefetch_factor`, and `drop_last`; datasets, transforms, and custom samplers remain application-owned |
+| `logging` | Optional console `level` and `file_level`; a logging session still needs an explicit file destination |
 | `schedules` | Named coefficient curves consumed explicitly by the recipe |
 | `application` | Recipe-owned JSON-compatible dataset/model/settings metadata |
 | `experiment_identity` | Optional JSON-compatible semantic identity used for reconstruction/resume checks |
@@ -151,6 +227,11 @@ Unknown common fields are rejected. `application` does not impose a universal
 dataset or model schema; each recipe validates the keys it consumes. TOML has no
 null literal: omit optional values to use their defaults. See
 [config.py](../../src/deepopt/config.py) for exact field validation.
+
+The new DDP, CUDA Graph, loader, and logging tables default to empty dictionaries,
+leaving existing API behavior intact. Persistent workers and a non-null prefetch
+factor require `loader.num_workers > 0`. Rank, world size, and local GPU assignment
+come from the distributed environment rather than fixed configuration fields.
 
 `runtime.precision` configures trainer-level AMP: `fp32` disables AMP on CPU/CUDA,
 and `bf16` enables AMP on CUDA. Configure FP8 operand formats through

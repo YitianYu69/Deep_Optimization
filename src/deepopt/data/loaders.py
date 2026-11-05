@@ -3,6 +3,7 @@
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler, BatchSampler
 from deepopt.distributed import _process as distributed
+from deepopt._config_resolution import _UNSET, resolve_config
 
 from .resumable import ResumableDataLoader
 
@@ -40,8 +41,8 @@ class DistributedEvalSampler(Sampler):
         return len(range(self.rank, self.size, self.world_size))
 
 
-def build_loaders(train_data: Dataset, validation_data: Dataset | None, *, batch_size: int, seed: int,
-                  num_workers: int = 0, resumable: bool = False, **loader_options):
+def build_loaders(train_data: Dataset, validation_data: Dataset | None, *, batch_size=_UNSET, seed=_UNSET,
+                  num_workers=_UNSET, resumable=_UNSET, config=None, **loader_options):
     """Use resumable=True for step and epoch resume with any worker count.
 
     Restores sample order/cursor, including with prefetch and rebatching. For
@@ -50,7 +51,38 @@ def build_loaders(train_data: Dataset, validation_data: Dataset | None, *, batch
     Extra DataLoader options (collate_fn, pin_memory, prefetch_factor, etc.) apply
     to both phases. The helper owns batch_size, generator and shuffle; supply a
     custom loader_factory for other sampler/batching contracts.
+
+    Omitted batch size, seed, and loader options inherit the selected config.
+    Explicit keywords override it. A positive configured step-save interval
+    selects resumable loading unless resumable is explicitly provided.
     """
+    overrides = {}
+    if batch_size is not _UNSET:
+        overrides["training"] = {"batch_size": batch_size}
+    if seed is not _UNSET:
+        overrides["seed"] = seed
+    explicit_loader = {key: loader_options[key] for key in
+                       ("pin_memory", "persistent_workers", "prefetch_factor", "drop_last")
+                       if key in loader_options}
+    if num_workers is not _UNSET:
+        explicit_loader["num_workers"] = num_workers
+    if explicit_loader:
+        overrides["loader"] = explicit_loader
+    snapshot = resolve_config(config, overrides=overrides)
+    training = snapshot.get("training", {})
+    options = dict(snapshot.get("loader", {}))
+    if batch_size is _UNSET:
+        batch_size = training.get("batch_size", _UNSET)
+    if seed is _UNSET:
+        seed = snapshot.get("seed", _UNSET)
+    if batch_size is _UNSET or seed is _UNSET:
+        raise ValueError("build_loaders requires batch_size and seed, explicitly or in configuration")
+    configured_workers = options.pop("num_workers", 0)
+    if num_workers is _UNSET:
+        num_workers = configured_workers
+    if resumable is _UNSET:
+        resumable = training.get("checkpoint_every_steps", 0) > 0
+    loader_options = {**options, **loader_options}
     if type(resumable) is not bool:
         raise ValueError("resumable must be a boolean")
     if type(num_workers) is not int or num_workers < 0:

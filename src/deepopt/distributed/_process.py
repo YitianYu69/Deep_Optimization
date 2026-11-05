@@ -12,6 +12,7 @@ import os
 
 import torch
 from torch import distributed as dist
+from deepopt._config_resolution import _UNSET, resolve_config
 
 
 _owns_group = False
@@ -75,7 +76,7 @@ def is_main_process():
     return rank() == 0
 
 
-def initialize_distributed(device="auto", *, backend=None, timeout=180) -> DistributedContext:
+def initialize_distributed(device=_UNSET, *, backend=None, timeout=180, config=None) -> DistributedContext:
     """Join torchrun's group (if present) and return device/rank metadata.
 
     CUDA uses LOCAL_RANK and NCCL; CPU uses Gloo. An existing default group is
@@ -83,6 +84,8 @@ def initialize_distributed(device="auto", *, backend=None, timeout=180) -> Distr
     for model placement and result.global_rank/local_rank/world_size for routing.
     """
     global _owns_group
+    if device is _UNSET:
+        device = resolve_config(config).get("runtime", {}).get("device", "auto")
     local_rank = _environment_integer("LOCAL_RANK", minimum=0)
     local_world_size = _environment_integer("LOCAL_WORLD_SIZE", minimum=1)
     requested_world = _environment_integer("WORLD_SIZE", minimum=1, default=1)

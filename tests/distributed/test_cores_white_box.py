@@ -88,7 +88,8 @@ class DDPCoreWhiteBoxTests(unittest.TestCase):
                 patch("deepopt.distributed.ddp.distributed.require_equal") as agreement, \
                 patch("deepopt.distributed.ddp.DistributedDataParallel.__new__", return_value=wrapper) as constructor:
             core = DDPCore(model, "cpu")
-            agreement.assert_called_once()
+            self.assertEqual([call.args[1] for call in agreement.call_args_list],
+                             ["FP8 configuration", "DDP options"])
         return core, wrapper, constructor.call_args
 
     def test_training_enters_ddp_but_uneven_evaluation_bypasses_forward_collectives(self):
@@ -128,6 +129,7 @@ class DDPCoreWhiteBoxTests(unittest.TestCase):
 
     def test_invalid_ddp_options_do_not_construct_native_wrapper(self):
         with patch("deepopt.distributed.ddp.distributed.world_size", return_value=2), \
+                patch("deepopt.distributed.ddp.distributed.collective_errors", side_effect=lambda _: nullcontext()), \
                 patch("deepopt.distributed.ddp.DistributedDataParallel.__new__") as constructor:
             for options in ({"process_group": object()}, {"bucket_cap_mb": 0}, {"static_graph": 1}):
                 with self.subTest(options=options), self.assertRaises(ValueError):

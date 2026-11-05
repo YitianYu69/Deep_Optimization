@@ -33,6 +33,35 @@ For FP8 projections, use the [FP8 DDP example](../fp8/README.md#train-with-the-d
 which shows automatic FP8 preparation before wrapping, `Trainer`/runtime integration,
 and direct `DDPCore` forward/backward calls.
 
+## Configuration on each rank
+
+Configuration defaults are process-local. Each torchrun worker should call
+`load_config()` with the same recipe before constructing its components:
+
+```python
+from deepopt import load_config, initialize_distributed
+
+load_config("builtin:ddp")
+context = initialize_distributed()  # Uses configured runtime.device.
+```
+
+Loading a configuration does not initialize the process group. The initializer
+uses `runtime.device` when its device argument is omitted; an explicit
+`initialize_distributed("cpu")` or `"auto"` overrides it. Rank/world-size values
+still come from the actual group and launcher environment, not configuration.
+
+Trainer, runtime, and both cores accept `config=None` for inherited defaults or
+`config=` for a selected source. Partial dictionaries merge with defaults;
+full experiment objects/files replace them, and explicit arguments win. DDP
+options live under `runtime.ddp`; explicit `ddp_options`/core `options` override
+that table. Each constructed object retains its snapshot, so loading different
+defaults later does not reconfigure an active reducer or existing optimizer.
+
+Use the [training ownership rules](../training/README.md#use-shared-configuration-defaults)
+when choosing automatic versus supplied optimizers. All ranks must agree on
+distributed execution settings and enter coordinated operations; a global
+configuration object is not a broadcast or an alternative to those contracts.
+
 ## Run the Python example
 
 From the repository root, after `python -m pip install -e .`:
@@ -171,7 +200,8 @@ Use `.device` where earlier code used the function's returned device directly.
 The runtime also exposes its snapshot as `runtime.distributed_context`.
 
 Native DDP options are supplied through `Trainer(..., ddp_options={...})` or
-`TrainingRuntime(..., ddp_options={...})`. Supported options are
+`TrainingRuntime(..., ddp_options={...})`, or inherited from `runtime.ddp`.
+Supported options are
 `find_unused_parameters`, `broadcast_buffers`, `gradient_as_bucket_view`,
 `bucket_cap_mb`, `static_graph`, and `validation_sync_buffers`. Unused-parameter
 detection defaults to false for dense models; enable it for conditional/unused

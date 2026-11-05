@@ -15,13 +15,15 @@ import torch
 
 from deepopt.cli import main
 from deepopt.baseline import baseline_sample_batch, build_baseline_experiment
-from deepopt.config import ConfigError, config_from_dict, load_config
+from deepopt.config import ConfigError, config_from_dict, _read_config as load_config, reset_config
 from deepopt.engine.checkpointing.checkpoint import read_checkpoint, restore_checkpoint
 from deepopt.run import train
 
 
 class ResumeCLIBatchSizeTests(unittest.TestCase):
     def setUp(self):
+        reset_config()
+        self.addCleanup(reset_config)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)

@@ -10,7 +10,8 @@ import torch
 from torch import fx, nn
 from torch.nn import functional as F
 
-from deepopt.config import ConfigError, FP8Config, config_from_dict, fp8_config_from_dict, load_config
+from deepopt.config import (ConfigError, FP8Config, config_from_dict, fp8_config_from_dict,
+                            _read_config as load_config, reset_config)
 from deepopt.opt.do_nn.linear_module import DOLinear
 from deepopt.opt.do_nn.mha_module import DOMultiheadAttention
 from deepopt.opt.policy import normalize_fp8_config, prepare_fp8_model
@@ -25,6 +26,10 @@ def experiment(fp8=None):
 
 
 class FP8ConfigBlackBoxTests(unittest.TestCase):
+    def setUp(self):
+        reset_config()
+        self.addCleanup(reset_config)
+
     def test_missing_configuration_preserves_disabled_behavior(self):
         config = config_from_dict(experiment())
         self.assertEqual(config.runtime.fp8, FP8Config())
@@ -116,6 +121,10 @@ weight = [32, 64]
 
 
 class FP8PreparationBlackBoxTests(unittest.TestCase):
+    def setUp(self):
+        reset_config()
+        self.addCleanup(reset_config)
+
     def test_default_module_preparation_preserves_container_methods_and_parameters(self):
         class Model(nn.Module):
             def __init__(self):

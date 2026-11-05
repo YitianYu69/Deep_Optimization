@@ -20,9 +20,15 @@ This application-level callback owns completed-epoch history, discovers common
 public loader/sampler generators, including nested `sampler`/`batch_sampler`
 links, and writes `last.pt`, monitored `best.pt`, and
 `metrics.jsonl`. `every_steps=N` also writes `last_step.pt` every N completed
-optimizer updates, including accumulation. `0` (default) disables step saves.
+optimizer updates, including accumulation. `0` disables step saves.
 A stateful loader is still required for any positive interval. Ordinary epoch
 checkpoints work with normal DataLoaders; absent validation produces no best file.
+
+When `every_steps` is omitted, the callback inherits
+`training.checkpoint_every_steps` from the trainer's effective configuration at
+first attachment. With no configured cadence it remains zero. Explicit
+`every_steps=0` disables inherited step saves. The directory is always explicit;
+loading global configuration alone does not create checkpoint files.
 
 Reconstruct the same components and attach a fresh callback:
 
@@ -41,7 +47,17 @@ The callback repairs its
 metrics file and a best-file write interrupted after an authoritative last epoch.
 Restoring does not recreate arbitrary models, datasets or Python functions.
 
-Optional `config=` records recipe metadata; `generators=` supplies an explicit
+Global defaults select settings when new trainers/loaders are constructed.
+They do not replace saved policy during restoration: `restore_checkpoint(...,
+config=None)` starts from the checkpoint's configuration, and a supplied partial
+dictionary overlays that saved base. The callback follows the same saved-base
+rule and derives an omitted cadence from it. Reconstruct compatible components
+first; loading unrelated defaults later is not a checkpoint migration. The
+configured `train(resume=...)` entry point owns this reconstruction for its recipe.
+
+Optional `config=` overlays recipe metadata on the trainer snapshot at first
+attachment; omitted configuration uses that snapshot. The callback does not
+re-read changing globals during saves. `generators=` supplies an explicit
 mapping when your recipe owns additional Torch generators. Call `restore` with
 `batch_size_mode="auto"`, `sample_batch_fn` and optional `memory_budget_bytes` for
 preflight resume sizing; its default is manual. Common public loader/sampler
@@ -140,13 +156,13 @@ integrating a different artifact workflow; ordinary recipes need only `Checkpoin
 Import helpers from `deepopt.engine.checkpointing.checkpoint`:
 
 ```text
-save_checkpoint(path, trainer, config, *, generators, history,
+save_checkpoint(path, trainer, config=None, *, generators, history,
                 kind="epoch", train_loader=None)
 
 read_checkpoint(path) -> dict
 
 restore_checkpoint(
-    payload, trainer, config, *, generators, train_loader=None,
+    payload, trainer, config=None, *, generators, train_loader=None,
     validation_loader=None, batch_size_mode="auto", sample_batch_fn=None,
     memory_budget_bytes=None,
 ) -> list[dict]
@@ -162,8 +178,10 @@ def record_epoch(trainer, row):
                     history=history, train_loader=train_loader)
 ```
 
-`config` may be an `ExperimentConfig` or a dictionary of recipe metadata. Direct
-recipes may use `{}`. `history` must contain exactly one row per completed epoch;
+`config` may be an `ExperimentConfig` or a dictionary of recipe metadata. On
+save, omitted configuration uses `trainer.config`; on restore it uses the saved
+configuration. Direct recipes may still supply explicit metadata. `history`
+must contain exactly one row per completed epoch;
 an in-progress step checkpoint retains completed rows only. Append the row before
 saving in an epoch callback. `generators` maps stable names to Torch generators;
 use `{}` if the recipe has none. Include a `train_loader` for step saves and

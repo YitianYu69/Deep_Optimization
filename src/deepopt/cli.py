@@ -7,7 +7,7 @@ from pathlib import Path
 import pickle
 import sys
 
-from .config import load_config
+from .config import _read_config
 from .logger import logging_session, log_output
 
 
@@ -50,12 +50,12 @@ def _main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "inspect-config" or (args.command is None and args.config is not None):
             path = args.inspect_config if args.command else args.config
-            config = load_config(path)
+            config = _read_config(path)
             with logging_session(config):
                 log_output(json.dumps(asdict(config), indent=2))
         elif args.command == "train":
             from .run import train
-            config = load_config(args.train_config) if args.train_config else None
+            config = _read_config(args.train_config) if args.train_config else None
             train(config, output=args.output, resume=args.resume, epochs=args.epochs,
                   batch_size=args.batch_size, batch_size_mode=args.batch_size_mode,
                   checkpoint_every_steps=args.checkpoint_every_steps,

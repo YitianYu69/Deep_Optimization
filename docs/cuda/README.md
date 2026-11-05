@@ -14,9 +14,36 @@ deepopt/
 `CUDAGraphCore` composes with either training core. It does not own optimizers,
 epochs, process groups, checkpoint counters, diagnostics, or loss reductions.
 Constructing a core does not initialize CUDA. `deepopt.cuda_graph_core` is a
-convenience instance using the current CUDA device; use `CUDAGraphCore(device)`
-to select a device explicitly. CUDA is required at capture time; there is no
+convenience instance that reads configuration when creating each capture handle;
+use `CUDAGraphCore(device)` to select a device explicitly. CUDA is required at capture time; there is no
 silent CPU fallback.
+
+## Configuration and capture snapshots
+
+Capture defaults belong in `runtime.cuda_graph`:
+
+```toml
+[runtime.cuda_graph]
+warmup = 5
+allow_unused_input = false
+autograd = true
+capture_error_mode = "global"
+```
+
+An ordinary `CUDAGraphCore(config=None)` captures the loaded defaults at
+construction. `config=` accepts partial overrides or a full experiment/file
+source; explicit capture arguments such as `warmup=3` and `autograd=False`
+take priority. `runtime.cuda_graph.device` selects the device, otherwise a CUDA
+`runtime.device` is used when available; explicit `device=None` retains current
+CUDA-device selection. Python callables, sample tensors, streams, and pools
+remain explicit objects supplied by the caller.
+
+The shared `cuda_graph_core` convenience object resolves current defaults for
+each new handle. Once a handle/decorator is created, its configuration is fixed,
+including before a decorator's first invocation. Later `load_config()` calls do
+not alter existing captures. The core's `.config` property returns a copy. Loading configuration
+does not initialize CUDA or perform capture; the hardware requirements below
+still apply. See [shared configuration](../runs/README.md).
 
 ## Run a complete example
 

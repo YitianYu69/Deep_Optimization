@@ -43,6 +43,7 @@ class ExampleBlackBoxTests(unittest.TestCase):
             ("data/skip_batches.py",), ("data/resumable_prefetch.py",),
             ("execution/compile_training.py",), ("execution/execution_modes.py",),
             ("configured/read_config.py",), ("configured/read_config.py", "--config", "configs/scheduling.toml"),
+            ("configured/global_config.py",),
             ("cuda/graphs.py", "--help"),
             ("distributed/ddp_training.py", "--help"),
         ]
@@ -51,6 +52,15 @@ class ExampleBlackBoxTests(unittest.TestCase):
                 result = self.run_example("examples/" + command[0], *command[1:])
                 self.assertTrue((result.stdout + result.stderr).strip(),
                                 f"Example produced no result: {command}")
+                if command[0] == "configured/global_config.py":
+                    summary = json.loads(result.stdout.splitlines()[-1])
+                    self.assertEqual(summary["first"]["updates"], 4)
+                    self.assertEqual(summary["second"]["updates"], 2)
+                    self.assertEqual(summary["first"]["batch_size"], 4)
+                    self.assertEqual(summary["second"]["batch_size"], 8)
+                    self.assertFalse(summary["first"]["checks"])
+                    self.assertIsNone(summary["first"]["monitor"])
+                    self.assertTrue(summary["global_reset"])
 
     def test_checkpoint_and_logging_recipes_use_explicit_or_temporary_artifacts(self):
         for script in ("checkpoint_resume.py", "checkpoint_resume_low_level.py"):

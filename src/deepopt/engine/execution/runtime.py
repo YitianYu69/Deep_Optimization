@@ -9,6 +9,11 @@ from math import isfinite
 from numbers import Real
 from typing import Any, TypeVar
 from weakref import proxy
+from copy import deepcopy
+from dataclasses import asdict
+
+from deepopt._config_resolution import _UNSET, ResolvedConfig
+from deepopt.engine.execution.configuration import execution_config
 
 from deepopt.observers import CheckObservers, FiniteCheck, TensorStatistics
 from deepopt.engine.execution.policy import DiagnosticPolicy, ExecutionMode, ModeController
@@ -34,15 +39,34 @@ class TrainingRuntime:
     afterward; autocast() combines its FP8 policy with the configured AMP mode.
     """
 
-    def __init__(self, model, optimizer=None, *, device="cpu", precision="fp32", grad_clip_norm=None,
-                 gradient_strategy: GradientStrategy | None = None, checks=True, ddp_options=None,
-                 execution_mode=None, diagnostics=None, mode_schedule=None, non_blocking=False, fp8=None):
-        if precision not in ("fp32", "bf16"):
-            raise ValueError("precision must be fp32 or bf16; fp16 is unsupported")
-        self.distributed_context = distributed_ops.initialize_distributed(device)
-        self.device = self.distributed_context.device
-        if self.device.type == "cuda" and self.device.index is None:
-            self.device = torch.device("cuda", torch.cuda.current_device())
+    def __init__(self, model, optimizer=None, *, device=_UNSET, precision=_UNSET, grad_clip_norm=_UNSET,
+                 gradient_strategy: GradientStrategy | None = None, checks=_UNSET, ddp_options=_UNSET,
+                 execution_mode=_UNSET, diagnostics=_UNSET, mode_schedule=_UNSET, non_blocking=_UNSET,
+                 fp8=_UNSET, config=None):
+        with distributed_ops.collective_errors("runtime configuration"):
+            self._config_snapshot = execution_config(
+                config, device=device, precision=precision, checks=checks, grad_clip_norm=grad_clip_norm,
+                execution_mode=execution_mode, diagnostics=diagnostics, mode_schedule=mode_schedule,
+                non_blocking=non_blocking, fp8=fp8, model=model, ddp_options=ddp_options)
+            runtime = self._config_snapshot.get("runtime", {})
+            training = self._config_snapshot.get("training", {})
+            device = runtime.get("device", "cpu")
+            precision = runtime.get("precision", "fp32")
+            grad_clip_norm = training.get("grad_clip_norm")
+            checks = runtime.get("checks", True) if checks is _UNSET else checks
+            execution_mode = runtime.get("execution_mode")
+            diagnostics = runtime.get("diagnostics")
+            configured_modes = runtime.get("mode_schedule")
+            mode_schedule = ({int(step): mode for step, mode in configured_modes.items()}
+                             if configured_modes is not None else None)
+            non_blocking = runtime.get("non_blocking", False)
+            if precision not in ("fp32", "bf16"):
+                raise ValueError("precision must be fp32 or bf16; fp16 is unsupported")
+        with distributed_ops.collective_errors("runtime device"):
+            self.distributed_context = distributed_ops.initialize_distributed(device)
+            self.device = self.distributed_context.device
+            if self.device.type == "cuda" and self.device.index is None:
+                self.device = torch.device("cuda", torch.cuda.current_device())
         self.model, self.optimizer = model, optimizer
         with distributed_ops.collective_errors("diagnostic configuration"):
             self.checks = CheckObservers(checks)
@@ -53,38 +77,59 @@ class TrainingRuntime:
         self._in_compute = self._forward_pending = self._pending_gradients = False
         self.non_blocking = non_blocking
         self.precision = precision
-        if grad_clip_norm is not None and gradient_strategy is not None:
-            raise ValueError("Choose grad_clip_norm or gradient_strategy, not both")
-        self.grad_clip_norm = grad_clip_norm
-        if grad_clip_norm is not None:
-            if not 0 < grad_clip_norm < float("inf"):
-                raise ValueError("grad_clip_norm must be positive and finite")
-            gradient_strategy = ClipGradNorm(grad_clip_norm)
-        if gradient_strategy is not None and not isinstance(gradient_strategy, GradientStrategy):
-            raise TypeError("gradient_strategy must inherit GradientStrategy")
-        self._gradient_strategy = gradient_strategy
-        self._precision = PrecisionPolicy(self.device, precision)
-        if any(p.device != self.device for p in model.parameters()):
-            raise ValueError("Move the model to the training device before constructing its optimizer")
+        with distributed_ops.collective_errors("runtime preconditions"):
+            if grad_clip_norm is not None and gradient_strategy is not None:
+                raise ValueError("Choose grad_clip_norm or gradient_strategy, not both")
+            self.grad_clip_norm = grad_clip_norm
+            if grad_clip_norm is not None:
+                if not 0 < grad_clip_norm < float("inf"):
+                    raise ValueError("grad_clip_norm must be positive and finite")
+                gradient_strategy = ClipGradNorm(grad_clip_norm)
+            if gradient_strategy is not None and not isinstance(gradient_strategy, GradientStrategy):
+                raise TypeError("gradient_strategy must inherit GradientStrategy")
+            self._gradient_strategy = gradient_strategy
+            self._precision = PrecisionPolicy(self.device, precision)
+            if any(p.device != self.device for p in model.parameters()):
+                raise ValueError("Move the model to the training device before constructing its optimizer")
         if distributed_ops.world_size() > 1:
-            self.core = DDPCore(model, self.device, ddp_options, fp8=fp8)
+            self.core = DDPCore(model, self.device, ddp_options, fp8=fp8, config=self._config_snapshot)
         else:
-            if ddp_options:
+            if ddp_options is not _UNSET and ddp_options:
                 raise ValueError("ddp_options requires an initialized multi-rank process group")
-            self.core = TrainingCore(model, self.device, fp8=fp8)
+            self.core = TrainingCore(model, self.device, fp8=fp8, config=self._config_snapshot)
         self.model = self.core.model
+        compilation = getattr(self.model, "_deepopt_compile_config", None)
+        if compilation is not None:
+            self._config_snapshot.setdefault("runtime", {})["compile"] = deepcopy(compilation)
         self.fp8 = self.core.fp8
         self.transformation_report = self.core.transformation_report
+        if self.core.distributed:
+            self._config_snapshot.setdefault("runtime", {})["ddp"] = deepcopy(self.core.options)
+        self._config_snapshot.setdefault("runtime", {})["fp8"] = asdict(self.fp8)
         self._precision.fp8 = self.fp8 if self.fp8.enabled else None
-        self._stepper = (OptimizerStepper(self.model, optimizer, self._precision, gradient_strategy,
-                                         checks=self.checks)
-                         if optimizer is not None else None)
+        self._config_snapshot.setdefault("runtime", {}).update({
+            "device": str(device), "precision": precision, "execution_mode": execution_mode,
+            "diagnostics": deepcopy(diagnostics), "mode_schedule": deepcopy(configured_modes),
+            "non_blocking": non_blocking,
+        })
+        if type(checks) is bool:
+            self._config_snapshot["runtime"]["checks"] = checks
+        self._config_snapshot.setdefault("training", {})["grad_clip_norm"] = grad_clip_norm
+        self._precision.config = ResolvedConfig(deepcopy(self._config_snapshot))
+        with self.core.check_errors("optimizer setup"):
+            self._stepper = (OptimizerStepper(self.model, optimizer, self._precision, gradient_strategy,
+                                             checks=self.checks)
+                             if optimizer is not None else None)
         self._failed = False
         if self._stepper is not None:
             # The stepper borrows its owner for diagnostics; owning it back
             # would keep native DDP resources alive until cyclic collection.
             self._stepper.checks = proxy(self)
         self._configure_checks()
+
+    @property
+    def config(self):
+        return deepcopy(self._config_snapshot)
 
     @property
     def execution_mode(self):
