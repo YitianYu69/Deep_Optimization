@@ -16,7 +16,8 @@ The API and compact level/time/source format are inspired by
 [vLLM's logger](https://github.com/vllm-project/vllm/blob/main/vllm/logger.py).
 DeepOpt implements its own scoped file routing; vLLM is not a dependency.
 Messages go to stderr, with terminal color when available. Every line of a
-multiline message or traceback gets a prefix. Files are plain UTF-8 text.
+multiline message or traceback gets a prefix. The default console color is blue
+for every severity; files are plain UTF-8 text without ANSI color codes.
 
 Run the offline CPU recipe from the repository root after installing the package:
 
@@ -37,9 +38,11 @@ choose a new directory when you want independent artifacts.
 [logging]
 level = "WARNING"
 file_level = "DEBUG"
+color = "blue"
+memory_each_epoch = false
 ```
 
-`logging_session(config=None)` inherits current metadata and levels, but its
+`logging_session(config=None)` inherits current metadata, levels, and color, but its
 default `directory=None` creates **no file**. Pass a destination explicitly:
 
 ```python
@@ -51,7 +54,7 @@ with logging_session(directory="runs/my-recipe/logs", level="WARNING"):
     trainer.fit(train_loader, epochs=2)
 ```
 
-Explicit level arguments override a session's metadata/configuration, which
+Explicit level/color arguments override a session's metadata/configuration, which
 overrides global defaults. A partial dictionary can also add arbitrary
 JSON-compatible recipe metadata; it is not restricted to the experiment schema.
 Full experiment/file sources select their own configuration. A session owns a
@@ -96,11 +99,55 @@ instead of passing that plan directly to `logging_session`.
 
 The session includes framework logs, your `init_logger()` messages, and exceptions
 that escape the context. It flushes each record and closes the file on exit,
-including interruption. Trainer construction emits model parameter counts/percentages and current
-model/optimizer tensor storage; construct it inside the session for file capture.
+including interruption. Trainer construction emits model parameter counts/percentages,
+current model/optimizer tensor storage, and estimated dense-gradient, initialized
+optimizer, and persistent training storage; construct it inside the session for
+file capture. A fresh AdamW optimizer can report zero currently allocated state
+alongside a nonzero estimate for its moment tensors and scalar steps.
 Direct `Trainer.fit()` emits start/epoch/end events but
 creates no files by itself. Manual loops can use the same context and logger.
 No logging is added to the per-tensor or backward hot path.
+
+The estimated persistent total is model storage plus expected dense gradients
+and optimizer state. It assumes every trainable parameter receives a gradient
+and supports standard Adam/AdamW, SGD, and supported `MultiOptimizer` children;
+unsupported forecasts are logged as unknown. It excludes batches, activations,
+transient tensors, kernel workspaces, DDP overhead, and allocator reservations.
+For a batch-dependent tensor peak, explicitly call
+`estimate_training_memory(trainer, sample_batch)` as shown in the
+[memory guide](../memory/README.md#estimate-a-representative-computation).
+Neither estimate represents total process memory, and startup logging does not
+execute a training trace.
+
+## Per-epoch memory reports
+
+Enable a fresh memory report after each completed `Trainer.fit()` epoch,
+following training and optional validation:
+
+```toml
+[logging]
+level = "INFO"
+memory_each_epoch = true
+```
+
+Load these settings with `load_config()` before constructing the trainer, or
+pass them through `Trainer(..., config=settings)`. The trainer owns a snapshot;
+later configuration changes do not alter this policy. Passing the flag only as
+`logging_session()` metadata does not configure the trainer's reporting policy.
+
+The report includes current model and optimizer tensor storage, plus the
+estimated persistent training baseline. On CUDA it also reports current
+allocated/reserved memory and a separate **"CUDA peak memory since last reset"**
+line for maximum allocated/reserved memory on the trainer's device. The peaks
+cover this process's PyTorch allocator since its last statistics reset, including
+other work in the process; they are not isolated trainer totals or per-epoch
+peaks. Application code may reset the statistics independently. Reporting itself
+does not reset counters or synchronize CUDA. CUDA allocations outside PyTorch's
+allocator are excluded from both the current and peak figures.
+Reports run only on global rank zero and use INFO messages, subject to console
+and file thresholds. `memory_each_epoch` defaults to `false`; the existing
+initialization storage report is emitted either way. Standalone `train_epoch()`
+calls do not emit the additional report.
 
 ## File names and resume
 
@@ -149,8 +196,17 @@ DEEPOPT_LOGGING_COLOR=0 python examples/observability/logging_recipe.py
 | `DEEPOPT_LOGGING_COLOR` | `auto` | `1` forces color; `0` disables it; auto uses a terminal check |
 | `NO_COLOR` | unset | A nonempty value disables terminal color |
 | `DEEPOPT_LOGGING_PREFIX` | empty | Adds a console prefix, such as `[experiment] ` |
+| `logging.color` | `"blue"` | One console color for all severities; `"none"` disables color |
 | `logging_session(..., level="WARNING")` | `logging.level`, then environment/INFO | Override the console threshold for this context |
 | `logging_session(..., file_level="INFO")` | `logging.file_level`, then `DEBUG` | File threshold, independent of console verbosity |
+| `logging_session(..., color="cyan")` | `logging.color`, then `"blue"` | Override the console color for this context |
+
+Named colors are `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`,
+and `white`; use `none` to disable color. The selected color applies uniformly
+to DEBUG, INFO, WARNING, ERROR, and CRITICAL messages. Color is emitted only
+when the terminal check or `DEEPOPT_LOGGING_COLOR=1` enables it;
+`DEEPOPT_LOGGING_COLOR=0`, a nonempty `NO_COLOR`, or `color="none"` disables it.
+File output always remains free of ANSI color codes.
 
 With the default file level, an explicitly opened file captures DEBUG diagnostics even when the console uses INFO.
 Checkpoint-save messages use DEBUG. Standard logger methods (`warning`, `error`,

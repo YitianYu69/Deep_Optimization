@@ -147,9 +147,10 @@ weight, and upstream-gradient roles can have different grids. The gradient role
 controls quantization of the upstream gradient used to compute input/weight
 gradients, not the dtype of optimizer-owned gradient buffers.
 
-Both E4M3FN and E5M2 are accepted. `out_dtype=None` uses the active autocast dtype
-or the input dtype. Explicit output dtypes are FP32, BF16, and FP16. Input,
-weight, and bias tensors must be dense, on the same CPU/CUDA device, and use
+Each operand role independently selects E4M3FN or E5M2 on either backend.
+`out_dtype=None` uses the active autocast dtype or the input dtype. Explicit
+output dtypes are FP32, BF16, and FP16. Input, weight, and bias tensors must be
+dense, on the same CPU/CUDA device, and use
 FP32/BF16/FP16. Empty operands, nonfinite quantization inputs, and second-order
 derivatives are unsupported. **Trainer-level AMP and FP8 operand formats are
 separate choices**: CPU/CUDA can use FP32 with AMP disabled, and CUDA can enable
@@ -302,8 +303,7 @@ print(report)
 `precision="fp32"` disables **trainer-level AMP**; the converted projections
 still quantize their GEMM operands to FP8. For actual CUDA FP8 GEMM, set
 `device = torch.device("cuda:0")` and the FP8 setting's `backend` to `"triton"` on a
-supported GPU. The example already uses the same FP8 format for all roles, as
-Triton requires. Choose `precision="bf16"` separately to enable CUDA BF16 AMP.
+supported GPU. Choose `precision="bf16"` separately to enable CUDA BF16 AMP.
 
 The shorter `Trainer(model, optimizer, device=device, precision="fp32", fp8=fp8,
 loss_fn=F.mse_loss)` constructs this runtime internally. Passing the runtime
@@ -614,9 +614,16 @@ python examples/optimization/fp8_training.py --device cuda --backend triton
 python examples/optimization/fp8_training.py --device cuda --backend triton --block-size 32 --precision bf16
 ```
 
-The current Triton training backend requires all three operand roles to use the
-same FP8 dtype. Every non-None training block dimension must be a multiple of 32
-because backward transposes the operands. Pipeline stages can be 1 through 4.
+The Triton backend supports independent `e4m3fn`/`e5m2` formats and any positive
+block dimensions. For example, activation `[1, 32]` with weight and gradient
+`[32, 32]` is supported. Pipeline stages can be 1 through 4.
+
+Tensorwise scaling and blockwise scales whose reduction-axis widths are multiples
+of 32 use native FP8 dot products. Other layouts use fused per-element FP32
+dequantization followed by a `tf32x3` dot product. This includes the activation's
+transposed `[32, 1]` blocks in the weight-gradient computation for the example
+above. The fallback preserves the stored FP8 values and scales without additional
+FP8 quantization, but may have lower throughput than native FP8 dot products.
 The backend packs strided/misaligned operands, pads partial tiles, and returns
 FP32/BF16/FP16 results. Correctness/performance must be measured on the target GPU.
 

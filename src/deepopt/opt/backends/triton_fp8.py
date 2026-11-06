@@ -17,11 +17,12 @@ def _gemm_nt_kernel(
     a_desc, b_desc, c_desc,
     a_scale_inv_ptr, b_scale_inv_ptr,
     bias_ptr,
-    M, N, K_PADDED,
+    M, N, K,
     A_BLOCK_ROWS: tl.constexpr, A_BLOCK_COLS: tl.constexpr,
     B_BLOCK_ROWS: tl.constexpr, B_BLOCK_COLS: tl.constexpr,
     A_SCALE_COLS: tl.constexpr, B_SCALE_COLS: tl.constexpr,
     TENSORWISE: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     OUTPUT_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -36,7 +37,7 @@ def _gemm_nt_kernel(
     cols = start_n + tl.arange(0, BLOCK_N)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k_tile in tl.range(0, tl.cdiv(K_PADDED, BLOCK_K), num_stages=PIPELINE_STAGES):
+    for k_tile in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=PIPELINE_STAGES):
         start_k = k_tile * BLOCK_K
 
         a_tile = a_desc.load([start_m, start_k])
@@ -44,7 +45,7 @@ def _gemm_nt_kernel(
 
         if TENSORWISE:
             acc = tl.dot(a_tile, b_tile.T, acc, out_dtype=tl.float32, max_num_imprecise_acc=32)
-        else:
+        elif NATIVE_FP8:
             partial = tl.dot(a_tile, b_tile.T, out_dtype=tl.float32, max_num_imprecise_acc=32)
 
             a_scale_offset = (rows // A_BLOCK_ROWS) * A_SCALE_COLS + start_k // A_BLOCK_COLS
@@ -55,6 +56,22 @@ def _gemm_nt_kernel(
 
             scaled_partial = (partial * a_scale_inv[:, None]) * b_scale_inv[None, :]
             acc = acc + scaled_partial
+        else:
+            # Transposing rowwise blocks can make scales vary at every K.
+            # Apply those scales before reduction without requantizing FP8.
+            ks = start_k + tl.arange(0, BLOCK_K)
+            a_scale_offset = ((rows // A_BLOCK_ROWS)[:, None] * A_SCALE_COLS
+                              + (ks // A_BLOCK_COLS)[None, :])
+            b_scale_offset = ((cols // B_BLOCK_ROWS)[:, None] * B_SCALE_COLS
+                              + (ks // B_BLOCK_COLS)[None, :])
+            a_scales = tl.load(a_scale_inv_ptr + a_scale_offset,
+                               mask=(rows[:, None] < M) & (ks[None, :] < K), other=0.0)
+            b_scales = tl.load(b_scale_inv_ptr + b_scale_offset,
+                               mask=(cols[:, None] < N) & (ks[None, :] < K), other=0.0)
+            a_values = a_tile.to(tl.float32) * a_scales
+            b_values = b_tile.to(tl.float32) * b_scales
+            acc = tl.dot(a_values, b_values.T, acc, out_dtype=tl.float32,
+                         input_precision="tf32x3")
     
     if TENSORWISE:
         a_scale_inv = tl.load(a_scale_inv_ptr)
@@ -103,7 +120,11 @@ def gemm_nt(
 ) -> torch.Tensor:
 
     """
-    Compute A @ B.t with tensorwise scales and TMA loads/stores.
+    Compute A @ B.t with independent FP8 formats and TMA loads/stores.
+
+    Scale blocks aligned along K use native FP8 dot products. Other layouts
+    dequantize tiles to FP32 before a TF32x3 dot, retaining the stored FP8
+    values and their scales without additional FP8 rounding.
     """
     
     if a.data.device != b.data.device:
@@ -112,8 +133,6 @@ def gemm_nt(
         raise ValueError("This backend requires an Nvidia CUDA GPU")
     if torch.cuda.get_device_capability(a.data.device)[0] < 9:
         raise ValueError("This backend requires compute cabaility >= 9")
-    if a.data.dtype != b.data.dtype:
-        raise ValueError("Operands must use the same FP8 dtype")
     if a.data.shape[1] != b.data.shape[1]:
         raise ValueError("Operands must have the same reduction dimension")
     if type(num_stages) is not int or num_stages not in (1, 2, 3, 4):
@@ -138,20 +157,17 @@ def gemm_nt(
         if bias.dtype not in output_types:
             raise TypeError("Bias must be FP32, BF16, or FP16")
 
-    block_m = 128; block_n = 128; block_k = 64
-    for operand in (a, b):
-        if operand.block_shape is not None:
-            scale_block_k = operand.block_shape[1]
-
-            if scale_block_k % 32 != 0:
-                raise NotImplementedError(
-                    "The native blockwise kernel requires scale-block"
-                    "widths along K to be multiples of 32. "
-                    "Use (128, 128) for the initial linear training path."
-                )
-
-            # Ensure no dot interval crosses either operand's scale-block boundary.
-            block_k = gcd(block_k, scale_block_k)
+    native_fp8 = all(operand.block_shape is None or operand.block_shape[1] % 32 == 0
+                     for operand in (a, b))
+    if native_fp8:
+        block_m, block_n, block_k, num_warps = 128, 128, 64, 8
+        for operand in (a, b):
+            if operand.block_shape is not None:
+                # No dot interval may cross either operand's scale boundary.
+                block_k = gcd(block_k, operand.block_shape[1])
+    else:
+        # FP32 operands require more resources than native FP8 tiles.
+        block_m, block_n, block_k, num_warps = 64, 64, 32, 4
     
     padded_k = triton.cdiv(k, block_k) * block_k
 
@@ -191,17 +207,18 @@ def gemm_nt(
             a_desc, b_desc, c_desc,
             a_scale_inv, b_scale_inv,
             bias_arg,
-            m, n, padded_k,
+            m, n, k,
             A_BLOCK_ROWS=a_block_rows, A_BLOCK_COLS=a_block_cols,
             B_BLOCK_ROWS=b_block_rows, B_BLOCK_COLS=b_block_cols,
             A_SCALE_COLS=a_scale_inv.shape[1], B_SCALE_COLS=b_scale_inv.shape[1],
             TENSORWISE=tensorwise,
+            NATIVE_FP8=native_fp8,
             HAS_BIAS=bias is not None,
             OUTPUT_DTYPE=output_types[out_dtype],
             BLOCK_M=block_m, BLOCK_N=block_n,
             BLOCK_K=block_k,
             PIPELINE_STAGES=num_stages,
-            num_warps=8, num_stages=num_stages
+            num_warps=num_warps, num_stages=num_stages
         )
     
     return output_storage[:m, :n]

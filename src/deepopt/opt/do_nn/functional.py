@@ -95,22 +95,6 @@ def validate_fp8_plan(plan: dict) -> dict:
                 "out_dtype must be FP32, BF16, FP16, or None"
             )
 
-    if backend == "triton":
-        if len(set(fp8_dtypes.values())) != 1:
-            raise ValueError(
-                "The current Triton training backend requires "
-                "the same FP8 dtype for activation, weight, and grad"
-            )
-
-        for operand in _OPERANDS:
-            shape = block_shapes[operand]
-
-            if shape is not None:
-                if any(size % 32 != 0 for size in shape):
-                    raise ValueError(
-                        f"Triton block dimensions for {operand!r} "
-                        "must both be multiples of 32"
-                    )
     return {
         "fp8_training": {
             "fp8_dtypes": dict(fp8_dtypes),

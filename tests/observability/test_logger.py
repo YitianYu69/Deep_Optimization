@@ -10,10 +10,21 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from deepopt.config import ConfigError, _logging_config_from_dict, get_config, load_config, reset_config
 from deepopt.logger import init_logger, logging_session, log_filename, log_output
 
 
 class LoggerTests(unittest.TestCase):
+    def setUp(self):
+        previous = get_config()
+        reset_config()
+        self.addCleanup(lambda: load_config(previous) if previous is not None else reset_config())
+
+    def _configure_color(self, color):
+        return load_config({"name": "logger-color", "seed": 1,
+                            "training": {"epochs": 1, "batch_size": 2, "learning_rate": .01},
+                            "logging": {"color": color}})
+
     def test_names_cover_full_config_and_are_safe_and_stable(self):
         config = {"name": "../test / name", "training": {"batch_size": 8, "epochs": 2}}
         name = log_filename(config)
@@ -135,8 +146,100 @@ class LoggerTests(unittest.TestCase):
                     init_logger(__name__).error("visible error")
             self.assertNotIn("hidden warning", stderr.getvalue())
             self.assertIn("[recipe]", stderr.getvalue())
-            self.assertIn("\x1b[31m", stderr.getvalue())
+            self.assertIn("\x1b[34m", stderr.getvalue())
             self.assertNotIn("\x1b", session.path.read_text())
+
+    def test_default_blue_is_uniform_across_console_levels(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), patch.dict(
+                os.environ, {"DEEPOPT_LOGGING_COLOR": "1", "NO_COLOR": ""}):
+            with logging_session(level="DEBUG") as session:
+                logger = init_logger(__name__)
+                for level in (logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL):
+                    logger.log(level, "same color at level %s", level)
+                self.assertEqual(session.color, "blue")
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(sum("same color at level" in line for line in lines), 5)
+        self.assertTrue(all(line.startswith("\x1b[34m") and line.endswith("\x1b[0m") for line in lines))
+
+    def test_configured_named_colors_are_case_normalized(self):
+        for color, code in (("black", 30), ("red", 31), ("green", 32), ("yellow", 33),
+                            ("blue", 34), ("magenta", 35), ("cyan", 36), ("white", 37)):
+            with self.subTest(color=color):
+                configured = self._configure_color(color.upper())
+                self.assertEqual(configured.logging["color"], color)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), patch.dict(
+                        os.environ, {"DEEPOPT_LOGGING_COLOR": "1", "NO_COLOR": ""}):
+                    with logging_session() as session:
+                        init_logger(__name__).error("configured color")
+                        self.assertEqual(session.color, color)
+                self.assertIn(f"\x1b[{code}m", stderr.getvalue())
+
+    def test_session_color_override_and_snapshot_are_independent_of_global_changes(self):
+        self._configure_color("red")
+        metadata = {"logging": {"color": "GrEeN"}}
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), patch.dict(
+                os.environ, {"DEEPOPT_LOGGING_COLOR": "1", "NO_COLOR": ""}):
+            with logging_session(metadata) as inherited:
+                self.assertEqual(inherited.color, "green")
+                self._configure_color("yellow")
+                init_logger(__name__).warning("snapshot stays green")
+                with logging_session(metadata, color="CyAn") as override:
+                    self.assertEqual(override.color, "cyan")
+                    self._configure_color("white")
+                    init_logger(__name__).error("explicit cyan")
+                init_logger(__name__).warning("outer restored green")
+        lines = stderr.getvalue().splitlines()
+        self.assertTrue(next(line for line in lines if "snapshot stays green" in line).startswith("\x1b[32m"))
+        self.assertTrue(next(line for line in lines if "explicit cyan" in line).startswith("\x1b[36m"))
+        self.assertTrue(next(line for line in lines if "outer restored green" in line).startswith("\x1b[32m"))
+        self.assertEqual(metadata, {"logging": {"color": "GrEeN"}})
+        self.assertEqual(get_config().logging["color"], "white")
+
+    def test_standalone_logging_resolves_current_global_color(self):
+        stderr = io.StringIO()
+        logger = init_logger(__name__)
+        with contextlib.redirect_stderr(stderr), patch.dict(
+                os.environ, {"DEEPOPT_LOGGING_COLOR": "1", "NO_COLOR": ""}):
+            logger.error("default blue")
+            self._configure_color("red")
+            logger.error("global red")
+            self._configure_color("green")
+            logger.error("global green")
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        for line, code in zip(lines, (34, 31, 32)):
+            self.assertTrue(line.startswith(f"\x1b[{code}m"))
+
+    def test_named_color_respects_terminal_and_no_color_controls(self):
+        cases = (("blue", "auto", True, "", True),
+                 ("yellow", "auto", False, "", False),
+                 ("magenta", "1", False, "", True),
+                 ("red", "0", True, "", False),
+                 ("red", "1", True, "1", False),
+                 ("NoNe", "1", True, "", False))
+        for color, mode, is_tty, no_color, enabled in cases:
+            with self.subTest(color=color, mode=mode, tty=is_tty, no_color=no_color):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), patch.object(stderr, "isatty", return_value=is_tty), \
+                        patch.dict(os.environ, {"DEEPOPT_LOGGING_COLOR": mode, "NO_COLOR": no_color}):
+                    with logging_session({"logging": {"color": color}}):
+                        init_logger(__name__).error("terminal policy")
+                self.assertEqual("\x1b[" in stderr.getvalue(), enabled)
+
+    def test_invalid_colors_are_rejected_by_config_and_session(self):
+        for color in (None, True, 34, "orange", "", ["blue"]):
+            with self.subTest(color=color):
+                with self.assertRaises(ConfigError):
+                    _logging_config_from_dict({"color": color})
+                with self.assertRaises(ConfigError):
+                    with logging_session({"logging": {"color": color}}):
+                        self.fail("Invalid metadata color was accepted")
+                with self.assertRaises(ConfigError):
+                    with logging_session(color=color):
+                        self.fail("Invalid explicit color was accepted")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from deepopt.engine.execution.configuration import execution_config, prepare_exe
 
 from deepopt.tasks.base import Task
 from deepopt.logger import init_logger
-from deepopt.memory.statistics import log_model_memory
+from deepopt.memory.statistics import log_model_memory, summarize_model_memory
 from deepopt.engine.training.loops import EpochRunner
 from deepopt.engine.training.progress import EpochProgress
 from deepopt.engine.execution.runtime import TrainingRuntime
@@ -250,6 +250,28 @@ class Trainer:
                 raise RuntimeError("Change execution mode only at an optimizer-update or epoch boundary")
         self.runtime.set_execution_mode(mode)
 
+    def _log_epoch_memory(self):
+        if not distributed.is_main_process():
+            return
+        summary = summarize_model_memory(self.model, self.optimizer)
+
+        def gb(value):
+            return "unknown" if value is None else f"{value:.9f} GB"
+
+        logger.info("Epoch %s memory (%s): model=%s optimizer=%s",
+                    self.state.completed_epochs, self.device, gb(summary.model_gb), gb(summary.optimizer_gb))
+        logger.info("Epoch %s estimated persistent training storage (model + gradients + optimizer): %s",
+                    self.state.completed_epochs, gb(summary.estimated_persistent_gb))
+        if self.device.type == "cuda":
+            logger.info("Epoch %s CUDA memory (%s): allocated=%.9f GB reserved=%.9f GB",
+                        self.state.completed_epochs, self.device,
+                        torch.cuda.memory_allocated(self.device) / 1_000_000_000,
+                        torch.cuda.memory_reserved(self.device) / 1_000_000_000)
+            logger.info("Epoch %s CUDA peak memory since last reset (%s): allocated=%.9f GB reserved=%.9f GB",
+                        self.state.completed_epochs, self.device,
+                        torch.cuda.max_memory_allocated(self.device) / 1_000_000_000,
+                        torch.cuda.max_memory_reserved(self.device) / 1_000_000_000)
+
     def fit(self, train_loader, validation_loader=None, *, epochs=_UNSET,
             monitor=_DEFAULT_MONITOR, monitor_mode=_UNSET, callbacks=(), step_callbacks=(),
             progress_bar: bool = True, config=None) -> TrainingState:
@@ -266,6 +288,8 @@ class Trainer:
         pass monitor=None explicitly to disable selection while still evaluating.
         The optional progress bar reports completed epochs to stderr using only
         their computed metrics. Set progress_bar=False to disable it entirely.
+        logging.memory_each_epoch in the trainer configuration enables a fresh
+        memory report after each epoch's training and validation.
         """
         with self.runtime.core.check_errors("fit configuration"):
             base = resolve_config(ResolvedConfig(self._config_snapshot))
@@ -281,6 +305,7 @@ class Trainer:
                 if before != after:
                     raise ValueError("fit config may only override training.epochs, monitor, and monitor_mode")
             fit_settings = selected.get("training", {})
+            memory_each_epoch = selected.get("logging", {}).get("memory_each_epoch", False)
             if epochs is _UNSET:
                 epochs = fit_settings.get("epochs")
             if monitor_mode is _UNSET:
@@ -304,6 +329,7 @@ class Trainer:
         self.state.monitor, self.state.monitor_mode = monitor, monitor_mode
         self.runtime.core.require_equal({"epochs": epochs, "monitor": monitor, "monitor_mode": monitor_mode,
                                          "callbacks": len(callbacks), "step_callbacks": len(step_callbacks),
+                                         "memory_each_epoch": memory_each_epoch,
                                          "validation": validation_loader is not None}, "fit settings")
         for callback in callbacks:
             start = getattr(callback, "on_fit_start", None)
@@ -347,6 +373,9 @@ class Trainer:
                     row.update(self._schedule_report)
                 logger.info("Epoch %s/%s: train=%s validation=%s",
                             self.state.completed_epochs, epochs, training, validation)
+                if memory_each_epoch:
+                    with self.runtime.core.check_errors("epoch memory logging"):
+                        self._log_epoch_memory()
                 for callback in callbacks:
                     with self.runtime.core.check_errors("epoch callback"):
                         callback(self, row)

@@ -1,6 +1,7 @@
 """Quantization metadata, autograd storage/dispatch, and adapter ownership."""
 
 from copy import deepcopy
+from itertools import product
 import sys
 from types import ModuleType
 import unittest
@@ -172,17 +173,17 @@ class FP8AutogradWhiteBoxTests(unittest.TestCase):
         self.assertEqual(normalized["block_shapes"]["weight"], (2, 3))
         self.assertEqual(normalized["fp8_training"]["fp8_dtypes"]["grad"], torch.float8_e5m2)
 
-    def test_triton_rejects_mixed_fp8_formats_and_unaligned_training_blocks(self):
-        plan = _plan((32, 32))
-        plan["fp8_training"]["backend"] = "triton"
-        with self.assertRaisesRegex(ValueError, "same FP8 dtype"):
-            validate_fp8_plan(plan)
-        plan["fp8_training"]["fp8_dtypes"]["grad"] = torch.float8_e4m3fn
-        for shape in ((16, 32), (32, 16)):
-            plan["block_shapes"]["weight"] = shape
-            with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, "multiples of 32"):
-                validate_fp8_plan(plan)
-        plan["block_shapes"]["weight"] = (32, 32)
+    def test_triton_preserves_independent_formats_and_small_training_blocks(self):
+        roles = ("activation", "weight", "grad")
+        for formats in product((torch.float8_e4m3fn, torch.float8_e5m2), repeat=3):
+            for shape in ((1, 32), (32, 1), (3, 5)):
+                with self.subTest(formats=formats, shape=shape):
+                    plan = _plan(shape)
+                    plan["fp8_training"]["backend"] = "triton"
+                    plan["fp8_training"]["fp8_dtypes"] = dict(zip(roles, formats))
+                    normalized = validate_fp8_plan(plan)
+                    self.assertEqual(normalized["fp8_training"]["fp8_dtypes"], dict(zip(roles, formats)))
+                    self.assertEqual(normalized["block_shapes"], dict.fromkeys(roles, shape))
         with self.assertRaisesRegex(ValueError, "CUDA"):
             do_linear(torch.ones(2, 3), torch.ones(4, 3), plan=plan)
 

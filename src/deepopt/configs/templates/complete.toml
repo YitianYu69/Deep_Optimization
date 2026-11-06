@@ -83,14 +83,15 @@ backend = "reference"              # reference emulation or triton native CUDA F
 trace_mode = "modules"             # modules, full, or auto.
 activation_dtype = "e4m3fn"         # e4m3fn or e5m2.
 weight_dtype = "e4m3fn"             # e4m3fn or e5m2.
-grad_dtype = "e4m3fn"               # e4m3fn or e5m2; Triton requires all three to match.
+grad_dtype = "e4m3fn"               # e4m3fn or e5m2; each operand chooses independently.
 num_stages = 3                     # Triton pipeline stages: 1, 2, 3, or 4.
 # out_dtype = "fp32"               # fp32, bf16, fp16; omit to follow active AMP/input dtype.
 
 [runtime.fp8.block_shapes]
 # Omitted operands use tensorwise scaling (None in Python).
-# Each block shape contains two positive integers.
-# Triton requires both dimensions to be multiples of 32.
+# Each block shape contains two positive integers; activation = [1, 32] is supported.
+# Native FP8 dot requires reduction-axis scale widths that are multiples of 32.
+# Other layouts, including after transpose, use fused dequantization and TF32x3 dot.
 # activation = [32, 32]
 # weight = [32, 32]
 # grad = [32, 32]
@@ -124,6 +125,12 @@ drop_last = false
 [logging]
 level = "INFO"                     # Level name or nonnegative integer; Python None uses environment/default.
 file_level = "DEBUG"
+color = "blue"                     # Console color for all severities; none disables color.
+# Colors: black, red, green, yellow, blue, magenta, cyan, white, none.
+memory_each_epoch = false          # Report memory after each completed fit epoch.
+# Model/optimizer storage and estimated persistent baseline; rank zero only.
+# CUDA reports current allocated/reserved memory and process allocator peaks since last reset.
+# Reporting never resets the allocator statistics.
 # Logging sessions write files only when an explicit destination is supplied.
 
 [application]

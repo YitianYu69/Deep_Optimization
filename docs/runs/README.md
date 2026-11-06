@@ -316,16 +316,19 @@ python -m deepopt evaluate --checkpoint runs/fp8/best.pt --device cpu
 | FP8 field | Meaning |
 | --- | --- |
 | `enabled` | Opt in to automatic preparation and supported FP8 computation; default `false` |
-| `backend` | `reference` emulates quantized operands; `triton` runs native FP8 GEMM on supported NVIDIA CUDA hardware |
+| `backend` | `reference` emulates quantized operands; `triton` uses native FP8 or fused dequantization/TF32x3 GEMM according to scale alignment on supported NVIDIA CUDA hardware |
 | `trace_mode` | `modules` (default) preserves a container root; `full` requests one FX graph; `auto` tries full tracing then falls back |
-| `activation_dtype`, `weight_dtype`, `grad_dtype` | Each accepts `e4m3fn` (default) or `e5m2`; Triton currently requires all three to match |
+| `activation_dtype`, `weight_dtype`, `grad_dtype` | Each independently accepts `e4m3fn` (default) or `e5m2` on either backend |
 | `block_shapes` | Optional table with `activation`, `weight`, and `grad` two-integer arrays; omitted roles use tensorwise scaling |
 | `num_stages` | Triton pipeline stages, integer 1–4; default 3 |
 | `out_dtype` | Optional `fp32`, `bf16`, or `fp16`; omit to follow the active AMP/input dtype |
 
 For example, `[runtime.fp8.block_shapes]` with `weight = [32, 64]` applies
-blockwise weight scaling. Triton requires both dimensions to be multiples of
-32. TOML has no null literal; leave a role absent to retain tensorwise scaling.
+blockwise weight scaling. Positive block dimensions, including `activation = [1, 32]`,
+are supported. Triton uses native FP8 when reduction-axis scale widths are
+multiples of 32, and fused dequantization/TF32x3 for other layouts, including
+after backward transposes. See the [CUDA FP8 details](../fp8/README.md#actual-cuda-execution).
+TOML has no null literal; leave a role absent to retain tensorwise scaling.
 
 Construction order is **model placement → FP8 preparation → optional compilation
 → optimizer → runtime/DDP core**. The core reuses matching preparation and

@@ -1,6 +1,7 @@
 """Serializable FP8 configuration for Python, TOML, and checkpoint round trips."""
 
 from dataclasses import asdict
+from itertools import product
 import json
 from pathlib import Path
 import tempfile
@@ -84,15 +85,22 @@ weight = [32, 64]
         self.assertEqual(restored, config)
         self.assertEqual(restored.runtime.fp8.block_shapes["activation"], (32, 96))
 
-    def test_reference_allows_independent_operand_formats(self):
-        config = fp8_config_from_dict({"activation_dtype": "e4m3fn", "grad_dtype": "e5m2"})
-        self.assertEqual((config.activation_dtype, config.grad_dtype), ("e4m3fn", "e5m2"))
+    def test_backends_allow_independent_operand_formats(self):
+        for backend in ("reference", "triton"):
+            for formats in product(("e4m3fn", "e5m2"), repeat=3):
+                with self.subTest(backend=backend, formats=formats):
+                    options = dict(zip(("activation_dtype", "weight_dtype", "grad_dtype"), formats))
+                    config = fp8_config_from_dict({"backend": backend, **options})
+                    self.assertEqual((config.activation_dtype, config.weight_dtype, config.grad_dtype), formats)
 
-    def test_triton_rejects_incompatible_formats_and_scale_alignment(self):
-        for options in ({"grad_dtype": "e5m2"}, {"block_shapes": {"weight": [16, 32]}},
-                        {"block_shapes": {"activation": [32, 48]}}):
-            with self.subTest(options=options), self.assertRaises(ConfigError):
-                fp8_config_from_dict({"backend": "triton", **options})
+    def test_triton_allows_rowwise_and_unaligned_scale_blocks(self):
+        for shape in ([1, 32], [32, 1], [3, 5]):
+            with self.subTest(shape=shape):
+                config = fp8_config_from_dict({"backend": "triton", "block_shapes": {
+                    role: shape for role in ("activation", "weight", "grad")},
+                })
+                self.assertEqual(config.block_shapes,
+                                 dict.fromkeys(("activation", "weight", "grad"), tuple(shape)))
 
     def test_invalid_configuration_fails_with_config_error(self):
         invalid = (

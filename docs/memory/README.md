@@ -11,7 +11,7 @@ lives outside the trainer's epoch loop.
 
 | Need | API |
 | --- | --- |
-| Inspect current model/optimizer tensor storage | `deepopt.memory.summarize_model_memory(model, optimizer)` |
+| Inspect current storage and estimate the persistent training baseline | `deepopt.memory.summarize_model_memory(model, optimizer)` |
 | Estimate one supplied batch shape | `deepopt.memory.estimate_training_memory(trainer, sample_batch)` |
 | Prepare a caller-owned loader before training | `deepopt.memory.prepare_batch_size(trainer, train_loader, ...)` |
 | Automatically size a fresh configured run | `deepopt.run.train(config, output=..., sample_batch_fn=...)` |
@@ -30,11 +30,12 @@ They use the loaders and components you provide. Direct recipes can call the
 standalone estimator before `fit()` and choose their loader size themselves.
 The configured `run.train()` path provides the planning-and-application sequence.
 
-## Parameters and currently allocated storage
+## Parameters, allocated storage, and the persistent baseline
 
 Every successful `Trainer(...)` initialization logs parameter counts with their
-percentage of the total, model storage, and optimizer storage through the shared
-logger. No additional trainer option is needed. Create the trainer inside
+percentage of the total, current model/optimizer storage, and estimates for dense
+gradients, initialized optimizer state, and their persistent training total through
+the shared logger. No additional trainer option is needed. Create the trainer inside
 `logging_session(...)` to include this summary in the log file; configured runs
 already establish the session before constructing the trainer.
 
@@ -55,6 +56,9 @@ The returned `ModelMemorySummary` exposes:
 | `parameter_bytes`, `buffer_bytes` | Unique backing storage in each category, using actual tensor dtypes |
 | `model_bytes`, `model_gb` | Union of registered parameter and buffer storage, including nonpersistent buffers |
 | `optimizer_bytes`, `optimizer_gb` | Currently allocated tensors in optimizer state and tensor-valued parameter-group settings, excluding model allocations already counted |
+| `estimated_gradient_bytes`, `estimated_gradient_gb` | Expected dense gradients for all trainable parameters, using their dtypes |
+| `estimated_optimizer_bytes`, `estimated_optimizer_gb` | Existing optimizer allocations plus state expected to be allocated during initialization |
+| `estimated_persistent_bytes`, `estimated_persistent_gb` | `model_bytes + estimated_gradient_bytes + estimated_optimizer_bytes`; `None` when a component is unknown |
 | `notes`, `as_dict()` | Accounting limits and a serializable report including percentages/GB |
 
 GB means **1,000,000,000 bytes**, not GiB. Shared storages and views count once;
@@ -64,22 +68,59 @@ parameter, `model_bytes` need not equal `parameter_bytes + buffer_bytes`.
 Sparse COO/compressed tensors include index and value storage.
 
 Fresh Adam-like optimizers often have **zero allocated state** until the first
-update. Initialization reports that current value and explicitly notes lazy
-allocation; it does not guess an optimizer multiplier. Call the helper again
-after an update or checkpoint restore for the current figure. Custom optimizer
-tensors outside `state` and parameter-group settings are outside this summary.
+update. The current-storage figure remains zero, while the separate estimate
+includes the expected lazy state. Standard `torch.optim.Adam` and `AdamW` allocate
+two parameter-shaped moment tensors and one scalar step per participating
+parameter tensor; AMSGrad adds a third moment tensor. Standard `SGD` allocates
+one momentum buffer when momentum is enabled and no such state otherwise.
+`MultiOptimizer` forecasts its supported children. Existing state/settings are
+counted as allocated, and only missing state is added to the forecast.
+
+The forecast assumes every trainable parameter receives a dense gradient. It
+supports the exact standard optimizer types above; custom optimizers, unavailable
+or malformed state, and meta/fake/uninitialized tensors yield `None` for affected
+estimates with explanatory notes. Custom optimizer tensors outside `state` and
+parameter-group settings are outside this summary. Call the helper again after
+an update or checkpoint restore to refresh both measured storage and estimates.
+
+For example, 11,181,642 trainable FP32 parameters occupy 44,726,568 bytes. If
+registered model storage is 44,765,128 bytes including buffers, ordinary AdamW
+adds an estimated 44,726,568 bytes of gradients and 89,453,136 bytes of moments.
+The persistent baseline is **178,944,832 bytes (0.178944832 GB)**, plus scalar step
+counters and any tensor-valued optimizer settings. This assumes the optimizer
+owns all those parameters.
 
 This helper does not execute the model, copy tensors, read tensor values, or
-create optimizer state. It excludes parameter gradients, activations, temporary
-workspaces, Python object overhead, and allocator reservations. Meta/fake tensors
-have zero physical payload. Uninitialized parameters or inaccessible storage
-produce `None` for affected totals and explanatory notes, rather than guessed
-values. This is current tensor storage, not peak training-memory planning.
+create optimizer state. Measured model/optimizer storage excludes gradients;
+the persistent estimate adds their expected storage. Neither the persistent
+baseline nor the measured storage includes a batch, saved activations, transient
+tensors, kernel workspaces, DDP communication/bucket allowances, Python object
+overhead, or allocator reservations. Meta/fake tensors have zero physical payload.
+Uninitialized parameters or inaccessible storage produce `None` for affected
+totals. The persistent baseline is not a batch-dependent training peak or total
+process memory.
 
 The implementation is isolated in
 [`memory/statistics.py`](../../src/deepopt/memory/statistics.py), and re-exported from
 `deepopt.memory`. See [model_memory.py](../../examples/memory/model_memory.py)
 for frozen/trainable percentages and a before/after optimizer-state example.
+
+## Observe CUDA allocator memory during training
+
+Set `logging.memory_each_epoch = true` in the trainer's configuration to report
+memory after each completed training/validation epoch. Alongside model/optimizer
+storage and the estimated persistent baseline, CUDA runs report current allocated
+and reserved memory and their observed peaks on the trainer's device.
+
+The peak line is labeled **"CUDA peak memory since last reset"**. These are
+PyTorch allocator statistics for this process on that device, including other
+work in the process. They are not isolated trainer totals or per-epoch peaks:
+the reporting window starts at the allocator's last statistics reset, which
+application code may perform. DeepOpt reporting does not reset these counters or
+synchronize CUDA. Allocations outside the PyTorch allocator, such as CUDA context
+or external library allocations, remain excluded. See
+[per-epoch logging](../logging/README.md#per-epoch-memory-reports) for configuration
+and output policy.
 
 ## Estimate a representative computation
 
@@ -95,6 +136,39 @@ Supply the **complete batch** expected by your loss or step: inputs, targets,
 masks, and any other fields. Existing tensors and meta tensors are accepted.
 The sample's structure must also work with the runtime's batch-transfer logic.
 No batch axis, class count, sequence length, or task reduction is inferred.
+
+For an existing ResNet/CIFAR classification trainer that consumes batches of
+256 FP32 RGB images resized to 256 × 256 and integer class targets:
+
+```python
+import torch
+from deepopt.memory import estimate_training_memory
+from deepopt.logger import log_output
+
+sample_batch = (
+    torch.empty((256, 3, 256, 256), dtype=torch.float32, device="meta"),
+    torch.empty((256,), dtype=torch.long, device="meta"),
+)
+estimate = estimate_training_memory(trainer, sample_batch)
+log_output({
+    "peak_tensor_gb_by_device": {
+        device: size / 1_000_000_000
+        for device, size in estimate.peak_bytes_by_device.items()
+    },
+    "persistent_tensor_gb_by_device": {
+        device: size / 1_000_000_000
+        for device, size in estimate.persistent_bytes_by_device.items()
+    },
+    "assumptions": estimate.assumptions,
+})
+```
+
+Match these shapes and dtypes to the actual preprocessing and loss. The meta
+sample allocates no image/target payload. This is an explicit, batch-dependent
+tensor-peak estimate; trainer initialization does not run it automatically.
+Unsupported execution raises `MemoryEstimationError` rather than running a real
+probe or reporting a guessed peak. In particular, FP8 quantization and Triton
+execution may be unsupported by fake tracing; see [the limits below](#unsupported-paths-and-estimation-limits).
 
 The estimator uses [PyTorch fake tensors](https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/torch.compiler_fake_tensor.html)
 to execute tensor operations using metadata rather than model/input data
