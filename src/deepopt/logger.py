@@ -17,7 +17,7 @@ import sys
 from threading import RLock
 
 from ._config_resolution import _UNSET, ResolvedConfig, _merge, resolve_config
-from .config import ExperimentConfig
+from .config import ExperimentConfig, _LOGGING_COLORS, _logging_config_from_dict
 
 
 _active = ContextVar("deepopt_logging_session", default=None)
@@ -79,6 +79,10 @@ def _level(value):
     return value
 
 
+def _color(value):
+    return _logging_config_from_dict({"color": value})["color"]
+
+
 class _Formatter(logging.Formatter):
     def format(self, record):
         text = _ansi.sub("", super().format(record))
@@ -90,14 +94,14 @@ class _Formatter(logging.Formatter):
 _formatter = _Formatter("%(message)s")
 
 
-def _console(record, level):
+def _console(record, level, color):
     if getattr(record, "output_only", False) or record.levelno < level:
         return
     text = os.getenv("DEEPOPT_LOGGING_PREFIX", "") + _formatter.format(record)
-    color = os.getenv("DEEPOPT_LOGGING_COLOR", "auto")
-    if not os.getenv("NO_COLOR") and (color == "1" or (color == "auto" and sys.stderr.isatty())):
-        code = {logging.DEBUG: 36, logging.INFO: 32, logging.WARNING: 33, logging.ERROR: 31,
-                logging.CRITICAL: 31}.get(record.levelno, 0)
+    mode = os.getenv("DEEPOPT_LOGGING_COLOR", "auto")
+    code = _LOGGING_COLORS[color]
+    if (code is not None and not os.getenv("NO_COLOR")
+            and (mode == "1" or (mode == "auto" and sys.stderr.isatty()))):
         text = f"\x1b[{code}m{text}\x1b[0m"
     # Avoid importing tqdm (or torch) for configuration-only entry points.
     tqdm_module = sys.modules.get("tqdm")
@@ -117,9 +121,11 @@ class _Router(logging.Handler):
         if session is not None:
             session.emit(record)
         else:
-            configured = resolve_config().get("logging", {}).get("level")
+            options = resolve_config().get("logging", {})
+            configured = options.get("level")
             _console(record, _level(configured if configured is not None else
-                                   os.getenv("DEEPOPT_LOGGING_LEVEL", "INFO")))
+                                   os.getenv("DEEPOPT_LOGGING_LEVEL", "INFO")),
+                     _color(options.get("color", "blue")))
 
 
 def init_logger(name: str) -> logging.Logger:
@@ -136,7 +142,7 @@ def init_logger(name: str) -> logging.Logger:
 
 
 class _Session:
-    def __init__(self, config, level, file_level):
+    def __init__(self, config, level, file_level, color):
         self.config, _ = _config_dict(config)
         options = self.config.get("logging", {})
         options = options if isinstance(options, Mapping) else {}
@@ -144,14 +150,17 @@ class _Session:
             level = options.get("level")
         if file_level is _UNSET:
             file_level = options.get("file_level", "DEBUG")
+        if color is _UNSET:
+            color = options.get("color", "blue")
         self.level = _level(level if level is not None else os.getenv("DEEPOPT_LOGGING_LEVEL", "INFO"))
         self.file_level = _level(file_level)
+        self.color = _color(color)
         self.path = None
         self._file = None
         self._pending = []
 
     def emit(self, record):
-        _console(record, self.level)
+        _console(record, self.level, self.color)
         if record.levelno >= self.file_level:
             # Format immediately: do not retain tensors, exceptions, or mutable args.
             line = _formatter.format(record) + "\n"
@@ -186,16 +195,18 @@ class _Session:
 
 
 @contextmanager
-def logging_session(config=None, directory=None, *, level=_UNSET, file_level=_UNSET, failure_directory=None):
+def logging_session(config=None, directory=None, *, level=_UNSET, file_level=_UNSET,
+                    color=_UNSET, failure_directory=None):
     """Snapshot logging policy; write a file only to an explicit destination.
 
-    Omitted metadata/levels inherit current configuration without activating it.
+    Omitted metadata, levels, and color inherit current configuration without
+    activating it. Console color defaults to blue; "none" disables it.
     directory=None buffers until session.bind(). Configured runs use this to
     record preflight messages under the final, selected batch size. A failed
     preflight can flush to failure_directory without creating a run directory.
     Nested sessions are isolated and restore the outer session on exit.
     """
-    session = _Session(_metadata_snapshot(config), level, file_level)
+    session = _Session(_metadata_snapshot(config), level, file_level, color)
     token = _active.set(session)
     logger = init_logger(__name__)
     failure = None

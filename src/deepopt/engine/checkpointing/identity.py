@@ -26,6 +26,8 @@ def compatibility_config(config):
     if "training" in result:
         result["training"] = {key: value for key, value in result["training"].items()
                               if key not in ("epochs", "batch_size", "checkpoint_every_steps")}
+        if not result["training"].get("ema", {}).get("enabled", False):
+            result["training"].pop("ema", None)
     if "runtime" in result:
         result["runtime"] = {key: value for key, value in result["runtime"].items()
                              if key not in ("checks", "execution_mode", "diagnostics", "mode_schedule", "non_blocking")}

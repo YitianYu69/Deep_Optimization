@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError, asdict
+from itertools import product
 import json
 from pathlib import Path
 import subprocess
@@ -38,6 +39,54 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.training.learning_rate, 0.001)
         self.assertEqual(config.training.monitor, "loss")
         self.assertEqual(config.training.monitor_mode, "min")
+
+    def test_logging_color_and_epoch_memory_roundtrip_from_toml(self):
+        for enabled in (False, True):
+            with self.subTest(memory_each_epoch=enabled):
+                self.path.write_text(VALID + f'''
+[logging]
+level = "info"
+file_level = "debug"
+color = "BLUE"
+memory_each_epoch = {str(enabled).lower()}
+''', encoding="utf-8")
+                config = load_config(self.path)
+                self.assertEqual(config.logging, {"level": "INFO", "file_level": "DEBUG",
+                                                  "color": "blue", "memory_each_epoch": enabled})
+                self.assertEqual(config_from_dict(asdict(config)), config)
+
+    def test_logging_memory_and_color_require_supported_values(self):
+        raw = asdict(load_config(self.path))
+        for option, values in (
+            ("memory_each_epoch", (None, 0, 1, "true", [])),
+            ("color", (None, False, 34, "unknown", "\x1b[34m", [])),
+        ):
+            for value in values:
+                with self.subTest(option=option, value=value), self.assertRaisesRegex(ConfigError, option):
+                    config_from_dict({**raw, "logging": {option: value}})
+
+    def test_triton_fp8_toml_preserves_independent_formats_and_rowwise_blocks(self):
+        for activation, weight, grad in product(("e4m3fn", "e5m2"), repeat=3):
+            with self.subTest(activation=activation, weight=weight, grad=grad):
+                self.path.write_text(VALID + f'''
+[runtime.fp8]
+enabled = true
+backend = "triton"
+activation_dtype = "{activation}"
+weight_dtype = "{weight}"
+grad_dtype = "{grad}"
+[runtime.fp8.block_shapes]
+activation = [1, 32]
+weight = [32, 32]
+grad = [32, 32]
+''', encoding="utf-8")
+                config = load_config(self.path)
+                fp8 = config.runtime.fp8
+                self.assertEqual((fp8.activation_dtype, fp8.weight_dtype, fp8.grad_dtype),
+                                 (activation, weight, grad))
+                self.assertEqual(fp8.block_shapes,
+                                 {"activation": (1, 32), "weight": (32, 32), "grad": (32, 32)})
+                self.assertEqual(config_from_dict(json.loads(json.dumps(asdict(config)))), config)
 
     def test_application_options_roundtrip_without_a_dataset_or_task_schema(self):
         raw = asdict(load_config(self.path))

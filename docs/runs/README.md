@@ -250,6 +250,7 @@ precision = "fp32"
 | `training` | Required fields above; `optimizer="adamw"` (`sgd` or recipe-supplied `custom`), `weight_decay=0`, `momentum=0.9`, `accumulation_steps=1`, optional `grad_clip_norm` |
 | Reporting/checkpoints in `training` | `monitor="loss"`, `monitor_mode="min"`, `checkpoint_every_steps=0`; TOML `monitor=false` disables best selection |
 | LR scheduling in `training` | `lr_gamma=1`, `scheduler_interval="epoch"` (`step` counts optimizer updates), optional `lr_schedule` table |
+| `training.ema` | `enabled=false`, `decay=0.999`; when enabled, validation uses parameter averages updated after each optimizer step; checkpoints preserve live and averaged weights |
 | `runtime` | `device="cpu"`, `precision="fp32"`, `deterministic=true`, `checks=true`, optional execution/diagnostic policies, `non_blocking=false` |
 | `runtime.compile` | `enabled=false`, `backend="inductor"`, `fullgraph=false`, optional `mode`, `dynamic`, and scalar-valued `options` |
 | `runtime.fp8` | `enabled=false`, `backend="reference"`, `trace_mode="modules"`; operand formats and scaling described below |
@@ -316,16 +317,19 @@ python -m deepopt evaluate --checkpoint runs/fp8/best.pt --device cpu
 | FP8 field | Meaning |
 | --- | --- |
 | `enabled` | Opt in to automatic preparation and supported FP8 computation; default `false` |
-| `backend` | `reference` emulates quantized operands; `triton` runs native FP8 GEMM on supported NVIDIA CUDA hardware |
+| `backend` | `reference` emulates quantized operands; `triton` uses native FP8 or fused dequantization/TF32x3 GEMM according to scale alignment on supported NVIDIA CUDA hardware |
 | `trace_mode` | `modules` (default) preserves a container root; `full` requests one FX graph; `auto` tries full tracing then falls back |
-| `activation_dtype`, `weight_dtype`, `grad_dtype` | Each accepts `e4m3fn` (default) or `e5m2`; Triton currently requires all three to match |
+| `activation_dtype`, `weight_dtype`, `grad_dtype` | Each independently accepts `e4m3fn` (default) or `e5m2` on either backend |
 | `block_shapes` | Optional table with `activation`, `weight`, and `grad` two-integer arrays; omitted roles use tensorwise scaling |
 | `num_stages` | Triton pipeline stages, integer 1–4; default 3 |
 | `out_dtype` | Optional `fp32`, `bf16`, or `fp16`; omit to follow the active AMP/input dtype |
 
 For example, `[runtime.fp8.block_shapes]` with `weight = [32, 64]` applies
-blockwise weight scaling. Triton requires both dimensions to be multiples of
-32. TOML has no null literal; leave a role absent to retain tensorwise scaling.
+blockwise weight scaling. Positive block dimensions, including `activation = [1, 32]`,
+are supported. Triton uses native FP8 when reduction-axis scale widths are
+multiples of 32, and fused dequantization/TF32x3 for other layouts, including
+after backward transposes. See the [CUDA FP8 details](../fp8/README.md#actual-cuda-execution).
+TOML has no null literal; leave a role absent to retain tensorwise scaling.
 
 Construction order is **model placement → FP8 preparation → optional compilation
 → optimizer → runtime/DDP core**. The core reuses matching preparation and

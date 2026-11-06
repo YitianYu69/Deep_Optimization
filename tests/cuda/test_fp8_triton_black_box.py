@@ -1,6 +1,7 @@
 """Numerical FP8 CUDA kernel and autograd validation; never mocked GPU evidence."""
 
 from copy import deepcopy
+from itertools import product
 import unittest
 
 import torch
@@ -25,15 +26,21 @@ class TritonFP8BlackBoxTests(unittest.TestCase):
     def test_gemm_matches_dequantized_oracle_for_partial_tiles_and_scale_boundaries(self):
         # K=97 and scale width 96 exercise a final partial tile and gcd(BLOCK_K, 96).
         shapes = ((13, 19, 7), (129, 137, 97), (32, 65, 160))
-        scales = ((None, None), ((32, 96), (64, 64)), (None, (32, 32)), ((64, 64), None))
+        scales = (
+            (None, None), ((32, 96), (64, 64)), (None, (32, 32)), ((64, 64), None),
+            ((1, 32), (32, 32)), ((32, 1), (32, 32)), ((32, 32), (32, 1)),
+            ((3, 5), (7, 9)), (None, (7, 9)), ((3, 5), None),
+        )
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
         for m, n, k in shapes:
             for a_block, b_block in scales:
-                for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                    with self.subTest(shape=(m, n, k), blocks=(a_block, b_block), dtype=dtype):
+                for a_dtype, b_dtype in product(fp8_dtypes, repeat=2):
+                    with self.subTest(shape=(m, n, k), blocks=(a_block, b_block),
+                                      dtypes=(a_dtype, b_dtype)):
                         a = quantize_fp8(torch.randn(m, k, device=self.device) * 0.3,
-                                         fp8_dtype=dtype, block_shape=a_block)
+                                         fp8_dtype=a_dtype, block_shape=a_block)
                         b = quantize_fp8(torch.randn(n, k, device=self.device) * 0.3,
-                                         fp8_dtype=dtype, block_shape=b_block)
+                                         fp8_dtype=b_dtype, block_shape=b_block)
                         bias = torch.randn(n, device=self.device) * 0.1
                         actual = gemm_nt(a, b, backend="triton", bias=bias)
                         # CPU FP32 oracle avoids CUDA TF32 settings affecting the comparison.
@@ -43,23 +50,36 @@ class TritonFP8BlackBoxTests(unittest.TestCase):
                         torch.testing.assert_close(actual.cpu(), expected, rtol=3e-4, atol=3e-4)
 
     def test_output_dtypes_pipeline_stages_and_biasless_gemm(self):
-        a = quantize_fp8(torch.randn(9, 73, device=self.device) * 0.2)
-        b = quantize_fp8(torch.randn(17, 73, device=self.device) * 0.2)
-        expected = a.dequantize().cpu() @ b.dequantize().cpu().T
-        for dtype, tolerance in ((torch.float32, 3e-4), (torch.float16, 2e-3), (torch.bfloat16, 1e-2)):
-            for stages in (1, 2, 3, 4):
-                with self.subTest(dtype=dtype, stages=stages):
-                    actual = gemm_nt(a, b, backend="triton", out_dtype=dtype, num_stages=stages)
-                    self.assertEqual(actual.dtype, dtype)
-                    torch.testing.assert_close(actual.cpu(), expected.to(dtype),
-                                               rtol=tolerance, atol=tolerance)
+        for a_block, b_block in ((None, None), ((32, 1), (7, 9))):
+            a = quantize_fp8(torch.randn(9, 73, device=self.device) * 0.2,
+                             fp8_dtype=torch.float8_e5m2, block_shape=a_block)
+            b = quantize_fp8(torch.randn(17, 73, device=self.device) * 0.2,
+                             block_shape=b_block)
+            expected = a.dequantize().cpu() @ b.dequantize().cpu().T
+            for dtype, tolerance in ((torch.float32, 3e-4), (torch.float16, 2e-3), (torch.bfloat16, 1e-2)):
+                for stages in (1, 2, 3, 4):
+                    with self.subTest(blocks=(a_block, b_block), dtype=dtype, stages=stages):
+                        actual = gemm_nt(a, b, backend="triton", out_dtype=dtype, num_stages=stages)
+                        self.assertEqual(actual.dtype, dtype)
+                        torch.testing.assert_close(actual.cpu(), expected.to(dtype),
+                                                   rtol=tolerance, atol=tolerance)
 
     def test_linear_forward_and_all_gradients_match_quantized_reference(self):
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        roles = ("activation", "weight", "grad")
+        layouts = ((None, None, None), ((32, 96),) * 3, ((1, 32), (32, 32), (32, 32)))
+        cases = tuple(product(layouts, product(fp8_dtypes, repeat=3)))
+        hybrid_formats = (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e5m2)
+        cases += (
+            (((1, 32),) * 3, hybrid_formats),
+            (((3, 5), (7, 9), (5, 3)), hybrid_formats),
+        )
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            for block in (None, (32, 96)):
-                with self.subTest(dtype=dtype, block=block):
+            for blocks, formats in cases:
+                with self.subTest(dtype=dtype, blocks=blocks, formats=formats):
                     plan = fp8_plan("triton")
-                    plan["block_shapes"] = {role: block for role in ("activation", "weight", "grad")}
+                    plan["fp8_training"]["fp8_dtypes"] = dict(zip(roles, formats))
+                    plan["block_shapes"] = dict(zip(roles, blocks))
                     reference_plan = deepcopy(plan)
                     reference_plan["fp8_training"]["backend"] = "reference"
                     x = (torch.randn(2, 17, 65, device=self.device, dtype=dtype) * 0.2).requires_grad_()

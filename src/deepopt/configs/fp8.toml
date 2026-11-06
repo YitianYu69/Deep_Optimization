@@ -29,7 +29,9 @@ num_stages = 3
 # out_dtype = "fp32"
 
 # Omitted operands use tensorwise scaling. Uncomment for blockwise scaling.
-# Triton requires both dimensions to be multiples of 32.
+# Any positive dimensions are supported, including activation = [1, 32].
+# Native FP8 dot requires reduction-axis scale widths that are multiples of 32.
+# Other layouts, including after transpose, use fused dequantization and TF32x3 dot.
 # [runtime.fp8.block_shapes]
 # activation = [32, 32]
 # weight = [32, 32]

@@ -29,6 +29,7 @@ class TrainingConfig:
     checkpoint_every_steps: int = 0  # Opt in with a positive optimizer-update interval.
     scheduler_interval: str = "epoch"
     lr_schedule: dict[str, Any] | None = None
+    ema: dict[str, Any] = field(default_factory=lambda: {"enabled": False, "decay": 0.999})
 
 
 @dataclass(frozen=True)
@@ -150,7 +151,7 @@ def training_config_from_dict(raw: Mapping[str, Any]) -> TrainingConfig:
     t = _copy_tables(raw)
     _require_keys(t, {"epochs", "batch_size", "learning_rate"}, "training",
                   {"accumulation_steps", "optimizer", "weight_decay", "momentum", "lr_gamma", "grad_clip_norm",
-                   "monitor", "monitor_mode", "checkpoint_every_steps", "scheduler_interval", "lr_schedule"})
+                   "monitor", "monitor_mode", "checkpoint_every_steps", "scheduler_interval", "lr_schedule", "ema"})
     optimizer = t.get("optimizer", "adamw")
     if optimizer not in ("adamw", "sgd", "custom"):
         raise ConfigError("training.optimizer must be adamw, sgd, or custom")
@@ -189,7 +190,20 @@ def training_config_from_dict(raw: Mapping[str, Any]) -> TrainingConfig:
         monitor=monitor, monitor_mode=monitor_mode,
         checkpoint_every_steps=_integer(t.get("checkpoint_every_steps", 0), "training.checkpoint_every_steps", 0),
         scheduler_interval=scheduler_interval, lr_schedule=lr_schedule,
+        ema=ema_config_from_dict(t.get("ema", {})),
     )
+
+
+def ema_config_from_dict(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize optional exponential moving averages without importing Torch."""
+    _require_keys(raw, set(), "training.ema", {"enabled", "decay"})
+    enabled = raw.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ConfigError("training.ema.enabled must be a boolean")
+    decay = _number(raw.get("decay", 0.999), "training.ema.decay", 0)
+    if decay >= 1:
+        raise ConfigError("training.ema.decay must be less than 1")
+    return {"enabled": enabled, "decay": decay}
 
 
 def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
@@ -338,12 +352,25 @@ def _loader_config_from_dict(raw: Mapping[str, Any]) -> dict:
     return result
 
 
+_LOGGING_COLORS = {"black": 30, "red": 31, "green": 32, "yellow": 33,
+                   "blue": 34, "magenta": 35, "cyan": 36, "white": 37, "none": None}
+
+
 def _logging_config_from_dict(raw: Mapping[str, Any]) -> dict:
     import logging
 
-    _require_keys(raw, set(), "logging", {"level", "file_level"})
+    _require_keys(raw, set(), "logging", {"level", "file_level", "color", "memory_each_epoch"})
     result = dict(raw)
     for key, value in result.items():
+        if key == "memory_each_epoch":
+            if type(value) is not bool:
+                raise ConfigError("logging.memory_each_epoch must be a boolean")
+            continue
+        if key == "color":
+            if not isinstance(value, str) or value.lower() not in _LOGGING_COLORS:
+                raise ConfigError(f"logging.color must be one of {', '.join(_LOGGING_COLORS)}")
+            result[key] = value.lower()
+            continue
         if key == "level" and value is None:
             continue
         if isinstance(value, str):
@@ -419,11 +446,6 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
                 raise ConfigError(f"runtime.fp8.block_shapes.{role} must contain two positive integers or be null")
             shape = tuple(_integer(size, f"runtime.fp8.block_shapes.{role}", 1) for size in shape)
         block_shapes[role] = shape
-    if backend == "triton":
-        if len(set(dtypes.values())) != 1:
-            raise ConfigError("Triton FP8 requires the same activation, weight, and grad dtype")
-        if any(size % 32 for shape in block_shapes.values() if shape is not None for size in shape):
-            raise ConfigError("Triton FP8 block dimensions must both be multiples of 32")
     return FP8Config(enabled=enabled, backend=backend, trace_mode=trace_mode,
                      activation_dtype=dtypes["activation"], weight_dtype=dtypes["weight"],
                      grad_dtype=dtypes["grad"], block_shapes=block_shapes,

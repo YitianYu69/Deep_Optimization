@@ -11,16 +11,18 @@ from torch import nn
 from torchmetrics import Metric
 from deepopt.distributed import _process as distributed
 from deepopt._config_resolution import _UNSET, ResolvedConfig, config_scope, resolve_config
+from deepopt.config import ema_config_from_dict
 from deepopt.engine.execution.configuration import execution_config, prepare_execution_model, runtime_signature
 
 from deepopt.tasks.base import Task
 from deepopt.logger import init_logger
-from deepopt.memory.statistics import log_model_memory
+from deepopt.memory.statistics import log_model_memory, summarize_model_memory
 from deepopt.engine.training.loops import EpochRunner
 from deepopt.engine.training.progress import EpochProgress
 from deepopt.engine.execution.runtime import TrainingRuntime
 from deepopt.engine.training.state import TrainingState
 from deepopt.engine.training.steps import StepAdapter
+from deepopt.engine.training.ema import ExponentialMovingAverage
 from deepopt.engine.strategies import ExplicitObjective, GradientStrategy, LossStrategy
 
 
@@ -154,6 +156,10 @@ class Trainer:
                                       validation_step_fn=validation_step_fn, metrics=metrics, metric_inputs=metric_inputs)
             self._epochs = EpochRunner(self.runtime, self._steps, accumulation_steps=accumulation_steps,
                                        loss_strategy=loss_strategy, metric_factory=metric_factory)
+            ema_settings = ema_config_from_dict(training.get("ema", {}))
+            self._config_snapshot.setdefault("training", {})["ema"] = ema_settings
+            self.ema = (ExponentialMovingAverage(self.model, ema_settings["decay"])
+                        if ema_settings["enabled"] else None)
         from deepopt.engine.checkpointing.identity import validate_identity
         from deepopt.scheduling import ScheduleController
         with self.runtime.core.check_errors("experiment identity"):
@@ -167,6 +173,7 @@ class Trainer:
             self._config_snapshot["schedules"] = self.schedules._input_config() if self.schedules is not None else {}
             schedule_state = self.schedules.state_dict() if self.schedules is not None else None
         self.runtime.core.require_equal({"accumulation_steps": accumulation_steps, "precision": self.precision,
+                                         "ema": ema_settings,
                                          "experiment_identity": self.experiment_identity,
                                          "schedules": schedule_state,
                                          "scheduler_interval": scheduler_interval,
@@ -181,7 +188,12 @@ class Trainer:
         self._resume_pending = False
         self._stop_requested = False
         self._schedule_report = None
-        log_model_memory(self.model, self.optimizer)
+        summary = log_model_memory(self.model, self.optimizer)
+        if self.ema is not None:
+            logger.info("EMA parameter shadow storage: %.9f GB", self.ema.storage_bytes / 1_000_000_000)
+            if summary.estimated_persistent_bytes is not None:
+                logger.info("Estimated persistent training storage including EMA: %.9f GB",
+                            (summary.estimated_persistent_bytes + self.ema.storage_bytes) / 1_000_000_000)
 
     @property
     def config(self):
@@ -250,6 +262,35 @@ class Trainer:
                 raise RuntimeError("Change execution mode only at an optimizer-update or epoch boundary")
         self.runtime.set_execution_mode(mode)
 
+    def _log_epoch_memory(self):
+        if not distributed.is_main_process():
+            return
+        summary = summarize_model_memory(self.model, self.optimizer)
+
+        def gb(value):
+            return "unknown" if value is None else f"{value:.9f} GB"
+
+        logger.info("Epoch %s memory (%s): model=%s optimizer=%s",
+                    self.state.completed_epochs, self.device, gb(summary.model_gb), gb(summary.optimizer_gb))
+        logger.info("Epoch %s estimated persistent training storage (model + gradients + optimizer): %s",
+                    self.state.completed_epochs, gb(summary.estimated_persistent_gb))
+        if self.ema is not None:
+            logger.info("Epoch %s EMA parameter shadow storage: %.9f GB",
+                        self.state.completed_epochs, self.ema.storage_bytes / 1_000_000_000)
+            if summary.estimated_persistent_bytes is not None:
+                logger.info("Epoch %s estimated persistent training storage including EMA: %.9f GB",
+                            self.state.completed_epochs,
+                            (summary.estimated_persistent_bytes + self.ema.storage_bytes) / 1_000_000_000)
+        if self.device.type == "cuda":
+            logger.info("Epoch %s CUDA memory (%s): allocated=%.9f GB reserved=%.9f GB",
+                        self.state.completed_epochs, self.device,
+                        torch.cuda.memory_allocated(self.device) / 1_000_000_000,
+                        torch.cuda.memory_reserved(self.device) / 1_000_000_000)
+            logger.info("Epoch %s CUDA peak memory since last reset (%s): allocated=%.9f GB reserved=%.9f GB",
+                        self.state.completed_epochs, self.device,
+                        torch.cuda.max_memory_allocated(self.device) / 1_000_000_000,
+                        torch.cuda.max_memory_reserved(self.device) / 1_000_000_000)
+
     def fit(self, train_loader, validation_loader=None, *, epochs=_UNSET,
             monitor=_DEFAULT_MONITOR, monitor_mode=_UNSET, callbacks=(), step_callbacks=(),
             progress_bar: bool = True, config=None) -> TrainingState:
@@ -266,6 +307,8 @@ class Trainer:
         pass monitor=None explicitly to disable selection while still evaluating.
         The optional progress bar reports completed epochs to stderr using only
         their computed metrics. Set progress_bar=False to disable it entirely.
+        logging.memory_each_epoch in the trainer configuration enables a fresh
+        memory report after each epoch's training and validation.
         """
         with self.runtime.core.check_errors("fit configuration"):
             base = resolve_config(ResolvedConfig(self._config_snapshot))
@@ -281,6 +324,7 @@ class Trainer:
                 if before != after:
                     raise ValueError("fit config may only override training.epochs, monitor, and monitor_mode")
             fit_settings = selected.get("training", {})
+            memory_each_epoch = selected.get("logging", {}).get("memory_each_epoch", False)
             if epochs is _UNSET:
                 epochs = fit_settings.get("epochs")
             if monitor_mode is _UNSET:
@@ -304,6 +348,7 @@ class Trainer:
         self.state.monitor, self.state.monitor_mode = monitor, monitor_mode
         self.runtime.core.require_equal({"epochs": epochs, "monitor": monitor, "monitor_mode": monitor_mode,
                                          "callbacks": len(callbacks), "step_callbacks": len(step_callbacks),
+                                         "memory_each_epoch": memory_each_epoch,
                                          "validation": validation_loader is not None}, "fit settings")
         for callback in callbacks:
             start = getattr(callback, "on_fit_start", None)
@@ -347,6 +392,9 @@ class Trainer:
                     row.update(self._schedule_report)
                 logger.info("Epoch %s/%s: train=%s validation=%s",
                             self.state.completed_epochs, epochs, training, validation)
+                if memory_each_epoch:
+                    with self.runtime.core.check_errors("epoch memory logging"):
+                        self._log_epoch_memory()
                 for callback in callbacks:
                     with self.runtime.core.check_errors("epoch callback"):
                         callback(self, row)
@@ -415,6 +463,9 @@ class Trainer:
 
         def on_update(progress):
             self.state.optimizer_steps += 1
+            if self.ema is not None:
+                with self.runtime.core.check_errors("EMA update"):
+                    self.ema.update(self.model)
             if self.schedules is not None:
                 self.schedules.complete_update(self.state.optimizer_steps)
             if self.scheduler is not None and self.scheduler_interval == "step":
@@ -453,5 +504,18 @@ class Trainer:
         return results
 
     def evaluate(self, loader) -> dict:
-        with self.schedules.read_only() if self.schedules is not None else nullcontext():
-            return self._epochs.evaluate(loader)
+        if self.ema is None:
+            with self.schedules.read_only() if self.schedules is not None else nullcontext():
+                return self._epochs.evaluate(loader)
+        context = self.ema.average_parameters(self.model)
+        entered = False
+        try:
+            with self.runtime.core.check_errors("EMA validation setup"):
+                context.__enter__()
+                entered = True
+            with self.schedules.read_only() if self.schedules is not None else nullcontext():
+                return self._epochs.evaluate(loader)
+        finally:
+            with self.runtime.core.check_errors("EMA validation restore"):
+                if entered:
+                    context.__exit__(None, None, None)

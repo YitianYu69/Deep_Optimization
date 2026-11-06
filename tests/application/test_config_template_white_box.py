@@ -37,7 +37,7 @@ class ConfigTemplateWhiteBoxTests(unittest.TestCase):
         self.assertEqual(set(template["loader"]), {
             "num_workers", "pin_memory", "persistent_workers", "prefetch_factor", "drop_last",
         })
-        self.assertEqual(set(template["logging"]), {"level", "file_level"})
+        self.assertEqual(set(template["logging"]), {"level", "file_level", "color", "memory_each_epoch"})
         self.assertEqual(set(template["runtime"]["fp8"]["block_shapes"]), {"activation", "weight", "grad"})
         config_from_dict(template)
 

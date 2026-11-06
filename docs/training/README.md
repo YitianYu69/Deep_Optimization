@@ -197,6 +197,45 @@ allows that epoch to finish without replaying its data.
 before validation and callbacks; a later failure still makes automatic
 continuation unsafe. Restore a checkpoint or reconstruct the run before retrying.
 
+## Exponential moving averages for validation
+
+Enable EMA in the trainer's configuration when validation should use averaged
+model parameters:
+
+```toml
+[training.ema]
+enabled = true
+decay = 0.999
+```
+
+Use `load_config()` before constructing the trainer, or pass the settings with
+`Trainer(..., config={"training": {"ema": {"enabled": True, "decay": 0.999}}})`.
+EMA is disabled by default. Decay must be finite and satisfy `0 <= decay < 1`.
+The initial shadow equals the initial model. After every successful optimizer
+update, `shadow = decay * shadow + (1 - decay) * live_parameter`; accumulation
+microbatches do not advance it separately. Step callbacks see the completed
+average, and a failed optimizer step does not advance its counter.
+
+Training and optimizer updates always use live parameters. `Trainer.evaluate()`
+and validation inside `fit()` temporarily install the EMA values in existing
+parameter storage, preserving parameter identities and optimizer references.
+Validation starts with current buffers, including BatchNorm statistics and
+integer counters; buffers are not averaged. Live parameters and buffers are
+restored even when validation raises. Best-checkpoint selection therefore uses
+the EMA validation result when this option is enabled.
+
+Shadows use FP32 for lower-precision floating-point parameters and otherwise
+retain their dtype. Enabled EMA requires materialized dense parameters and adds
+shadow storage; validation also allocates temporary parameter/buffer backups.
+The trainer logs the additional shadow bytes and a persistent estimate including
+EMA. Model wrappers are not deep-copied. Configure EMA before training and keep
+the model's parameters, shapes, and dtypes fixed afterward.
+
+Checkpoints store live model weights together with EMA shadows and their update
+count. Resume requires the same enabled policy and decay. Configured checkpoint
+evaluation restores EMA automatically; see the [checkpoint guide](../checkpoints/README.md)
+for direct evaluation.
+
 ## Callbacks, progress, and saving
 
 ```python
