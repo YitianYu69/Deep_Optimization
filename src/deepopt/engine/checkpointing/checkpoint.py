@@ -13,7 +13,7 @@ from importlib.metadata import version
 import torch
 from deepopt.distributed import _process as distributed
 from deepopt._config_resolution import _merge, resolve_config
-from deepopt.config import compile_config_from_dict
+from deepopt.config import compile_config_from_dict, ema_config_from_dict
 
 from deepopt.engine.training.state import TrainingState
 from deepopt.engine.training.progress import EpochProgress, type_name
@@ -84,6 +84,8 @@ def _trainer_settings(trainer) -> dict:
         settings["ddp"] = trainer.runtime.core.options
     if trainer.runtime.fp8.enabled:
         settings["fp8"] = asdict(trainer.runtime.fp8)
+    if trainer.ema is not None:
+        settings["ema"] = {"enabled": True, "decay": trainer.ema.decay}
     # Earlier checkpoints already used epoch scheduling. Keep that default's
     # metadata unchanged while rejecting a changed per-update schedule.
     if trainer.scheduler_interval != "epoch":
@@ -151,6 +153,10 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
     if len(history) != trainer.state.completed_epochs:
         raise ValueError("Checkpoint history must contain one record per completed epoch")
     saved_config = _config_dict(config)
+    configured_ema = ema_config_from_dict(saved_config.get("training", {}).get("ema", {}))
+    if (configured_ema["enabled"] != (trainer.ema is not None)
+            or (trainer.ema is not None and configured_ema["decay"] != trainer.ema.decay)):
+        raise ValueError("Checkpoint configuration must match the trainer's EMA settings")
     batch_size = loader_batch_size(train_loader)
     if batch_size is None:
         batch_size = _config_batch_size(saved_config)
@@ -184,6 +190,9 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
     }
     if trainer.schedules is not None:
         trainer.schedules.validate_state_dict(payload["schedules"], completed_update=trainer.state.optimizer_steps)
+    if trainer.ema is not None:
+        payload["ema"] = trainer.ema.state_dict()
+        trainer.ema.validate_state_dict(payload["ema"], completed_updates=trainer.state.optimizer_steps)
     return payload
 
 
@@ -337,6 +346,12 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
                                     and not (k == "scheduler_interval" and v == "epoch")}
             if settings["training"].get("lr_schedule") is None:
                 settings["training"].pop("lr_schedule", None)
+            ema = ema_config_from_dict(settings["training"].get("ema", {}))
+            if ema["enabled"]:
+                settings["training"]["ema"] = ema
+            else:
+                # Existing checkpoints predate EMA; disabled is equivalent.
+                settings["training"].pop("ema", None)
         if not settings.get("schedules"):
             settings.pop("schedules", None)
         if not settings.get("loader"):
@@ -395,6 +410,7 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
     if trainer.device.type == "cuda" and len(payload["rng"]["cuda"]) != (1 if saved_world > 1 else torch.cuda.device_count()):
         raise ValueError("Resume requires the same number of visible CUDA devices")
     state = TrainingState(**payload["state"])
+    _validate_ema_state(payload, trainer, completed_updates=state.optimizer_steps)
     saved_schedules = payload.get("schedules")
     if (saved_schedules is None) != (trainer.schedules is None):
         raise ValueError("Resume requires the same coefficient schedules; old checkpoints cannot acquire new schedules")
@@ -467,6 +483,8 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
     restore_strategies(payload.get("strategies"), trainer)
     if trainer.schedules is not None:
         trainer.schedules.load_state_dict(saved_schedules, completed_update=state.optimizer_steps)
+    if trainer.ema is not None:
+        trainer.ema.load_state_dict(payload["ema"], completed_updates=state.optimizer_steps)
     trainer.state = state
     for name, generator in generators.items():
         generator.set_state(payload["generators"][name])
@@ -510,3 +528,24 @@ def restore_schedules_for_evaluation(payload, trainer):
         raise ValueError("Evaluation requires the checkpoint's coefficient schedules")
     if trainer.schedules is not None:
         trainer.schedules.load_state_dict(saved, completed_update=payload["state"]["optimizer_steps"])
+
+
+def _validate_ema_state(payload, trainer, *, completed_updates):
+    saved = payload.get("ema")
+    configured = ema_config_from_dict(payload["config"].get("training", {}).get("ema", {}))
+    if (configured["enabled"] != (trainer.ema is not None)
+            or (trainer.ema is not None and configured["decay"] != trainer.ema.decay)):
+        raise ValueError("EMA settings differ from checkpoint")
+    if trainer.ema is None:
+        if saved is not None:
+            raise ValueError("Checkpoint EMA state requires EMA to be enabled")
+    else:
+        trainer.ema.validate_state_dict(saved, completed_updates=completed_updates)
+
+
+def restore_ema_for_evaluation(payload, trainer):
+    """Restore validation averages while leaving the checkpoint's live model intact."""
+    completed_updates = payload["state"]["optimizer_steps"]
+    _validate_ema_state(payload, trainer, completed_updates=completed_updates)
+    if trainer.ema is not None:
+        trainer.ema.load_state_dict(payload["ema"], completed_updates=completed_updates)

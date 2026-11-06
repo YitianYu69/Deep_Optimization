@@ -1,17 +1,27 @@
-"""
-Tritin FP8 GEMM with TMA operand loads.
-"""
+"""Autotuned Triton FP8 GEMM with TMA operand loads."""
 
 import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor 
 
-from math import gcd
-
 from ..quantization.tensor import QuantizedTensor
+from ._triton_autotune import (
+    AUTOTUNE_KEY, AUTOTUNE_TILES, MAX_BLOCK_M, MAX_BLOCK_N, MAX_BLOCK_K,
+    prune_gemm_configs, set_descriptor_block_shapes,
+)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk},
+                      num_warps=warps, num_stages=stages, pre_hook=set_descriptor_block_shapes)
+        for bm, bn, bk, warps in AUTOTUNE_TILES
+        for stages in (1, 2, 3, 4)
+    ],
+    key=list(AUTOTUNE_KEY),
+    prune_configs_by={"early_config_prune": prune_gemm_configs},
+)
 @triton.jit
 def _gemm_nt_kernel(
     a_desc, b_desc, c_desc,
@@ -25,6 +35,8 @@ def _gemm_nt_kernel(
     NATIVE_FP8: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     OUTPUT_DTYPE: tl.constexpr,
+    A_FP8_FORMAT: tl.constexpr, B_FP8_FORMAT: tl.constexpr,
+    DEVICE_INDEX: tl.constexpr, DEVICE_CAPABILITY: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr
@@ -131,7 +143,8 @@ def gemm_nt(
         raise ValueError("Operands must be on the same device")
     if a.data.device.type != "cuda" or torch.version.hip is not None:
         raise ValueError("This backend requires an Nvidia CUDA GPU")
-    if torch.cuda.get_device_capability(a.data.device)[0] < 9:
+    capability = torch.cuda.get_device_capability(a.data.device)
+    if capability[0] < 9:
         raise ValueError("This backend requires compute cabaility >= 9")
     if a.data.shape[1] != b.data.shape[1]:
         raise ValueError("Operands must have the same reduction dimension")
@@ -159,17 +172,9 @@ def gemm_nt(
 
     native_fp8 = all(operand.block_shape is None or operand.block_shape[1] % 32 == 0
                      for operand in (a, b))
-    if native_fp8:
-        block_m, block_n, block_k, num_warps = 128, 128, 64, 8
-        for operand in (a, b):
-            if operand.block_shape is not None:
-                # No dot interval may cross either operand's scale boundary.
-                block_k = gcd(block_k, operand.block_shape[1])
-    else:
-        # FP32 operands require more resources than native FP8 tiles.
-        block_m, block_n, block_k, num_warps = 64, 64, 32, 4
-    
-    padded_k = triton.cdiv(k, block_k) * block_k
+    # Allocate once for every candidate. Descriptor hooks and the launch grid
+    # follow the selected tiles, including on autotuner cache hits.
+    padded_k = triton.cdiv(k, MAX_BLOCK_K) * MAX_BLOCK_K
 
     # Represent tensorwise scaling as a single logical scale block when the other operands is blockwise
     a_block_rows, a_block_cols = a.block_shape or (m, padded_k)
@@ -177,32 +182,34 @@ def gemm_nt(
 
     tensorwise = a.block_shape is None and b.block_shape is None
     with torch.cuda.device(a.data.device):
-        a_packed = _pack_fp8_rows(a.data, block_k)
-        b_packed = _pack_fp8_rows(b.data, block_k)
+        a_packed = _pack_fp8_rows(a.data, MAX_BLOCK_K)
+        b_packed = _pack_fp8_rows(b.data, MAX_BLOCK_K)
 
         a_scale_inv = a.scale_inv.contiguous()
         b_scale_inv = b.scale_inv.contiguous()
 
         a_desc = TensorDescriptor.from_tensor(
-            a_packed, [block_m, block_k]
+            a_packed, [64, 32]
         )
         b_desc = TensorDescriptor.from_tensor(
-            b_packed, [block_n, block_k]
+            b_packed, [64, 32]
         )
 
-        padded_m = triton.cdiv(m, block_m) * block_m
-        padded_n = triton.cdiv(n, block_n) * block_n
+        padded_m = triton.cdiv(m, MAX_BLOCK_M) * MAX_BLOCK_M
+        padded_n = triton.cdiv(n, MAX_BLOCK_N) * MAX_BLOCK_N
 
         output_storage = torch.empty(
             (padded_m, padded_n), dtype=out_dtype, device=a.data.device
         )
         c_desc = TensorDescriptor.from_tensor(
-            output_storage, [block_m, block_n]
+            output_storage, [64, 64]
         )
 
         bias_arg = output_storage if bias is None else bias.contiguous()
 
-        grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+        def grid(meta):
+            return (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]))
+
         _gemm_nt_kernel[grid](
             a_desc, b_desc, c_desc,
             a_scale_inv, b_scale_inv,
@@ -215,10 +222,9 @@ def gemm_nt(
             NATIVE_FP8=native_fp8,
             HAS_BIAS=bias is not None,
             OUTPUT_DTYPE=output_types[out_dtype],
-            BLOCK_M=block_m, BLOCK_N=block_n,
-            BLOCK_K=block_k,
+            A_FP8_FORMAT=str(a.data.dtype), B_FP8_FORMAT=str(b.data.dtype),
+            DEVICE_INDEX=torch.cuda.current_device(), DEVICE_CAPABILITY=capability[0] * 10 + capability[1],
             PIPELINE_STAGES=num_stages,
-            num_warps=num_warps, num_stages=num_stages
         )
     
     return output_storage[:m, :n]

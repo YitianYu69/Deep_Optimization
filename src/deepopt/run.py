@@ -10,7 +10,7 @@ import tempfile
 from .config import config_from_dict
 from ._config_resolution import _UNSET, ResolvedConfig, config_scope, resolve_config
 from deepopt.engine.checkpointing.checkpoint import environment, read_checkpoint, require_step_loader, restore_checkpoint, save_checkpoint
-from deepopt.engine.checkpointing.checkpoint import restore_schedules_for_evaluation
+from deepopt.engine.checkpointing.checkpoint import restore_schedules_for_evaluation, restore_ema_for_evaluation
 from deepopt.memory.planning import apply_batch_size_plan, plan_batch_size
 from .baseline import baseline_sample_batch, build_baseline_experiment
 from .logger import init_logger, logging_session, log_output
@@ -200,6 +200,7 @@ def evaluate(checkpoint, *, device=None, experiment_factory=build_baseline_exper
             raise ValueError("Evaluation requires a validation loader from experiment_factory")
         trainer.model.load_state_dict(payload["model"])
         restore_schedules_for_evaluation(payload, trainer)
+        restore_ema_for_evaluation(payload, trainer)
         result = {"checkpoint": str(Path(checkpoint).resolve()),
                   "epoch": payload["state"]["completed_epochs"],
                   "device": str(trainer.device), "validation": trainer.evaluate(validation_loader)}

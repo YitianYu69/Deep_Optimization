@@ -38,6 +38,11 @@ scheduler_interval = "epoch"       # epoch or step (completed optimizer updates)
 # lr_schedule = { type = "cosine_decay", total_steps = 100, eta_min = 0.00001 }
 # lr_schedule = { type = "warmup_cosine", warmup_steps = 5, total_steps = 100, start_factor = 0.1, eta_min = 0.00001 }
 
+[training.ema]
+enabled = false                   # Validate with averaged parameters; training uses live parameters.
+decay = 0.999                     # Finite value in [0, 1); updated after each optimizer step.
+# Validation uses current buffers; checkpoints retain both live and averaged parameters.
+
 [runtime]
 device = "cpu"                     # cpu, cuda, cuda:N, or auto.
 precision = "fp32"                 # fp32; bf16 AMP requires CUDA at trainer level.

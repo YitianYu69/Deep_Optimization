@@ -627,6 +627,19 @@ FP8 quantization, but may have lower throughput than native FP8 dot products.
 The backend packs strided/misaligned operands, pads partial tiles, and returns
 FP32/BF16/FP16 results. Correctness/performance must be measured on the target GPU.
 
+The kernel uses Triton's native `@triton.autotune` to select matrix tile sizes
+and warp counts. The configured `num_stages` remains fixed; candidates with a
+different stage count or incompatible reduction-scale boundaries are pruned.
+The FP32/TF32x3 path uses a smaller candidate set to limit resource use.
+
+The first call for a new shape, operand/output format, scale layout, bias policy,
+pipeline stage count, or CUDA device benchmarks the compatible candidates.
+This adds first-use latency; subsequent matching calls reuse the in-process
+winner. TMA descriptor shapes and the launch grid follow the selected candidate
+on both tuning and cached calls. Padding accommodates all candidate tiles.
+Set `TRITON_PRINT_AUTOTUNING=1` to inspect Triton's selected configurations.
+No speedup is implied without measurements on the target GPU.
+
 ## Black-box and white-box validation
 
 Install optional real-model dependencies without downloading pretrained weights:

@@ -278,6 +278,13 @@ def estimate_training_memory(trainer, sample_batch) -> TrainingMemoryEstimate:
             trace.peak[device] += buckets
             persistent[device] += buckets
             initial[device] += buckets
+        ema = getattr(trainer, "ema", None)
+        if ema is not None:
+            for shadow in ema.shadow.values():
+                shadow_device = str(shadow.device)
+                shadow_bytes = shadow.numel() * shadow.element_size()
+                for values in (initial, persistent, trace.peak):
+                    values[shadow_device] = values.get(shadow_device, 0) + shadow_bytes
         return TrainingMemoryEstimate(
             trace.peak, persistent, initial,
             ("Tensor-storage estimate for this sample's shapes, dtypes and training execution path; input values are assumed valid.",
@@ -287,7 +294,9 @@ def estimate_training_memory(trainer, sample_batch) -> TrainingMemoryEstimate:
              "Kernel workspaces, allocator fragmentation, CUDA context, communication and external allocations are excluded.",
              "Metrics, observers, scheduler and Trainer callbacks are excluded; user computation must not mutate external Python state or perform I/O.",
              "In-place compiled modules are copied and traced eagerly; compiler workspaces and graph pools are not estimated.",
-             "Existing scalar CPU optimizer step counters are copied as known control constants; model and input values remain unknown."))
+             "Existing scalar CPU optimizer step counters are copied as known control constants; model and input values remain unknown.")
+            + (("EMA parameter shadows are included; EMA update temporaries and validation parameter/buffer backups are excluded.",)
+               if ema is not None else ()))
     except MemoryEstimationError:
         raise
     except Exception as exc:

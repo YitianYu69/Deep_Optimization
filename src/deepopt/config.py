@@ -29,6 +29,7 @@ class TrainingConfig:
     checkpoint_every_steps: int = 0  # Opt in with a positive optimizer-update interval.
     scheduler_interval: str = "epoch"
     lr_schedule: dict[str, Any] | None = None
+    ema: dict[str, Any] = field(default_factory=lambda: {"enabled": False, "decay": 0.999})
 
 
 @dataclass(frozen=True)
@@ -150,7 +151,7 @@ def training_config_from_dict(raw: Mapping[str, Any]) -> TrainingConfig:
     t = _copy_tables(raw)
     _require_keys(t, {"epochs", "batch_size", "learning_rate"}, "training",
                   {"accumulation_steps", "optimizer", "weight_decay", "momentum", "lr_gamma", "grad_clip_norm",
-                   "monitor", "monitor_mode", "checkpoint_every_steps", "scheduler_interval", "lr_schedule"})
+                   "monitor", "monitor_mode", "checkpoint_every_steps", "scheduler_interval", "lr_schedule", "ema"})
     optimizer = t.get("optimizer", "adamw")
     if optimizer not in ("adamw", "sgd", "custom"):
         raise ConfigError("training.optimizer must be adamw, sgd, or custom")
@@ -189,7 +190,20 @@ def training_config_from_dict(raw: Mapping[str, Any]) -> TrainingConfig:
         monitor=monitor, monitor_mode=monitor_mode,
         checkpoint_every_steps=_integer(t.get("checkpoint_every_steps", 0), "training.checkpoint_every_steps", 0),
         scheduler_interval=scheduler_interval, lr_schedule=lr_schedule,
+        ema=ema_config_from_dict(t.get("ema", {})),
     )
+
+
+def ema_config_from_dict(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize optional exponential moving averages without importing Torch."""
+    _require_keys(raw, set(), "training.ema", {"enabled", "decay"})
+    enabled = raw.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ConfigError("training.ema.enabled must be a boolean")
+    decay = _number(raw.get("decay", 0.999), "training.ema.decay", 0)
+    if decay >= 1:
+        raise ConfigError("training.ema.decay must be less than 1")
+    return {"enabled": enabled, "decay": decay}
 
 
 def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:

@@ -100,6 +100,14 @@ Uninitialized parameters or inaccessible storage produce `None` for affected
 totals. The persistent baseline is not a batch-dependent training peak or total
 process memory.
 
+When EMA validation is enabled, the trainer separately reports its parameter
+shadow storage and a persistent estimate including those shadows. The generic
+`summarize_model_memory(model, optimizer)` helper has no trainer reference and
+does not include EMA. `estimate_training_memory(trainer, sample_batch)` includes
+the resident EMA shadows as a persistent allowance; it does not execute EMA
+updates or account for their temporary conversions and validation's temporary
+parameter/buffer backups.
+
 The implementation is isolated in
 [`memory/statistics.py`](../../src/deepopt/memory/statistics.py), and re-exported from
 `deepopt.memory`. See [model_memory.py](../../examples/memory/model_memory.py)

@@ -250,6 +250,7 @@ precision = "fp32"
 | `training` | Required fields above; `optimizer="adamw"` (`sgd` or recipe-supplied `custom`), `weight_decay=0`, `momentum=0.9`, `accumulation_steps=1`, optional `grad_clip_norm` |
 | Reporting/checkpoints in `training` | `monitor="loss"`, `monitor_mode="min"`, `checkpoint_every_steps=0`; TOML `monitor=false` disables best selection |
 | LR scheduling in `training` | `lr_gamma=1`, `scheduler_interval="epoch"` (`step` counts optimizer updates), optional `lr_schedule` table |
+| `training.ema` | `enabled=false`, `decay=0.999`; when enabled, validation uses parameter averages updated after each optimizer step; checkpoints preserve live and averaged weights |
 | `runtime` | `device="cpu"`, `precision="fp32"`, `deterministic=true`, `checks=true`, optional execution/diagnostic policies, `non_blocking=false` |
 | `runtime.compile` | `enabled=false`, `backend="inductor"`, `fullgraph=false`, optional `mode`, `dynamic`, and scalar-valued `options` |
 | `runtime.fp8` | `enabled=false`, `backend="reference"`, `trace_mode="modules"`; operand formats and scaling described below |

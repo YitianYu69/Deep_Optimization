@@ -147,6 +147,27 @@ There is no best file without monitored validation. Resume training through
 `Checkpoint.restore()` and a last checkpoint, which restore optimizer/RNG state
 as well as weights.
 
+When `training.ema.enabled = true`, the checkpoint's `model` remains the live
+training state and its separate `ema` entry contains validation shadows, decay,
+and the completed optimizer-update count. Construct an evaluator with the same
+EMA policy, load the live model as above, then restore the averages before
+calling `evaluate()`:
+
+```python
+from deepopt.engine.checkpointing.checkpoint import restore_ema_for_evaluation
+
+evaluator.model.load_state_dict(saved["model"])
+restore_ema_for_evaluation(saved, evaluator)
+results = evaluator.evaluate(validation_loader)
+```
+
+Keep `saved` until both loads finish. `deepopt.run.evaluate()` performs both
+steps automatically. Validation uses current checkpoint buffers with averaged
+parameters, and leaves the evaluator's live parameters intact. EMA checkpoint
+state is validated before resume mutates training components. Changing EMA's
+enabled policy or decay during resume is rejected; older checkpoints without
+EMA remain compatible when it is disabled.
+
 ## Lower-level helper signatures
 
 The [advanced checkpoint example](../../examples/checkpointing/checkpoint_resume_low_level.py)
