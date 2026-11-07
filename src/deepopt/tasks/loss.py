@@ -6,6 +6,7 @@ from numbers import Real
 
 from torch import Tensor
 from ..observers import FiniteCheck, TensorEvent
+from .._diagnostics import finite_checks_enabled
 
 
 def validate_weight(value, name="normalization weight") -> None:
@@ -17,9 +18,11 @@ def validate_weight(value, name="normalization weight") -> None:
         raise ValueError(f"{name} must be a positive finite real number")
 
 
-def validate_loss(value: Tensor, *, check_finite: bool = True) -> None:
+def validate_loss(value: Tensor, *, check_finite: bool | None = None) -> None:
     if not isinstance(value, Tensor) or not value.is_floating_point() or value.numel() == 0:
         raise ValueError("Loss must be a nonempty real floating-point tensor")
+    if check_finite is None:
+        check_finite = finite_checks_enabled("loss")
     if check_finite:
         FiniteCheck()(TensorEvent("loss", "loss", (value,)))
 
@@ -31,7 +34,9 @@ class LossReport:
     total: Tensor
     weight: float
 
-    def validate(self, *, check_finite: bool = True):
+    def validate(self, *, check_finite: bool | None = None):
+        if check_finite is None:
+            check_finite = finite_checks_enabled("report")
         validate_loss(self.total, check_finite=check_finite)
         if self.total.ndim != 0:
             raise ValueError("Reporting total must be a scalar tensor")
@@ -53,7 +58,7 @@ class LossResult:
     normalization_weight: float | None = None
     report: LossReport | None = None
 
-    def validate(self, *, check_finite: bool = True):
+    def validate(self, *, check_finite: bool | None = None):
         validate_loss(self.value, check_finite=check_finite)
         if self.normalization_weight is not None:
             validate_weight(self.normalization_weight)

@@ -117,6 +117,17 @@ class FP8PolicySnapshotTests(unittest.TestCase):
             save_checkpoint(path, trainer, {"runtime": {"fp8": inactive}}, generators={}, history=[])
             self.assertFalse(read_checkpoint(path)["config"]["runtime"]["fp8"]["enabled"])
 
+    def test_older_policy_without_interception_field_restores_default_behavior(self):
+        trainer = make_trainer()
+        payload = _checkpoint_payload(trainer, {}, generators={}, history=[])
+        payload["config"]["runtime"]["fp8"].pop("intercept_linear")
+        payload["trainer_settings"]["fp8"].pop("intercept_linear")
+        restored = make_trainer()
+        restore_checkpoint(payload, restored, payload["config"], generators={}, batch_size_mode="manual")
+        self.assertTrue(restored.runtime.fp8.intercept_linear)
+        for name, value in trainer.model.state_dict().items():
+            torch.testing.assert_close(restored.model.state_dict()[name], value, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

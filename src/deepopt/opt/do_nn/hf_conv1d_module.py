@@ -3,7 +3,8 @@ import sys
 import torch
 from torch import nn
 
-from .functional import do_linear, validate_fp8_plan
+from .functional import do_linear, _prepare_fp8_plan
+from ._cached_weights import CachedWeightModule
 
 
 def get_hf_conv1d_type() -> type[nn.Module] | None:
@@ -16,7 +17,7 @@ def get_hf_conv1d_type() -> type[nn.Module] | None:
 
 
 
-class DOHFConv1D(nn.Module):
+class DOHFConv1D(CachedWeightModule):
     def __init__(self, original: nn.Module, *, plan: dict) -> None:
         super().__init__()
 
@@ -41,7 +42,7 @@ class DOHFConv1D(nn.Module):
         if original.nf != weight.shape[1]:
             raise ValueError("Conv1D nf must match the weight's output dimension")
 
-        self.plan = validate_fp8_plan(plan)
+        self.plan = _prepare_fp8_plan(plan)
 
         self.nx = weight.shape[0]
         self.nf = original.nf
@@ -71,7 +72,7 @@ class DOHFConv1D(nn.Module):
         # adapter, including future activation compression and sparse kernels.
         return do_linear(
             x, self.weight.transpose(0, 1), self.bias,
-            plan=self.plan
+            plan=self.plan, _weight_cache=self._fp8_weight_cache,
         )
 
     def extra_repr(self) -> str:

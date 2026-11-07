@@ -193,7 +193,7 @@ class FP8AutogradWhiteBoxTests(unittest.TestCase):
         raw = _plan((2, 3))
         normalized = validate_fp8_plan(raw)
         self.assertEqual(normalized["fp8_training"]["backend"], "reference")
-        self.assertEqual(normalized["fp8_training"]["num_stages"], 3)
+        self.assertEqual(normalized["fp8_training"]["num_stages"], "auto")
         self.assertIsNone(normalized["fp8_training"]["out_dtype"])
         raw["block_shapes"]["weight"] = None
         raw["fp8_training"]["fp8_dtypes"]["grad"] = torch.float8_e4m3fn

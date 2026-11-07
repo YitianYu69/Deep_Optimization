@@ -14,11 +14,11 @@ def gemm_nt(
     backend: str,
     out_dtype: torch.dtype = torch.float32,
     bias: torch.Tensor | None = None,
-    num_stages: int = 3,
+    num_stages: int | str = "auto",
 ) -> torch.Tensor:
 
-    if type(num_stages) is not int or num_stages not in (1, 2, 3, 4):
-        raise ValueError("num_stages must be 1, 2, 3, or 4")
+    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4)):
+        raise ValueError("num_stages must be 'auto', 1, 2, 3, or 4")
 
     if backend == "reference":
         from .reference import gemm_nt as implementation

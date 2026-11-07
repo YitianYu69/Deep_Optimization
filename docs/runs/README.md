@@ -328,9 +328,10 @@ python -m deepopt evaluate --checkpoint runs/fp8/best.pt --device cpu
 | `enabled` | Opt in to automatic preparation and supported FP8 computation; default `false` |
 | `backend` | `reference` emulates quantized operands; `triton` uses native FP8 or fused dequantization/TF32x3 GEMM according to scale alignment on supported NVIDIA CUDA hardware |
 | `trace_mode` | `modules` (default) preserves a container root; `full` requests one FX graph; `auto` tries full tracing then falls back |
+| `intercept_linear` | `true` (default) also intercepts native `F.linear`; `false` scopes only prepared DO operations |
 | `activation_dtype`, `weight_dtype`, `grad_dtype` | Each independently accepts `e4m3fn` (default) or `e5m2` on either backend |
 | `block_shapes` | Optional table with `activation`, `weight`, and `grad` two-integer arrays; omitted roles use tensorwise scaling |
-| `num_stages` | Triton pipeline stages, integer 1–4; default 3 |
+| `num_stages` | `"auto"` (default) tunes Triton pipeline depth; integer 1–4 fixes it |
 | `out_dtype` | Optional `fp32`, `bf16`, or `fp16`; omit to follow the active AMP/input dtype |
 
 For example, `[runtime.fp8.block_shapes]` with `weight = [32, 64]` applies

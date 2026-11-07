@@ -8,6 +8,7 @@ import torch
 from torch import Tensor, nn
 from torchmetrics import Metric
 from ..observers import FiniteCheck, TensorEvent
+from .._diagnostics import finite_checks_enabled
 from .loss import LossReport, LossResult, validate_loss, validate_weight
 
 
@@ -83,7 +84,7 @@ class BatchOutput:
         with torch.no_grad():
             return self.objective.report
 
-    def validate(self, *, check_finite: bool = True) -> None:
+    def validate(self, *, check_finite: bool | None = None) -> None:
         """Check the declared shape and values without reducing or scaling loss."""
         if self.sample_count is not None and (type(self.sample_count) is not int or self.sample_count < 1):
             raise ValueError("sample_count must be a positive integer or None")
@@ -105,8 +106,10 @@ class BatchOutput:
             raise ValueError("loss_fn or a custom step must return a scalar loss; "
                              "reduce it with .mean() or .sum() in your computation")
 
-    def loss_sum(self, *, check_finite: bool = True) -> Tensor:
+    def loss_sum(self, *, check_finite: bool | None = None) -> Tensor:
         """Explicitly convert to a differentiable sum when a caller needs one."""
+        if check_finite is None:
+            check_finite = finite_checks_enabled("loss")
         self.validate(check_finite=check_finite)
         value, weight = self._objective_parts()
         total = value if weight is None else value * float(weight)

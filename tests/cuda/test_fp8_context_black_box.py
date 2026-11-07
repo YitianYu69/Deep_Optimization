@@ -2,12 +2,13 @@
 
 from copy import deepcopy
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from deepopt import autocast
+from deepopt import TrainingRuntime, autocast
 from deepopt.opt.do_nn.functional import do_linear
 from deepopt.opt.policy import fp8_plan
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
@@ -15,6 +16,25 @@ from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
 class FP8ContextCUDABlackBoxTests(unittest.TestCase):
+    def test_runtime_modes_control_real_triton_forward_and_backward_checks(self):
+        model = nn.Linear(65, 37, device="cuda")
+        runtime = TrainingRuntime(model, torch.optim.SGD(model.parameters(), lr=.01), device="cuda",
+                                  fp8={"enabled": True, "backend": "triton"},
+                                  execution_mode="max_speed", mode_schedule={2: "analyze", 3: "max_speed"})
+        for update in range(1, 4):
+            inputs = torch.randn(9, 65, device="cuda", requires_grad=True) * .1
+            if update == 2:
+                loss = runtime.compute(inputs, lambda value: runtime.model(value).square().mean())
+                runtime.backward(loss)
+                runtime.step()
+            else:
+                with patch("torch.isfinite", side_effect=AssertionError("max_speed passive scan")):
+                    loss = runtime.compute(inputs, lambda value: runtime.model(value).square().mean())
+                    runtime.backward(loss)
+                    runtime.step()
+        self.assertEqual(runtime.mode_controller.completed_updates, 3)
+        self.assertTrue(torch.isfinite(runtime.model.weight).all().item())
+
     def test_native_linear_in_combined_bf16_amp_fp8_context_matches_reference_forward_backward(self):
         torch.manual_seed(739)
         model = nn.Linear(65, 37, device="cuda")

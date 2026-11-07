@@ -86,10 +86,11 @@ fullgraph = false
 enabled = false
 backend = "reference"              # reference emulation or triton native CUDA FP8 GEMM.
 trace_mode = "modules"             # modules, full, or auto.
+intercept_linear = true            # false: prepared DO operations only; native F.linear stays dense.
 activation_dtype = "e4m3fn"         # e4m3fn or e5m2.
 weight_dtype = "e4m3fn"             # e4m3fn or e5m2.
 grad_dtype = "e4m3fn"               # e4m3fn or e5m2; each operand chooses independently.
-num_stages = 3                     # Triton pipeline stages: 1, 2, 3, or 4.
+num_stages = "auto"                # Tune Triton stages; 1, 2, 3, or 4 pins the depth.
 # out_dtype = "fp32"               # fp32, bf16, fp16; omit to follow active AMP/input dtype.
 
 [runtime.fp8.block_shapes]

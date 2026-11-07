@@ -1,7 +1,7 @@
 """Compare FP8 classifier implementations on a compatible CUDA GPU.
 
 python benchmarks/benchmark_fp8_autotune.py
-python benchmarks/benchmark_fp8_autotune.py --source src --source /path/to/baseline/src
+python benchmarks/benchmark_fp8_autotune.py --source src --source /path/to/baseline/src --num-stages 3
 
 Each source/scope runs in a fresh process. By default its Triton disk cache is
 also isolated, so first-use latency includes compilation. Warmed timings use
@@ -9,8 +9,9 @@ synchronized wall-clock measurements. No datasets or model downloads are needed.
 """
 
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import json
+from math import isfinite
 import os
 from pathlib import Path
 from statistics import median
@@ -18,12 +19,47 @@ import subprocess
 import sys
 import tempfile
 from time import perf_counter
+from unittest.mock import patch
 
 
 _RESULT_PREFIX = "DEEPOPT_BENCHMARK_RESULT="
 
 
-def _autotune_diagnostics():
+def _config_record(config):
+    return {"tile": dict(config.kwargs), "num_warps": config.num_warps,
+            "num_stages": config.num_stages}
+
+
+@contextmanager
+def _record_autotune_trials():
+    """Record cold-search timings for every key, outside the warmed path."""
+    backend = sys.modules.get("deepopt.opt.backends.triton_fp8")
+    kernel = getattr(backend, "_gemm_nt_kernel", None)
+    trials = {}
+    if kernel is None or not hasattr(kernel, "_bench"):
+        yield trials
+        return
+    original = kernel._bench
+
+    def record(*args, config, **kwargs):
+        all_args = {**kernel.nargs, **kwargs}
+        named = {name: value for name, value in all_args.items() if name in kernel.arg_names}
+        key = (tuple(named[name] for name in kernel.keys if name in named)
+               + tuple(str(value.dtype) for value in named.values() if hasattr(value, "dtype")))
+        timings = original(*args, config=config, **kwargs)
+        samples = timings if isinstance(timings, (list, tuple)) else [timings]
+        trials.setdefault(key, []).append({
+            **_config_record(config),
+            "quantiles_ms": [float(value) if isfinite(value) else None for value in samples],
+            "status": "ok" if all(isfinite(value) for value in samples) else "unavailable",
+        })
+        return timings
+
+    with patch.object(kernel, "_bench", new=record):
+        yield trials
+
+
+def _autotune_diagnostics(trials=None):
     """Read cached winners after timing; older static snapshots need no tuner."""
     backend = sys.modules.get("deepopt.opt.backends.triton_fp8")
     cache = getattr(getattr(backend, "_gemm_nt_kernel", None), "cache", None)
@@ -48,8 +84,39 @@ def _autotune_diagnostics():
             "tile": {name: serializable(value) for name, value in tile.items()},
             "num_warps": serializable(getattr(config, "num_warps", None)),
             "num_stages": serializable(getattr(config, "num_stages", None)),
+            "implicit_dtype_key": [serializable(value) for value in key_values[len(key_names):]],
+            "candidates": (trials or {}).get(key, []),
         })
     return winners
+
+
+def _prepare_gemm_products(x, weight, bias, grad, plan):
+    """Capture each snapshot's real autograd operands without warming GEMMs.
+
+    The explicit upstream gradient determines backward inputs independently of
+    the placeholder forward result. Quantization and saved orientations still
+    execute the source snapshot's own implementation.
+    """
+    import torch
+    from deepopt.opt.do_nn.functional import do_linear
+    from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
+
+    captured = []
+
+    def capture(a, b, **kwargs):
+        captured.append((a, b, kwargs.get("bias"), kwargs["out_dtype"]))
+        return torch.zeros((a.data.shape[0], b.data.shape[0]),
+                           dtype=kwargs["out_dtype"], device=a.data.device)
+
+    try:
+        with patch.object(linear_autograd_func, "gemm_nt", new=capture):
+            do_linear(x, weight, bias, plan=plan).backward(grad)
+    finally:
+        x.grad = weight.grad = bias.grad = None
+    if len(captured) != 3:
+        raise RuntimeError("Expected forward, input-gradient, and weight-gradient GEMMs")
+    return [(name, *product) for name, product in
+            zip(("forward", "input_gradient", "weight_gradient"), captured)]
 
 
 def _measure(operation, torch, device, args):
@@ -89,7 +156,8 @@ def _worker(args):
     import deepopt
     from deepopt.opt.backends import gemm_nt
     from deepopt.opt.do_nn.functional import do_linear
-    from deepopt.opt.quantization.quantizer import quantize_fp8
+    # Load the tuner before measuring so the recorder sees the very first key.
+    from deepopt.opt.backends import triton_fp8  # noqa: F401
 
     torch.manual_seed(42)
     # Initialize the CUDA context before timing any projection.
@@ -103,11 +171,26 @@ def _worker(args):
                 "weight": torch.float8_e4m3fn,
                 "grad": torch.float8_e5m2,
             },
-            "num_stages": 3,
+            "num_stages": args.num_stages,
             "out_dtype": torch.bfloat16,
         },
         "block_shapes": {"activation": (1, 32), "weight": (32, 32), "grad": (32, 32)},
     }
+    with _record_autotune_trials() as trials:
+        rows = _measure_batches(args, torch, device, plan, do_linear, gemm_nt)
+    return {
+        "source": str(args.source[0]),
+        "scope": args.scope,
+        "environment": {"torch": str(torch.__version__), "cuda": torch.version.cuda,
+                        "deepopt_source": str(Path(deepopt.__file__).resolve()),
+                        "gpu": torch.cuda.get_device_name(device),
+                        "capability": torch.cuda.get_device_capability(device)},
+        "timings": rows,
+        "autotune_selections": _autotune_diagnostics(trials),
+    }
+
+
+def _measure_batches(args, torch, device, plan, do_linear, gemm_nt):
     rows = []
     for batch in args.batches:
         x = torch.randn(batch, 512, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -123,33 +206,15 @@ def _worker(args):
             rows.append({"batch": batch, "operation": "forward_backward",
                          **_measure(projection, torch, device, args)})
         else:
-            qx = quantize_fp8(x, fp8_dtype=torch.float8_e4m3fn, block_shape=(1, 32))
-            qw = quantize_fp8(weight, fp8_dtype=torch.float8_e4m3fn, block_shape=(32, 32))
-            qg = quantize_fp8(grad, fp8_dtype=torch.float8_e5m2, block_shape=(32, 32))
-            # Match each autograd GEMM's orientation and result dtype, including
-            # FP32 weight gradients for FP32 master parameters.
-            products = (
-                ("forward", qx, qw, bias, torch.bfloat16),
-                ("input_gradient", qg, qw.transpose(), None, torch.bfloat16),
-                ("weight_gradient", qg.transpose(), qx.transpose(), None, torch.float32),
-            )
+            products = _prepare_gemm_products(x, weight, bias, grad, plan)
             for name, left, right, product_bias, output_dtype in products:
                 def product():
                     return gemm_nt(left, right, backend="triton", bias=product_bias,
-                                   out_dtype=output_dtype, num_stages=3)
+                                   out_dtype=output_dtype, num_stages=args.num_stages)
 
                 rows.append({"batch": batch, "operation": name,
                              **_measure(product, torch, device, args)})
-    return {
-        "source": str(args.source[0]),
-        "scope": args.scope,
-        "environment": {"torch": str(torch.__version__), "cuda": torch.version.cuda,
-                        "deepopt_source": str(Path(deepopt.__file__).resolve()),
-                        "gpu": torch.cuda.get_device_name(device),
-                        "capability": torch.cuda.get_device_capability(device)},
-        "timings": rows,
-        "autotune_selections": _autotune_diagnostics(),
-    }
+    return rows
 
 
 def _run(args):
@@ -162,6 +227,7 @@ def _run(args):
                        "--source", str(source), "--scope", scope, "--device", args.device,
                        "--warmups", str(args.warmups), "--iterations", str(args.iterations),
                        "--repeats", str(args.repeats), "--batches", *map(str, args.batches)]
+            command.extend(["--num-stages", str(args.num_stages)])
             cache = nullcontext(None) if args.reuse_cache else tempfile.TemporaryDirectory(prefix="deepopt-fp8-")
             with cache as cache_dir:
                 environment = os.environ.copy()
@@ -195,6 +261,8 @@ def _run(args):
             "GEMM scope uses prequantized inputs but includes packing, padding, and host dispatch; these are not kernel-only timings.",
             "Forward output and input gradients are BF16; master parameters and weight gradients are FP32.",
             "Autotune selections are inspected after timing; null means the source exposes no compatible tuner cache.",
+            "Candidate quantiles are search-time median/p20/p80 device milliseconds, including split-K reduction when used.",
+            "GEMM operands are captured from each source's actual autograd path before timing.",
         ],
         "results": results,
     }
@@ -206,6 +274,8 @@ def main():
                         help="Directory containing deepopt; repeat to compare snapshots. Defaults to this checkout's src.")
     parser.add_argument("--scope", choices=("both", "linear", "gemm"), default="both")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--num-stages", choices=("auto", "1", "2", "3", "4"), default="auto",
+                        help="Tune pipeline stages by default; use an integer to compare older source snapshots.")
     parser.add_argument("--batches", nargs="+", type=int, default=[2048, 848, 1808],
                         help="Batch sizes; defaults include CIFAR-10 training and validation tails.")
     parser.add_argument("--warmups", type=int, default=10)
@@ -214,6 +284,7 @@ def main():
     parser.add_argument("--reuse-cache", action="store_true", help="Reuse the normal Triton disk cache.")
     parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.num_stages = args.num_stages if args.num_stages == "auto" else int(args.num_stages)
     args.source = [source.resolve() for source in (args.source or [Path(__file__).resolve().parents[1] / "src"])]
     if any(not (source / "deepopt").is_dir() for source in args.source):
         parser.error("Each --source must be a directory containing the deepopt package.")

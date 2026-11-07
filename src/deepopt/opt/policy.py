@@ -30,7 +30,9 @@ def fp8_plan(settings=_UNSET, *, config=None) -> dict:
 
     fp8_types = {"e4m3fn": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
     output_types = {None: None, "fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
-    return {
+    from .do_nn.functional import validate_fp8_plan
+
+    return validate_fp8_plan({
         "fp8_training": {
             "fp8_dtypes": {role: fp8_types[getattr(settings, f"{role}_dtype")]
                            for role in ("activation", "weight", "grad")},
@@ -39,7 +41,7 @@ def fp8_plan(settings=_UNSET, *, config=None) -> dict:
             "out_dtype": output_types[settings.out_dtype],
         },
         "block_shapes": dict(settings.block_shapes),
-    }
+    })
 
 
 def resolve_fp8_config(model, settings=_UNSET, *, config=None) -> FP8Config:

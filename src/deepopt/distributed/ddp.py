@@ -76,19 +76,28 @@ class DDPCore:
             self.wrapper = DistributedDataParallel(
                 _StepModule(model), device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 **self.options)
+        if self.fp8.enabled:
+            from deepopt.opt.do_nn._cached_weights import CachedWeightModule
+
+            # DDP's initial parameter broadcast can replace rank-local values
+            # after a caller has already warmed an adapter's weight cache.
+            for module in model.modules():
+                if isinstance(module, CachedWeightModule):
+                    module.clear_fp8_cache()
         if not self.validation_sync_buffers:
             self.options["validation_sync_buffers"] = False
         self._config_snapshot.setdefault("runtime", {})["fp8"] = asdict(self.fp8)
         self._config_snapshot["runtime"]["ddp"] = deepcopy(self.options)
+        from deepopt.opt._autocast import _FP8Scope
+
+        self._fp8_scope = _FP8Scope(self.device.type, self.fp8 if self.fp8.enabled else None)
 
     @property
     def config(self):
         return deepcopy(self._config_snapshot)
 
     def compute(self, batch, step):
-        from deepopt.opt._autocast import fp8_context
-
-        with fp8_context(self.device.type, self.fp8 if self.fp8.enabled else None):
+        with self._fp8_scope.enter():
             if self.wrapper is not None and self.model.training and torch.is_grad_enabled():
                 result = self.wrapper(batch, step)
                 self.forward_pending = True
@@ -130,7 +139,10 @@ class DDPCore:
             checks.observe(kind, tensors, name=name)
 
     def interested(self, checks, kind):
-        return checks.allows(kind) and (self._observer_interests is None or kind in self._observer_interests)
+        # All ranks join the union's observer slots even if local legacy checks
+        # are disabled. Local observer execution remains independently gated.
+        return (checks.allows(kind, collective=True)
+                and (self._observer_interests is None or kind in self._observer_interests))
 
     def configure_checks(self, checks, configuration):
         distributed.require_equal(configuration, "diagnostic policy and mode schedule")

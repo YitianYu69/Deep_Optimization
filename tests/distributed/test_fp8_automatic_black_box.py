@@ -39,6 +39,10 @@ class AutomaticFP8DistributedBlackBoxTests(unittest.TestCase):
         rows = self.run_workers("mismatch")
         self.assertEqual(rows, [{"mismatch_rejected": ["runtime", "core"], "world_size": 2}])
 
+    def test_fp8_forward_and_backward_cadences_match_on_every_rank(self):
+        self.assertEqual(self.run_workers("modes"),
+                         [{"fp8_mode_cadence": True, "world_size": 2, "updates": 6}])
+
 
 if __name__ == "__main__":
     unittest.main()

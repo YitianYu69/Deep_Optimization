@@ -74,14 +74,9 @@ def block_amax_scalar_kernel(
     mask = (row_offsets[:, None] < M) & (col_offsets[None, :] < N)
 
     x = tl.load(x_ptrs, mask=mask, other=0.0)
-    amax = tl.maximum(tl.max(tl.abs(x)), 1e-12)
-
-    if amax != 0:
-        scalar = FP8_MAX / amax
-        scalar_inv = 1 / scalar
-    else:
-        scalar = 1.0
-        scalar_inv = 1.0
+    amax = tl.max(tl.abs(x))
+    scalar = tl.where(amax == 0, 1.0, FP8_MAX / tl.maximum(amax, 1e-12))
+    scalar_inv = 1.0 / scalar
 
     tl.store(scalar_ptr + pid, scalar)
     tl.store(scalar_inv_ptr + pid, scalar_inv)
@@ -133,7 +128,7 @@ def global_amax_kernel(
     mask = offs < N
 
     x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-    amax = tl.maximum(tl.max(tl.abs(x)), 1e-12)
+    amax = tl.max(tl.abs(x))
     tl.atomic_max(amax_ptr, amax)
 
 
@@ -150,10 +145,7 @@ def global_amax_scalar(x, fp8_max):
       N=N,
     )
 
-    if amax != 0:
-        scalar = fp8_max / amax
-    else:
-        scalar = 1.0
-    scalar_inv = 1 / scalar
+    scalar = torch.where(amax == 0, torch.ones_like(amax), fp8_max / amax.clamp_min(1e-12))
+    scalar_inv = scalar.reciprocal()
 
     return scalar, scalar_inv

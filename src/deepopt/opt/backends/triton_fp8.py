@@ -7,8 +7,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..quantization.tensor import QuantizedTensor
 from ._triton_autotune import (
-    AUTOTUNE_KEY, AUTOTUNE_TILES, MAX_BLOCK_K,
-    prune_gemm_configs, set_descriptor_block_shapes,
+    AUTOTUNE_KEY, AUTOTUNE_TILES, MAX_BLOCK_K, SPLIT_K_CHOICES,
+    autotune_cache_key, prune_gemm_configs, set_descriptor_block_shapes, split_k_enabled,
 )
 
 
@@ -19,25 +19,59 @@ def _benchmark_gemm(kernel_call, quantiles):
     # The benchmark uses a separate stream; packing/scale copies on the caller's
     # stream must finish first. Only the already-prepared GEMM is captured.
     torch.cuda.synchronize()
-    return do_bench_cudagraph(kernel_call, rep=5, quantiles=quantiles)
+    return do_bench_cudagraph(kernel_call, rep=20, quantiles=quantiles)
+
+
+@triton.jit
+def _reduce_split_k(partials_ptr, output_ptr, bias_ptr, M, N,
+                    OUTPUT_STRIDE: tl.constexpr, SPLIT_K: tl.constexpr,
+                    HAS_BIAS: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    rows, cols = offsets // N, offsets % N
+    splits = tl.arange(0, SPLIT_K)
+    addresses = (splits[:, None] * M * OUTPUT_STRIDE
+                 + rows[None, :] * OUTPUT_STRIDE + cols[None, :])
+    partials = tl.load(partials_ptr + addresses, mask=offsets[None, :] < M * N, other=0.0)
+    values = tl.sum(partials, axis=0)
+    if HAS_BIAS:
+        values += tl.load(bias_ptr + cols, mask=offsets < M * N, other=0.0).to(tl.float32)
+    tl.store(output_ptr + rows * OUTPUT_STRIDE + cols, values, mask=offsets < M * N)
+
+
+def _finish_gemm(args, exception=None):
+    """Benchmark post-hook; the wrapper also calls it after the winning launch.
+
+    Triton's autotuner invokes its post-hook only during benchmarking. Including
+    the reduction here makes split and unsplit timings directly comparable.
+    """
+    if exception is None and args["SPLIT_K"] > 1:
+        _reduce_split_k[(triton.cdiv(args["M"] * args["N"], 256),)](
+            args["partials_ptr"], args["output_ptr"], args["bias_ptr"], args["M"], args["N"],
+            OUTPUT_STRIDE=args["OUTPUT_STRIDE"], SPLIT_K=args["SPLIT_K"],
+            HAS_BIAS=args["HAS_BIAS"], BLOCK_SIZE=256, num_warps=4, num_stages=1,
+        )
 
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk},
+        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk,
+                       "NUM_STAGES": stages, "SPLIT_K": split},
                       num_warps=warps, num_stages=stages, pre_hook=set_descriptor_block_shapes)
         for bm, bn, bk, warps in AUTOTUNE_TILES
         for stages in (1, 2, 3, 4)
+        for split in SPLIT_K_CHOICES
     ],
     key=list(AUTOTUNE_KEY),
     prune_configs_by={"early_config_prune": prune_gemm_configs},
     do_bench=_benchmark_gemm,
+    post_hook=_finish_gemm,
 )
 @triton.jit
 def _gemm_nt_kernel(
     a_desc, b_desc, c_desc,
     a_scale_inv_ptr, b_scale_inv_ptr,
     bias_ptr,
+    partials_ptr, output_ptr,
     M, N, K,
     A_BLOCK_ROWS: tl.constexpr, A_BLOCK_COLS: tl.constexpr,
     B_BLOCK_ROWS: tl.constexpr, B_BLOCK_COLS: tl.constexpr,
@@ -48,9 +82,11 @@ def _gemm_nt_kernel(
     OUTPUT_DTYPE: tl.constexpr,
     A_FP8_FORMAT: tl.constexpr, B_FP8_FORMAT: tl.constexpr,
     DEVICE_INDEX: tl.constexpr, DEVICE_CAPABILITY: tl.constexpr,
+    NUM_SMS: tl.constexpr, OUTPUT_STRIDE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    PIPELINE_STAGES: tl.constexpr
+    PIPELINE_STAGES: tl.constexpr,
+    NUM_STAGES: tl.constexpr, SPLIT_K: tl.constexpr,
 ):
 
     start_m = tl.program_id(0) * BLOCK_M
@@ -60,7 +96,7 @@ def _gemm_nt_kernel(
     cols = start_n + tl.arange(0, BLOCK_N)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k_tile in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=PIPELINE_STAGES):
+    for k_tile in tl.range(tl.program_id(2), tl.cdiv(K, BLOCK_K), SPLIT_K, num_stages=NUM_STAGES):
         start_k = k_tile * BLOCK_K
 
         a_tile = a_desc.load([start_m, start_k])
@@ -101,12 +137,19 @@ def _gemm_nt_kernel(
         b_scale_inv = tl.load(b_scale_inv_ptr)
         acc = (acc * a_scale_inv) * b_scale_inv
 
-    if HAS_BIAS:
+    if HAS_BIAS and SPLIT_K == 1:
         cols = start_n + tl.arange(0, BLOCK_N)
         bias = tl.load(bias_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
         acc = acc + bias[None, :]
     
-    c_desc.store([start_m, start_n], acc.to(OUTPUT_DTYPE))
+    if SPLIT_K == 1:
+        c_desc.store([start_m, start_n], acc.to(OUTPUT_DTYPE))
+    else:
+        # Each CTA owns its partial tile; every valid element is overwritten on
+        # every invocation. No clearing or nondeterministic atomics are needed.
+        addresses = (tl.program_id(2) * M * OUTPUT_STRIDE
+                     + rows[:, None] * OUTPUT_STRIDE + cols[None, :])
+        tl.store(partials_ptr + addresses, acc, mask=(rows[:, None] < M) & (cols[None, :] < N))
 
 
 
@@ -138,7 +181,7 @@ def gemm_nt(
     *,
     out_dtype: torch.dtype = torch.float32,
     bias: torch.Tensor | None = None,
-    num_stages: int = 3,
+    num_stages: int | str = "auto",
 ) -> torch.Tensor:
 
     """
@@ -158,8 +201,8 @@ def gemm_nt(
         raise ValueError("This backend requires compute cabaility >= 9")
     if a.data.shape[1] != b.data.shape[1]:
         raise ValueError("Operands must have the same reduction dimension")
-    if type(num_stages) is not int or num_stages not in (1, 2, 3, 4):
-        raise ValueError("num_stages must be 1, 2, 3, 4")
+    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4)):
+        raise ValueError("num_stages must be 'auto', 1, 2, 3, or 4")
     
     output_types = {
         torch.float32 : tl.float32,
@@ -222,15 +265,10 @@ def gemm_nt(
         )
 
         bias_arg = output_storage if bias is None else bias.contiguous()
-
         def grid(meta):
-            return (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]))
+            return (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]), meta["SPLIT_K"])
 
-        _gemm_nt_kernel[grid](
-            a_desc, b_desc, c_desc,
-            a_scale_inv, b_scale_inv,
-            bias_arg,
-            m, n, k,
+        launch_args = dict(
             A_BLOCK_ROWS=a_block_rows, A_BLOCK_COLS=a_block_cols,
             B_BLOCK_ROWS=b_block_rows, B_BLOCK_COLS=b_block_cols,
             A_SCALE_COLS=a_scale_inv.shape[1], B_SCALE_COLS=b_scale_inv.shape[1],
@@ -240,7 +278,27 @@ def gemm_nt(
             OUTPUT_DTYPE=output_types[out_dtype],
             A_FP8_FORMAT=str(a.data.dtype), B_FP8_FORMAT=str(b.data.dtype),
             DEVICE_INDEX=torch.cuda.current_device(), DEVICE_CAPABILITY=capability[0] * 10 + capability[1],
-            PIPELINE_STAGES=num_stages,
+            NUM_SMS=torch.cuda.get_device_properties(a.data.device).multi_processor_count,
+            OUTPUT_STRIDE=padded_n,
+            PIPELINE_STAGES=0 if num_stages == "auto" else num_stages,
         )
+        # A dummy FP32 pointer keeps the implicit dtype key identical with and
+        # without scratch. Cached unsplit winners allocate no partial buffer;
+        # cached split winners need only their chosen number of planes.
+        positional = (a_desc, b_desc, c_desc, a_scale_inv, b_scale_inv,
+                      bias_arg, a_scale_inv, output_storage, m, n, k)
+        named = {**dict(zip(_gemm_nt_kernel.arg_names, positional)), **launch_args}
+        cached = _gemm_nt_kernel.cache.get(autotune_cache_key(named))
+        splits = cached.kwargs["SPLIT_K"] if cached is not None else max(SPLIT_K_CHOICES)
+        partials = (torch.empty((splits, m, padded_n), device=a.data.device, dtype=torch.float32)
+                    if splits > 1 and split_k_enabled(m, n, k) else a_scale_inv)
+        _gemm_nt_kernel[grid](
+            a_desc, b_desc, c_desc, a_scale_inv, b_scale_inv,
+            bias_arg, partials, output_storage, m, n, k, **launch_args,
+        )
+        if _gemm_nt_kernel.best_config.kwargs["SPLIT_K"] > 1:
+            _finish_gemm({**launch_args, **_gemm_nt_kernel.best_config.kwargs,
+                          "partials_ptr": partials, "output_ptr": output_storage,
+                          "bias_ptr": bias_arg, "M": m, "N": n})
     
     return output

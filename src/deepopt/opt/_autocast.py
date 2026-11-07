@@ -1,21 +1,23 @@
 """Scoped native AMP and FP8 linear execution, without modifying model classes."""
 
-from contextlib import ContextDecorator, ExitStack, contextmanager
+from contextlib import ContextDecorator, ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from collections.abc import Mapping
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import asdict
 
 import torch
 from torch.nn import functional as F
-from torch.overrides import TorchFunctionMode
+from torch.overrides import TorchFunctionMode, _get_current_function_mode, _pop_mode_temporarily
 from deepopt._config_resolution import _UNSET, resolve_config
 from deepopt.config import FP8Config
+from ._execution import finite_check_scope
 
 
 # Values are normalized operation plans or False (explicit dense override).
 # Missing device keys mean that an existing DO operation keeps its own plan.
 _active_fp8 = ContextVar("deepopt_active_fp8", default={})
+_active_interception = ContextVar("deepopt_fp8_linear_interception", default={})
 _autocast_entries = ContextVar("deepopt_autocast_entries", default=())
 _FLOAT_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
@@ -50,7 +52,8 @@ class _FP8LinearMode(TorchFunctionMode):
             arguments = _linear_arguments(args, kwargs)
             if arguments is not None:
                 plan = _get_fp8_plan(arguments[0].device.type)
-                if plan is not None and plan is not False:
+                if (plan is not None and plan is not False
+                        and _active_interception.get().get(arguments[0].device.type, True)):
                     from .do_nn.functional import do_linear
 
                     return do_linear(*arguments, plan=plan)
@@ -58,44 +61,65 @@ class _FP8LinearMode(TorchFunctionMode):
 
 
 @contextmanager
-def fp8_context(device_type, fp8=_UNSET, *, config=None):
-    """Apply only FP8 policy; preserve ambient native AMP for core composition.
+def _suspend_fp8_interception():
+    """Skip our broad dispatcher inside an already-selected FP8 operation.
 
-    Omitted policy inherits an outer scope or the selected configuration.
-    None inherits only the surrounding policy. False explicitly disables FP8, also
-    for existing DO modules. A dictionary enables FP8 unless enabled=False.
+    Other user modes and tensor subclass handlers remain active. If a user mode
+    is above ours, leave its stack intact instead of disabling all Torch modes.
     """
-    if fp8 is None:
-        yield
-        return
-
-    from .policy import fp8_plan, normalize_fp8_config
-
-    if fp8 is _UNSET and _get_fp8_plan(device_type) is not None:
-        yield
-        return
-    if isinstance(fp8, FP8Config):
-        settings = normalize_fp8_config(fp8)
-    else:
-        settings = normalize_fp8_config({"enabled": True, **fp8} if isinstance(fp8, Mapping) else fp8,
-                                        config=config)
-    if fp8 is _UNSET and not settings.enabled:
-        yield
-        return
-    if settings.enabled and device_type not in ("cpu", "cuda"):
-        raise ValueError("FP8 autocast supports CPU and CUDA devices")
-    plan = fp8_plan(settings) if settings.enabled else False
-    previous = _active_fp8.get()
-    if previous.get(device_type) == plan:
-        # Runtime and core may independently scope the same policy.
-        yield
-        return
-    token = _active_fp8.set({**previous, device_type: plan})
-    try:
-        with _FP8LinearMode():
+    if isinstance(_get_current_function_mode(), _FP8LinearMode):
+        with _pop_mode_temporarily():
             yield
-    finally:
-        _active_fp8.reset(token)
+    else:
+        yield
+
+
+class _FP8Scope:
+    """Resolve once; each entry owns only its context token and mode lifetime."""
+
+    def __init__(self, device_type, fp8=_UNSET, *, config=None):
+        self.device_type = device_type
+        self.inherit_outer = fp8 is _UNSET
+        self.plan = None
+        self.intercept_linear = True
+        if fp8 is None:
+            return
+        from .policy import fp8_plan, normalize_fp8_config
+
+        settings = normalize_fp8_config(
+            {"enabled": True, **fp8} if isinstance(fp8, Mapping) else fp8, config=config)
+        if fp8 is _UNSET and not settings.enabled:
+            return
+        if settings.enabled and device_type not in ("cpu", "cuda"):
+            raise ValueError("FP8 autocast supports CPU and CUDA devices")
+        from .do_nn.functional import _prepare_fp8_plan
+
+        self.plan = _prepare_fp8_plan(fp8_plan(settings)) if settings.enabled else False
+        self.intercept_linear = settings.intercept_linear
+
+    @contextmanager
+    def enter(self):
+        previous = _active_fp8.get()
+        previous_interception = _active_interception.get()
+        if (self.plan is None or (self.inherit_outer and previous.get(self.device_type) is not None)
+                or (previous.get(self.device_type) == self.plan
+                    and previous_interception.get(self.device_type) == self.intercept_linear)):
+            yield
+            return
+        token = _active_fp8.set({**previous, self.device_type: self.plan})
+        interception_token = _active_interception.set({**previous_interception,
+                                                      self.device_type: self.intercept_linear})
+        try:
+            with _FP8LinearMode() if self.intercept_linear else nullcontext():
+                yield
+        finally:
+            _active_interception.reset(interception_token)
+            _active_fp8.reset(token)
+
+
+def fp8_context(device_type, fp8=_UNSET, *, config=None):
+    """Apply FP8 policy, preserving ambient AMP and explicit disable/inherit."""
+    return _FP8Scope(device_type, fp8, config=config).enter()
 
 
 class autocast(ContextDecorator):
@@ -115,7 +139,11 @@ class autocast(ContextDecorator):
     not suspend an active scope across interleaved async tasks or generators.
     """
 
-    def __init__(self, device_type, dtype=_UNSET, enabled=_UNSET, cache_enabled=None, fp8=_UNSET, *, config=None):
+    def __init__(self, device_type, dtype=_UNSET, enabled=_UNSET, cache_enabled=None, fp8=_UNSET,
+                 *, config=None, check_finite=None):
+        if check_finite is not None and type(check_finite) is not bool:
+            raise TypeError("check_finite must be a boolean or None")
+        self.check_finite = check_finite
         self.device_type = device_type
         self.dtype = dtype
         self.enabled = enabled
@@ -130,10 +158,12 @@ class autocast(ContextDecorator):
             explicit_fp8 = {"enabled": fp8}
         overrides = None if explicit_fp8 is _UNSET else {"runtime": {"fp8": explicit_fp8}}
         self.config = resolve_config(config, overrides=overrides)
+        self._fp8_scope = _FP8Scope(device_type, self.fp8, config=self.config)
 
     def _recreate_cm(self):
-        return type(self)(self.device_type, dtype=self.dtype, enabled=self.enabled,
-                          cache_enabled=self.cache_enabled, fp8=self.fp8, config=self.config)
+        # Entries store their state in context variables, so decorators can
+        # reuse the resolved immutable policy without resolving configuration.
+        return copy(self)
 
     def __enter__(self):
         stack = ExitStack()
@@ -149,7 +179,9 @@ class autocast(ContextDecorator):
                          torch.bfloat16 if precision == "bf16" else None)
             stack.enter_context(torch.autocast(self.device_type, dtype=dtype,
                                                enabled=enabled, cache_enabled=self.cache_enabled))
-            stack.enter_context(fp8_context(self.device_type, self.fp8, config=self.config))
+            if self.check_finite is not None:
+                stack.enter_context(finite_check_scope(self.check_finite))
+            stack.enter_context(self._fp8_scope.enter())
         except BaseException:
             stack.close()
             raise
