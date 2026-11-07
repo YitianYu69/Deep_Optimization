@@ -2,10 +2,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .functional import do_linear, validate_fp8_plan
+from .functional import do_linear, _prepare_fp8_plan
+from ._cached_weights import CachedWeightModule
 
 
-class DOMultiheadAttention(nn.Module):
+class DOMultiheadAttention(CachedWeightModule):
     def __init__(self, original: nn.MultiheadAttention, *, plan: dict):
         super().__init__()
 
@@ -16,7 +17,7 @@ class DOMultiheadAttention(nn.Module):
         if original.add_zero_attn:
             raise NotImplementedError("add_zero_attn is not supported yet")
         
-        self.plan = validate_fp8_plan(plan)
+        self.plan = _prepare_fp8_plan(plan)
 
         self.embed_dim = original.embed_dim
         self.num_heads = original.num_heads
@@ -55,7 +56,7 @@ class DOMultiheadAttention(nn.Module):
                 packed = do_linear(
                     query,
                     self.in_proj_weight, self.in_proj_bias,
-                    plan=self.plan
+                    plan=self.plan, _weight_cache=self._fp8_weight_cache,
                 )
                 return packed.chunk(3, dim=-1)
             weights = self.in_proj_weight.chunk(3, dim=0)
@@ -72,13 +73,13 @@ class DOMultiheadAttention(nn.Module):
             biases = self.in_proj_bias.chunk(3, dim=0)
         
         q = do_linear(
-            query, weights[0], biases[0], plan=self.plan
+            query, weights[0], biases[0], plan=self.plan, _weight_cache=self._fp8_weight_cache,
         )
         k = do_linear(
-            key, weights[1], biases[1], plan=self.plan
+            key, weights[1], biases[1], plan=self.plan, _weight_cache=self._fp8_weight_cache,
         )
         v = do_linear(
-            value, weights[2], biases[2], plan=self.plan
+            value, weights[2], biases[2], plan=self.plan, _weight_cache=self._fp8_weight_cache,
         )
         return q, k, v
 
@@ -242,7 +243,7 @@ class DOMultiheadAttention(nn.Module):
         attended = attended.transpose(1, 2).reshape(batch_size, target_length, self.embed_dim)
         output = do_linear(
             attended, self.out_proj.weight, self.out_proj.bias,
-            plan=self.plan
+            plan=self.plan, _weight_cache=self._fp8_weight_cache,
         )
 
         if weights is not None and average_attn_weights:

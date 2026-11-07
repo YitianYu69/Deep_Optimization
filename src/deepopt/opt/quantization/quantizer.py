@@ -6,6 +6,7 @@ import torch
 
 from ..scaling_strategy.amax import AmaxScaling
 from .tensor import QuantizedTensor
+from .._execution import finite_checks_enabled
 
 
 @torch.no_grad()
@@ -13,14 +14,16 @@ def quantize_fp8(
     x: torch.Tensor,
     *,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
-    block_shape: tuple[int, int] | None = None
+    block_shape: tuple[int, int] | None = None,
+    check_finite: bool | None = None,
 ):
     """
     Quantize a non-empty 2D matrix with tensor-wise or block-wise scales.
     """
 
     scaling = AmaxScaling(block_shape=block_shape).compute(
-        x, fp8_dtype=fp8_dtype
+        x, fp8_dtype=fp8_dtype,
+        check_finite=finite_checks_enabled() if check_finite is None else check_finite,
     )
 
     x_fp32 = x.float()

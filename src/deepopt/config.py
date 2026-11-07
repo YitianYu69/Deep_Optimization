@@ -53,8 +53,9 @@ class FP8Config:
     block_shapes: dict[str, tuple[int, int] | None] = field(
         default_factory=lambda: {role: None for role in ("activation", "weight", "grad")}
     )
-    num_stages: int = 3
+    num_stages: int | str = "auto"
     out_dtype: str | None = None
+    intercept_linear: bool = True
 
 
 @dataclass(frozen=True)
@@ -413,7 +414,7 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     """Validate FP8 settings without importing Torch or loading a GPU backend."""
     _require_keys(raw, set(), "runtime.fp8", {
         "enabled", "backend", "trace_mode", "activation_dtype", "weight_dtype",
-        "grad_dtype", "block_shapes", "num_stages", "out_dtype",
+        "grad_dtype", "block_shapes", "num_stages", "out_dtype", "intercept_linear",
     })
     raw = _copy_tables(raw)
     enabled = raw.get("enabled", False)
@@ -425,14 +426,19 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     trace_mode = raw.get("trace_mode", "modules")
     if trace_mode not in ("full", "modules", "auto"):
         raise ConfigError("runtime.fp8.trace_mode must be full, modules, or auto")
+    intercept_linear = raw.get("intercept_linear", True)
+    if type(intercept_linear) is not bool:
+        raise ConfigError("runtime.fp8.intercept_linear must be a boolean")
     roles = ("activation", "weight", "grad")
     dtypes = {role: raw.get(f"{role}_dtype", "e4m3fn") for role in roles}
     for role, dtype in dtypes.items():
         if dtype not in ("e4m3fn", "e5m2"):
             raise ConfigError(f"runtime.fp8.{role}_dtype must be e4m3fn or e5m2")
-    stages = _integer(raw.get("num_stages", 3), "runtime.fp8.num_stages", 1)
-    if stages > 4:
-        raise ConfigError("runtime.fp8.num_stages must be 1, 2, 3, or 4")
+    stages = raw.get("num_stages", "auto")
+    if stages != "auto":
+        stages = _integer(stages, "runtime.fp8.num_stages", 1)
+        if stages > 4:
+            raise ConfigError("runtime.fp8.num_stages must be 'auto', 1, 2, 3, or 4")
     out_dtype = raw.get("out_dtype")
     if out_dtype not in (None, "fp32", "bf16", "fp16"):
         raise ConfigError("runtime.fp8.out_dtype must be fp32, bf16, fp16, or null")
@@ -447,6 +453,7 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
             shape = tuple(_integer(size, f"runtime.fp8.block_shapes.{role}", 1) for size in shape)
         block_shapes[role] = shape
     return FP8Config(enabled=enabled, backend=backend, trace_mode=trace_mode,
+                     intercept_linear=intercept_linear,
                      activation_dtype=dtypes["activation"], weight_dtype=dtypes["weight"],
                      grad_dtype=dtypes["grad"], block_shapes=block_shapes,
                      num_stages=stages, out_dtype=out_dtype)

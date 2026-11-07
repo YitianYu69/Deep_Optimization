@@ -6,10 +6,17 @@ protocol. Omitting a policy preserves the legacy checks=True/False behavior.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from typing import Any, Mapping, cast
+from typing import Any, Mapping
+
+from deepopt._diagnostics import CheckPhase, FiniteChecks, execution_check_scope
+
+
+_CHECKS_ON = FiniteChecks(True, True, True, True)
+_CHECKS_OFF = FiniteChecks(False, False, False, False)
 
 
 class ExecutionMode(StrEnum):
@@ -112,8 +119,25 @@ class ModeController:
             return policy.inspect_activations
         return kind == "metrics" or policy.mode == ExecutionMode.ANALYZE
 
-    def scope(self, name: str) -> AbstractContextManager[object]:
-        if self.policy is not None and self.policy.mode == ExecutionMode.ANALYZE:
-            from torch.profiler import record_function
-            return cast(AbstractContextManager[object], record_function(name))
-        return nullcontext()
+    def finite_checks(self, *, legacy_checks: bool = True) -> FiniteChecks:
+        """Use the same optimizer-update cadence inside lower-level operations."""
+        policy = self.policy
+        if policy is None:
+            return _CHECKS_ON if legacy_checks else _CHECKS_OFF
+        if policy.mode == ExecutionMode.MAX_SPEED:
+            return _CHECKS_OFF
+        loss, gradients = self.permits("loss"), self.permits("gradients")
+        return FiniteChecks(loss or policy.inspect_weights or policy.inspect_activations,
+                            gradients, loss, self.permits("report"))
+
+    @contextmanager
+    def scope(self, name: str, *, legacy_checks: bool = True,
+              phase: CheckPhase = "forward") -> Iterator[None]:
+        with execution_check_scope(self.finite_checks(legacy_checks=legacy_checks), phase,
+                                   self.permits if self.policy is not None else None):
+            if self.policy is not None and self.policy.mode == ExecutionMode.ANALYZE:
+                from torch.profiler import record_function
+                with record_function(name):
+                    yield
+            else:
+                yield

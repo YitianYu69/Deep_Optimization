@@ -41,6 +41,29 @@ class CountingGradients(GradientStrategy):
 
 
 class MemoryEstimationTests(unittest.TestCase):
+    def test_fp8_probe_uses_max_speed_checks_without_changing_source_policy_or_cache(self):
+        from deepopt import autocast
+        from deepopt.opt._execution import finite_checks_enabled
+
+        model = nn.Linear(3, 2)
+        trainer = Trainer(model, torch.optim.SGD(model.parameters(), lr=.01),
+                          loss_fn=F.mse_loss, fp8=True, execution_mode="analyze")
+        sample = (torch.randn(2, 3), torch.randn(2, 2))
+        with torch.no_grad():
+            trainer.model(sample[0])  # Populate a real adapter cache before probing.
+        cache = tuple(trainer.model._fp8_weight_cache._entries.items())
+        weights = copy.deepcopy(trainer.model.state_dict())
+        with autocast("cpu", enabled=False, fp8=True, check_finite=True):
+            estimate = estimate_training_memory(trainer, sample)
+            self.assertTrue(finite_checks_enabled())
+        self.assertGreater(estimate.peak_bytes_by_device["cpu"], 0)
+        model_bytes = sum(parameter.numel() * parameter.element_size() for parameter in trainer.model.parameters())
+        self.assertGreater(estimate.persistent_bytes_by_device["cpu"], model_bytes)
+        self.assertEqual(trainer.execution_mode, "analyze")
+        self.assertEqual(tuple(trainer.model._fp8_weight_cache._entries.items()), cache)
+        for name, value in weights.items():
+            torch.testing.assert_close(trainer.model.state_dict()[name], value, rtol=0, atol=0)
+
     def assert_nested_equal(self, actual, expected):
         if isinstance(expected, torch.Tensor):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)

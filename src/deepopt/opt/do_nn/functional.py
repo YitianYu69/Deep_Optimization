@@ -1,7 +1,7 @@
 import torch
 from torch.nn import functional as F
 
-from .._autocast import _get_fp8_plan
+from .._autocast import _get_fp8_plan, _suspend_fp8_interception
 from ..scaling_strategy.amax import AmaxScaling
 from .AOTAutograd_Func.linear_autograd_func import _DOLinearFunction
 
@@ -23,9 +23,39 @@ _OPERANDS = (
 )
 
 
+class _FrozenPlan(dict):
+    """Owned immutable dictionaries retain the public dict/equality contract."""
+
+    def __init__(self, values):
+        dict.__init__(self, ((name, _FrozenPlan(value) if isinstance(value, dict) else value)
+                            for name, value in values.items()))
+
+    def _immutable(self, *args, **kwargs):
+        raise TypeError("Validated FP8 plans are immutable; validate a new plan to change policy")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return type(self), (dict(self),)
+
+
+class _ValidatedFP8Plan(_FrozenPlan):
+    pass
+
+
+def _prepare_fp8_plan(plan):
+    """Keep the public mutable-plan API; freeze only an internal execution copy."""
+    if isinstance(plan, _ValidatedFP8Plan):
+        return plan
+    return _ValidatedFP8Plan(validate_fp8_plan(plan))
+
+
 def validate_fp8_plan(plan: dict) -> dict:
     """
-    Return a validated, independently owned plan with explicit defaults.
+    Return a validated, independently owned mutable plan with explicit defaults.
     """
 
     if not isinstance(plan, dict):
@@ -83,10 +113,10 @@ def validate_fp8_plan(plan: dict) -> dict:
             "backend must be 'reference' or 'triton'"
         )
 
-    num_stages = training.get("num_stages", 3)
+    num_stages = training.get("num_stages", "auto")
 
-    if (type(num_stages) is not int or num_stages not in (1, 2, 3, 4)):
-        raise ValueError("num_stages must be 1, 2, 3, or 4")
+    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4)):
+        raise ValueError("num_stages must be 'auto', 1, 2, 3, or 4")
 
     out_dtype = training.get("out_dtype")
     if out_dtype is not None:
@@ -112,7 +142,7 @@ def validate_fp8_plan(plan: dict) -> dict:
 def do_linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
     *,
-    plan: dict
+    plan: dict, _weight_cache=None,
 ) -> torch.Tensor:
     """Run FP8 projection/autograd eagerly inside an otherwise compiled model.
 
@@ -122,12 +152,17 @@ def do_linear(
     compile with fullgraph=False. Triton kernels retain their own compilation.
     """
 
+    with _suspend_fp8_interception():
+        return _do_linear(x, weight, bias, plan=plan, weight_cache=_weight_cache)
+
+
+def _do_linear(x, weight, bias, *, plan, weight_cache):
     active_plan = _get_fp8_plan(x.device.type) if isinstance(x, torch.Tensor) else None
     if active_plan is False:
         return F.linear(x, weight, bias)
     if active_plan is not None:
         plan = active_plan
-    checked_plan = validate_fp8_plan(plan)
+    checked_plan = _prepare_fp8_plan(plan)
     training = checked_plan["fp8_training"]
 
     tensors = {
@@ -175,5 +210,7 @@ def do_linear(
     
     return _DOLinearFunction.apply(
         x, weight, bias,
-        checked_plan, out_dtype
+        checked_plan, out_dtype,
+        torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors.values()),
+        weight_cache,
     )

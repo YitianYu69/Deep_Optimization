@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F 
 
+from .._execution import finite_checks_enabled
+
 
 def is_not_power_of_2(n: int) -> bool:
     return n <= 0 or (n & (n - 1)) != 0
@@ -38,7 +40,12 @@ class AmaxScaling:
             raise ValueError("block_shape must be None or a tuple of two positive integers")
 
     @torch.no_grad()
-    def compute(self, x: torch.Tensor, fp8_dtype: torch.dtype = torch.float8_e4m3fn) -> ScalingResult:
+    def compute(self, x: torch.Tensor, fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+                *, check_finite: bool | None = None) -> ScalingResult:
+        if check_finite is None:
+            check_finite = finite_checks_enabled()
+        if type(check_finite) is not bool:
+            raise TypeError("check_finite must be a boolean")
         if x.ndim != 2:
             raise ValueError("AmaxScaling excepts a 2D tensor")
         if x.numel() == 0:
@@ -58,7 +65,7 @@ class AmaxScaling:
                 raise ValueError("block_shape must be powers of two")
 
         x_fp32 = x.float()
-        if not torch.isfinite(x_fp32).all():
+        if check_finite and not torch.isfinite(x_fp32).all():
             raise ValueError("AmaxScaling requires finite inputs")
         
         fp8_max = torch.finfo(fp8_dtype).max

@@ -72,7 +72,8 @@ class EpochRunner:
                         output = self.runtime.compute(batch, self.steps.training_step)
                     if self.runtime.diagnostics is None:
                         self.runtime.observe("loss", output.loss, name="loss")
-                    with distributed.collective_errors("metric update"):
+                    with self.runtime.diagnostic_scope("deepopt.metrics", phase="report"), \
+                         distributed.collective_errors("metric update"):
                         progress.metrics.update(output)
                     updated = window.backward(output)
                 if progress.samples is not None:
@@ -88,7 +89,8 @@ class EpochRunner:
                 raise ValueError("Training loader is empty")
             if window.flush():
                 after_update()
-            results = self.metrics.compute(progress.metrics, observe=self.runtime.observe)
+            with self.runtime.diagnostic_scope("deepopt.metrics", phase="report"):
+                results = self.metrics.compute(progress.metrics, observe=self.runtime.observe)
         finally:
             self.runtime.zero_grad()
         self.runtime.synchronize()
@@ -113,7 +115,8 @@ class EpochRunner:
             for batch in loader:
                 output = self.runtime.compute(batch, self.steps.validation_step)
                 self.runtime.observe("loss", output.loss, name="loss")
-                metrics.update(output)
+                with self.runtime.diagnostic_scope("deepopt.metrics", phase="report"):
+                    metrics.update(output)
                 del output
                 batches += 1
         except Exception as exc:
@@ -133,4 +136,5 @@ class EpochRunner:
             raise
         if distributed.reduce_number(batches) == 0:
             raise ValueError("Validation loader is empty")
-        return self.metrics.compute(metrics, observe=self.runtime.observe)
+        with self.runtime.diagnostic_scope("deepopt.metrics", phase="report"):
+            return self.metrics.compute(metrics, observe=self.runtime.observe)

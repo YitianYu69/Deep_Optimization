@@ -5,6 +5,7 @@ from torch.autograd.function import once_differentiable
 from ...backends import gemm_nt
 from ...quantization.tensor import QuantizedTensor
 from ...quantization.quantizer import quantize_fp8
+from ..._execution import backward_finite_check_policy
 
 
 class _DOLinearFunction(Function):
@@ -15,13 +16,15 @@ class _DOLinearFunction(Function):
         weight,
         bias,
         plan: dict,
-        out_dtype: torch.dtype
+        out_dtype: torch.dtype,
+        backward_enabled: bool,
+        weight_cache,
     ):
         fp8_trainig_plan = plan["fp8_training"]
         fp8_dtypes = fp8_trainig_plan["fp8_dtypes"]
         block_shapes = plan["block_shapes"]
         backend = fp8_trainig_plan.get("backend", "reference")
-        num_stages = fp8_trainig_plan.get("num_stages", 3)
+        num_stages = fp8_trainig_plan.get("num_stages", "auto")
 
         x_matrix = x.reshape(-1, weight.shape[1])
 
@@ -29,12 +32,15 @@ class _DOLinearFunction(Function):
             x_matrix, fp8_dtype=fp8_dtypes["activation"],
             block_shape=block_shapes["activation"]
         )
-        qw = quantize_fp8(
-            weight, fp8_dtype=fp8_dtypes["weight"],
-            block_shape=block_shapes["weight"]
-        )
+        if weight_cache is None:
+            qw = quantize_fp8(weight, fp8_dtype=fp8_dtypes["weight"], block_shape=block_shapes["weight"])
+        else:
+            qw = weight_cache.quantize(weight, fp8_dtype=fp8_dtypes["weight"],
+                                       block_shape=block_shapes["weight"], quantizer=quantize_fp8)
 
         output = gemm_nt(qx, qw, backend=backend, bias=bias, out_dtype=out_dtype, num_stages=num_stages)
+        if not backward_enabled:
+            return output.reshape(*x.shape[:-1], weight.shape[0])
         need_dx, need_dw = ctx.needs_input_grad[:2]
 
         # Saved-activation compression belongs at this boundary: a future
@@ -72,6 +78,7 @@ class _DOLinearFunction(Function):
         ctx.backend = backend
         ctx.num_stages = num_stages
         ctx.save_qx_transpose = save_qx_transpose
+        ctx.check_finite = backward_finite_check_policy()
 
         return output.reshape(*x.shape[:-1], weight.shape[0])
 
@@ -88,7 +95,8 @@ class _DOLinearFunction(Function):
         db = None
         if need_dx or need_dw:
             qg = quantize_fp8(
-                grad_matrix, fp8_dtype=ctx.fp8_dtypes["grad"], block_shape=ctx.block_shapes["grad"]
+                grad_matrix, fp8_dtype=ctx.fp8_dtypes["grad"], block_shape=ctx.block_shapes["grad"],
+                check_finite=ctx.check_finite,
             )
 
             if need_dx:
@@ -99,7 +107,7 @@ class _DOLinearFunction(Function):
                 # Dense/sparse kernel selection belongs to backend dispatch;
                 # gradient orientation and dtype remain the autograd contract.
                 dx = gemm_nt(
-                    qg, qw.transpose(),
+                    qg, qw.transpose(contiguous=False),
                     backend=ctx.backend,
                     out_dtype=ctx.input_dtype,
                     num_stages=ctx.num_stages,
@@ -120,11 +128,12 @@ class _DOLinearFunction(Function):
                         grad_matrix.T.contiguous(),
                         fp8_dtype=ctx.fp8_dtypes["grad"],
                         block_shape=ctx.block_shapes["grad"],
+                        check_finite=ctx.check_finite,
                     )
 
                 dw = gemm_nt(
-                    qg if needs_qg_special_transpose else qg.transpose(),
-                    qx if ctx.save_qx_transpose else qx.transpose(),
+                    qg if needs_qg_special_transpose else qg.transpose(contiguous=False),
+                    qx if ctx.save_qx_transpose else qx.transpose(contiguous=False),
                     backend=ctx.backend,
                     out_dtype=ctx.weight_dtype,
                     num_stages=ctx.num_stages,
@@ -133,4 +142,4 @@ class _DOLinearFunction(Function):
         if need_db:
             db = grad_matrix.sum(dim=0, dtype=torch.float32).to(dtype=ctx.bias_dtype)
         
-        return dx, dw, db, None, None
+        return dx, dw, db, None, None, None, None

@@ -5,20 +5,21 @@ FP8 linear with explicit forward and backward computations.
 import torch
 from torch import nn
 
-from .functional import do_linear, validate_fp8_plan
+from .functional import do_linear, _prepare_fp8_plan
+from ._cached_weights import CachedWeightModule
 
 
 
 
 
-class DOLinear(nn.Module):
+class DOLinear(CachedWeightModule):
     def __init__(self, original: nn.Linear, *, plan: dict):
         super().__init__()
 
         if not isinstance(original, nn.Linear):
             raise ValueError("original must be an nn.Linear")
         
-        self.plan = validate_fp8_plan(plan)
+        self.plan = _prepare_fp8_plan(plan)
 
         self.in_features = original.in_features
         self.out_features = original.out_features
@@ -45,7 +46,7 @@ class DOLinear(nn.Module):
         # computation and any future activation codecs or sparse kernels.
         return do_linear(
             x, self.weight, self.bias,
-            plan=self.plan
+            plan=self.plan, _weight_cache=self._fp8_weight_cache,
         )
 
     def extra_repr(self) -> str:

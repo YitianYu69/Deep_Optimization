@@ -6,6 +6,8 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import Tensor
 
+from ._diagnostics import passive_checks_enabled
+
 
 @dataclass(frozen=True)
 class TensorEvent:
@@ -95,8 +97,9 @@ class CheckObservers:
         self._observers: tuple[Callable, ...] = observers
         self._gate = gate
 
-    def allows(self, kind):
-        return self._gate is None or self._gate(kind)
+    def allows(self, kind, *, collective=False):
+        return ((self._gate is None or self._gate(kind))
+                and passive_checks_enabled(kind, collective=collective))
 
     def interests(self):
         """Static subscriptions for one rank-wide registration, not per-batch RPC."""

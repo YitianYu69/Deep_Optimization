@@ -15,6 +15,7 @@ from torch.nn.parallel import DistributedDataParallel
 from deepopt import DDPCore, Trainer, TrainingRuntime, initialize_distributed, shutdown_distributed
 from deepopt.logger import log_output
 from deepopt.opt import transform_model
+from deepopt.opt._autocast import fp8_context
 from deepopt.opt.policy import fp8_plan
 
 
@@ -43,6 +44,16 @@ def train_variant(context, api):
     baseline, _ = transform_model(deepcopy(model), plan=fp8_plan(True))
     optimizer = torch.optim.SGD(model.parameters(), lr=0.03)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.03)
+    from deepopt.opt.policy import prepare_fp8_model
+
+    model, _ = prepare_fp8_model(model, True)
+    # Deliberately populate different rank-local caches before DDP broadcasts
+    # rank-zero parameters; .data writes model a version-untracked update.
+    with torch.no_grad(), fp8_context("cpu", True):
+        for parameter in model.parameters():
+            parameter.data.add_(context.global_rank)
+        model(torch.ones(3, 8))
+    assert model.projection._fp8_weight_cache._entries
     checked_gradients = []
 
     def check_gradients(current_optimizer, args, kwargs):
@@ -61,17 +72,20 @@ def train_variant(context, api):
     if api == "trainer":
         trainer = Trainer(model, optimizer, loss_fn=F.mse_loss, fp8=True)
         core = trainer.runtime.core
+        assert not model.projection._fp8_weight_cache._entries
         trainer.train_epoch([(inputs, targets)])
         assert trainer.state.optimizer_steps == 1
     elif api == "runtime":
         runtime = TrainingRuntime(model, optimizer, fp8=True)
         core = runtime.core
+        assert not model.projection._fp8_weight_cache._entries
         # This closure intentionally retains the caller's original composite root.
         loss = runtime.compute((inputs, targets), lambda b: F.mse_loss(model(b[0]), b[1]))
         runtime.backward(loss)
         runtime.step()
     else:
         core = DDPCore(model, context.device, fp8=True)
+        assert not model.projection._fp8_weight_cache._entries
         loss = core.compute((inputs, targets), lambda b: F.mse_loss(core.model(b[0]), b[1]))
         core.backward(loss)
         optimizer.step()
@@ -117,12 +131,46 @@ def reject_mismatched_policy(context):
     return {"mismatch_rejected": rejected, "world_size": context.world_size}
 
 
+def check_mode_coverage(context):
+    from deepopt import DiagnosticPolicy
+    from deepopt.opt.scaling_strategy.amax import AmaxScaling
+
+    torch.manual_seed(91)
+    model = nn.Linear(8, 4)
+    runtime = TrainingRuntime(model, torch.optim.SGD(model.parameters(), lr=.01), fp8=True,
+                              diagnostics=DiagnosticPolicy(loss_finite_every=2, gradient_finite_every=3))
+    observed = []
+    phase = None
+    original = AmaxScaling.compute
+
+    def compute(self, *args, **kwargs):
+        observed.append((runtime.mode_controller.completed_updates + 1, phase, kwargs["check_finite"]))
+        return original(self, *args, **kwargs)
+
+    with patch.object(AmaxScaling, "compute", new=compute):
+        for _ in range(6):
+            phase = "forward"
+            loss = runtime.compute(torch.full((3, 8), .1 + context.global_rank, requires_grad=True),
+                                   lambda value: runtime.model(value).square().mean())
+            phase = "backward"
+            runtime.backward(loss)
+            runtime.step()
+    for update, operation, enabled in observed:
+        assert enabled == (update % (2 if operation == "forward" else 3) == 0), (update, operation, enabled)
+    gathered = [None] * context.world_size
+    dist.all_gather_object(gathered, observed)
+    assert all(record == gathered[0] for record in gathered)
+    return {"fp8_mode_cadence": True, "world_size": context.world_size, "updates": 6}
+
+
 def main():
     torch.set_num_threads(1)
     context = initialize_distributed("cpu", timeout=45)
     try:
         if sys.argv[1] == "mismatch":
             log_output(json.dumps(reject_mismatched_policy(context)))
+        elif sys.argv[1] == "modes":
+            log_output(json.dumps(check_mode_coverage(context)))
         else:
             for api in ("trainer", "runtime", "core"):
                 log_output(json.dumps(train_variant(context, api)))

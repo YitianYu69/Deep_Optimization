@@ -401,7 +401,12 @@ def _validate_resume_state(payload, trainer, requested, *, generators, train_loa
     if _resume_config_for_comparison(payload["config"]) != _resume_config_for_comparison(requested):
         raise ValueError("Resume configuration differs from checkpoint "
                          "(only epochs, batch size, checkpoint cadence, and diagnostic checks may change)")
-    if payload["components"] != _component_types(trainer) or payload["trainer_settings"] != _trainer_settings(trainer):
+    saved_settings = dict(payload["trainer_settings"])
+    if "fp8" in saved_settings:
+        # Older snapshots omit newly added default policy fields. Preserve
+        # their meaning while still rejecting an actual execution-policy change.
+        saved_settings["fp8"] = asdict(fp8_config_from_dict(saved_settings["fp8"]))
+    if payload["components"] != _component_types(trainer) or saved_settings != _trainer_settings(trainer):
         raise ValueError("Resume requires the same component types and trainer settings")
     saved_compile = compile_config_from_dict(payload["config"].get("runtime", {}).get("compile", {}))
     actual_compile = compile_config_from_dict(trainer.config.get("runtime", {}).get("compile", {}))

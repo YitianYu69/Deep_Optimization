@@ -5,7 +5,9 @@
 Execution modes control passive diagnostics, not the optimization algorithm.
 Loss reduction, precision, accumulation, clipping, optimizer updates, structural
 validation and distributed failure coordination remain separate responsibilities.
-Both `TrainingCore` and `DDPCore` use the same runtime policy controller.
+When used by `TrainingRuntime`, both `TrainingCore` and `DDPCore` execute under
+the same runtime policy scopes. Bare cores do not own optimizer-update counters;
+mode selection and scheduling belong to the runtime/trainer.
 
 Model compilation is independently configurable through
 [`[runtime.compile]`](../runs/README.md#configure-torchcompile). It is disabled
@@ -15,6 +17,11 @@ FP8 is a separate opt-in computation policy through
 [`[runtime.fp8]`](../runs/README.md#configure-fp8) or `Trainer(..., fp8=...)`.
 It can be combined with AMP precision; changing diagnostic modes does not change
 FP8 formats or scaling.
+
+Mode coverage includes prepared/native FP8 projections, direct quantization and
+scaling calls, default loss/report validators, custom backward and gradient
+processing invoked through the runtime, trainer metric callbacks, and default
+observers owned by a custom metric factory.
 
 ## Run the examples
 
@@ -117,11 +124,11 @@ merely because the surrounding runtime supports those features.
 
 ## Diagnostic presets
 
-| Selection | Loss/gradient finite checks | Other diagnostics |
+| Selection | Loss/gradient and FP8 finite checks | Other diagnostics |
 | --- | --- | --- |
 | No mode; legacy `checks=True` | Existing strict checks at every observation | Existing default event kinds; behavior preserved |
 | `max_speed` | Disabled | No passive events, scans or observer-specific hot-path collectives |
-| `balanced` | Every 100 optimizer updates by default | Finite checks at metric computation; no weight/activation inspection |
+| `balanced` | Loss/FP8 forward and gradients/FP8 backward follow their independent update cadences (100 by default) | Finite checks at metric computation; no weight/activation inspection |
 | `analyze` | Every update | Weight and explicitly emitted activation checks/statistics, plus profiler scopes |
 
 `max_speed` can continue through numerical anomalies until another operation
@@ -129,6 +136,34 @@ detects them. It does not disable required shape/ownership checks, loader/rank
 consistency, checkpoint compatibility or monitored-score validity. Epoch-end
 Python scalar results still require host reads. Analysis mode intentionally
 adds scans, scalar reads and logging overhead.
+
+The runtime establishes phase-local policy in `compute()`, manual `autocast()`,
+`backward()`, optimizer/gradient processing, loss preparation, and trainer metric
+updates/computation. `quantize_fp8`, `AmaxScaling.compute`, `BatchOutput.validate`,
+and loss/report validation inherit it when their `check_finite` argument is
+omitted. Standalone calls remain strict; an explicit `check_finite=True` requests
+a check even in `max_speed`. Default validators still check shapes, dtypes,
+normalization weights and reporting structure in every mode.
+
+FP8 forward checks follow the loss cadence (or explicit weight/activation
+inspection); FP8 backward checks follow the gradient cadence. The latter choice
+is captured during forward, so leaving its autocast scope does not discard the
+backward policy. An unscoped FP8 forward defers its backward check decision to
+`runtime.backward()` when that helper is used; otherwise standalone backward
+remains strict. Explicit user checks and third-party library validation are
+not disabled automatically. All microbatches in an accumulation window use the same update
+number. Reenter a saved `runtime.autocast()` context for each manual forward;
+the next scheduled mode is selected on entry. A manual `runtime.step()` also
+prepares the next mode when its forward/backward were performed externally.
+
+Gradient normalization, clipping, and required sparse coalescing keep their
+mathematical behavior in all modes. Diagnostic-only gradient value lists and
+post-processing scans are omitted on unchecked updates. Classification label
+range validation, DDP coordination, monitored-score validation, and phase-end
+scalar conversion remain required. Memory estimation uses a separate
+`max_speed` metadata probe and preserves the source runtime's diagnostic mode
+and weight cache; reference FP8 cache layouts can be traced without real data
+addresses or CUDA stream access.
 
 ## Choose and schedule diagnostics
 
@@ -169,11 +204,14 @@ change replaces the current policy and clears the previous schedule. In DDP,
 every rank must call the transition with the same mode. Observer subscriptions
 are registered at construction/transitions; do not independently mutate observer
 subscriptions on individual ranks during a distributed run.
+Local legacy check opt-out does not remove a rank from observer collectives
+requested by another rank; only that rank's local callback execution is skipped.
 
 Analysis statistics include mean, standard deviation, minimum and maximum for
 gradient/weight/activation events without retaining tensors. Activation events
 still require an explicit `runtime.observe("activation", tensor)` call or hook.
-Profiler scopes `deepopt.compute`, `deepopt.backward`, and `deepopt.step` are
+Profiler scopes `deepopt.compute`, `deepopt.backward`, `deepopt.step`,
+`deepopt.loss`, and `deepopt.metrics` are
 visible when a caller enables `torch.profiler`; the engine does not silently
 start a trace or write profiler files.
 

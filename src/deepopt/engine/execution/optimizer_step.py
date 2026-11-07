@@ -44,6 +44,15 @@ class OptimizerStepper:
             raise ValueError("Optimizer gradients must be dense or sparse COO tensors")
         return gradient
 
+    @staticmethod
+    def _coalesce_sparse(parameters):
+        # Coalescing changes the inputs seen by a nonlinear gradient strategy;
+        # it must not depend on whether numerical observers are enabled.
+        for parameter in parameters:
+            gradient = parameter.grad
+            if gradient is not None and gradient.is_sparse:
+                parameter.grad = gradient.coalesce()
+
     def step(self, gradient_divisor: float) -> None:
         """Validate all gradients before applying any optimizer updates."""
         guard = getattr(self.checks, "check_errors", lambda operation: nullcontext())
@@ -57,25 +66,37 @@ class OptimizerStepper:
             self.optimizer.zero_grad(set_to_none=True)
             return
         parameters = self.parameters()
+        # Keep the rank-wide guard ordering even when this rank needs no
+        # gradient values; only the diagnostic traversal is conditional.
+        gradients = []
         with guard("gradient inspection"):
-            gradients = [self._values(p) for p in parameters if p.grad is not None]
-        self.checks.observe("gradients", gradients, name="gradient")
+            if gradient_divisor != 1 or observe_gradients:
+                gradients = [self._values(p) for p in parameters if p.grad is not None]
+            elif self.gradient_strategy is not None:
+                self._coalesce_sparse(parameters)
+        if observe_gradients:
+            self.checks.observe("gradients", gradients, name="gradient")
         if gradient_divisor != 1:
             for gradient in gradients:
                 gradient.div_(gradient_divisor)
-            self.checks.observe("gradients", gradients, name="normalized gradient")
+            if observe_gradients:
+                self.checks.observe("gradients", gradients, name="normalized gradient")
         if self.gradient_strategy is not None:
-            if (isinstance(self.gradient_strategy, (ClipGradNorm, ClipGradValue))
-                    and any(p.grad is not None and p.grad.is_sparse for p in parameters)):
-                raise ValueError("Built-in gradient clipping does not support sparse gradients; "
-                                 "provide a sparse-aware GradientStrategy or omit clipping")
             with guard("gradient processing"):
+                if (isinstance(self.gradient_strategy, (ClipGradNorm, ClipGradValue))
+                        and any(p.grad is not None and p.grad.is_sparse for p in parameters)):
+                    raise ValueError("Built-in gradient clipping does not support sparse gradients; "
+                                     "provide a sparse-aware GradientStrategy or omit clipping")
                 diagnostic = self.gradient_strategy.process(iter(parameters))
-            if isinstance(diagnostic, torch.Tensor):
-                self.checks.observe("gradients", diagnostic, name="gradient processing result")
-            # Inspect the actual replacement gradients, not the earlier views.
-            processed = [self._values(p) for p in parameters if p.grad is not None]
-            self.checks.observe("gradients", processed, name="gradient after processing")
+                if observe_gradients:
+                    processed = [self._values(p) for p in parameters if p.grad is not None]
+                else:
+                    self._coalesce_sparse(parameters)
+            if observe_gradients:
+                if isinstance(diagnostic, torch.Tensor):
+                    self.checks.observe("gradients", diagnostic, name="gradient processing result")
+                # Inspect replacement gradients only when diagnostics request it.
+                self.checks.observe("gradients", processed, name="gradient after processing")
         if observe_weights:
             self.checks.observe("weights", parameters, name="weights before update")
         with guard("optimizer update"):

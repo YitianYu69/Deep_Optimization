@@ -16,6 +16,110 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(271)
 
+    def test_unchecked_cuda_scaling_has_no_python_scalar_reads_and_handles_zero(self):
+        from deepopt.opt.scaling_strategy.amax import AmaxScaling
+
+        for blocks in (None, (1, 32), (32, 32)):
+            for value in (0.0, 0.25):
+                x = torch.full((37, 65), value, device="cuda")
+                expected = AmaxScaling(blocks).compute(x.cpu())
+                with patch.object(torch.Tensor, "__bool__", side_effect=AssertionError("GPU scalar branch")), \
+                     patch.object(torch.Tensor, "item", side_effect=AssertionError("GPU item read")):
+                    actual = AmaxScaling(blocks).compute(x, check_finite=False)
+                torch.testing.assert_close(actual.scale.cpu(), expected.scale)
+                torch.testing.assert_close(actual.scale_inv.cpu(), expected.scale_inv)
+
+    @staticmethod
+    def _split_config(split):
+        import triton
+        from deepopt.opt.backends._triton_autotune import set_descriptor_block_shapes
+
+        return triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 32,
+                              "SPLIT_K": split, "NUM_STAGES": 2},
+                             num_warps=4, num_stages=2, pre_hook=set_descriptor_block_shapes)
+
+    def test_split_k_matches_oracle_for_partial_tiles_scaling_and_output_types(self):
+        from deepopt.opt.backends import triton_fp8
+
+        kernel = triton_fp8._gemm_nt_kernel
+        for blocks in ((None, None), ((1, 32), (32, 32)), ((32, 1), (32, 32))):
+            a = quantize_fp8(torch.randn(13, 515, device="cuda") * .1, block_shape=blocks[0])
+            b = quantize_fp8(torch.randn(37, 515, device="cuda") * .1, block_shape=blocks[1],
+                             fp8_dtype=torch.float8_e5m2)
+            bias = torch.randn(37, device="cuda") * .1
+            for split in (2, 4, 8):
+                for dtype in (torch.float32, torch.float16, torch.bfloat16):
+                    with self.subTest(blocks=blocks, split=split, dtype=dtype), \
+                         patch.object(kernel, "configs", [self._split_config(split)]), \
+                         patch.object(kernel, "cache", {}):
+                        actual = gemm_nt(a, b, backend="triton", bias=bias,
+                                         out_dtype=dtype, num_stages=2)
+                        expected = (a.dequantize().cpu() @ b.dequantize().cpu().T + bias.cpu()).to(dtype)
+                        tolerance = 1e-2 if dtype == torch.bfloat16 else 2e-3 if dtype == torch.float16 else 5e-4
+                        torch.testing.assert_close(actual.cpu(), expected, rtol=tolerance, atol=tolerance)
+                        # The cached production launch must overwrite all partials.
+                        again = gemm_nt(a, b, backend="triton", bias=None,
+                                        out_dtype=dtype, num_stages=2)
+                        expected = (a.dequantize().cpu() @ b.dequantize().cpu().T).to(dtype)
+                        torch.testing.assert_close(again.cpu(), expected, rtol=tolerance, atol=tolerance)
+
+    def test_split_reduction_is_in_candidate_benchmark_and_cached_launch(self):
+        from deepopt.opt.backends import triton_fp8
+
+        kernel = triton_fp8._gemm_nt_kernel
+        a = quantize_fp8(torch.randn(13, 515, device="cuda") * .1, block_shape=(1, 32))
+        b = quantize_fp8(torch.randn(37, 515, device="cuda") * .1, block_shape=(32, 32))
+        expected = a.dequantize().cpu() @ b.dequantize().cpu().T
+        observed = []
+
+        def finish(args, exception=None):
+            triton_fp8._finish_gemm(args, exception)
+            if exception is None:
+                observed.append(args["SPLIT_K"])
+                torch.testing.assert_close(args["output_ptr"][:, :37].cpu(), expected, rtol=5e-4, atol=5e-4)
+
+        def bench(call, quantiles):
+            call()
+            # Deliberately choose split-K to exercise the cached final reduction.
+            return [1.0 if observed[-1] == 4 else 2.0] * len(quantiles)
+
+        with patch.object(kernel, "configs", [self._split_config(1), self._split_config(4)]), \
+             patch.object(kernel, "cache", {}), patch.object(kernel, "post_hook", new=finish), \
+             patch.object(kernel, "do_bench", new=bench), \
+             patch.object(triton_fp8.torch, "empty", wraps=torch.empty) as allocate:
+            for _ in range(2):
+                actual = gemm_nt(a, b, backend="triton", num_stages=2)
+                torch.testing.assert_close(actual.cpu(), expected, rtol=5e-4, atol=5e-4)
+            self.assertEqual(kernel.best_config.kwargs["SPLIT_K"], 4)
+            partial_shapes = [call.args[0] for call in allocate.call_args_list
+                              if call.args and isinstance(call.args[0], tuple) and len(call.args[0]) == 3]
+            self.assertEqual([shape[0] for shape in partial_shapes], [8, 4])
+        self.assertEqual(sorted(observed), [1, 4])
+
+    def test_split_k_preserves_output_guard_rows_and_stride_padding(self):
+        from deepopt.opt.backends import triton_fp8
+
+        kernel = triton_fp8._gemm_nt_kernel
+        a = quantize_fp8(torch.randn(13, 515, device="cuda") * .1, block_shape=(1, 32))
+        b = quantize_fp8(torch.randn(19, 515, device="cuda") * .1, block_shape=(32, 32))
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            alignment = 4 if dtype == torch.float32 else 8
+            stride = ((19 + alignment - 1) // alignment) * alignment
+            guarded = torch.full((14, stride), 123.0, dtype=dtype, device="cuda")
+            allocate = torch.empty
+
+            def output_with_guard(size, **kwargs):
+                if size == (13, stride) and kwargs.get("dtype") == dtype:
+                    return guarded[:13]
+                return allocate(size, **kwargs)
+
+            with patch.object(kernel, "configs", [self._split_config(4)]), \
+                 patch.object(kernel, "cache", {}), \
+                 patch.object(triton_fp8.torch, "empty", side_effect=output_with_guard):
+                gemm_nt(a, b, backend="triton", out_dtype=dtype, num_stages=2)
+            self.assertTrue(torch.all(guarded[13] == 123).item())
+            self.assertTrue(torch.all(guarded[:13, 19:] == 123).item())
+
     def test_classifier_autotunes_with_minimal_padding_and_logical_descriptors(self):
         from deepopt.opt.backends import triton_fp8
         from triton.runtime.autotuner import Autotuner
@@ -158,9 +262,10 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
             "A_SCALE_COLS": a.scale_inv.shape[1], "B_SCALE_COLS": b.scale_inv.shape[1],
             "TENSORWISE": False,
             "NATIVE_FP8": a.block_shape[1] % 32 == 0 and b.block_shape[1] % 32 == 0,
-            "HAS_BIAS": has_bias, "PIPELINE_STAGES": stages,
+            "HAS_BIAS": has_bias, "PIPELINE_STAGES": 0 if stages == "auto" else stages,
             "DEVICE_INDEX": a.data.device.index,
             "DEVICE_CAPABILITY": capability[0] * 10 + capability[1],
+            "NUM_SMS": torch.cuda.get_device_properties(a.data.device).multi_processor_count,
         }
         matches = [(key, config) for key, config in kernel.cache.items()
                    if all(dict(zip(AUTOTUNE_KEY, key)).get(name) == value
@@ -217,6 +322,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
             (22, e4m3, e5m2, torch.float32, (1, 96), (32, 64), 2),
             (21, e4m3, e5m2, torch.float32, (1, 32), (32, 64), 2),
             (21, e4m3, e5m2, torch.float32, (1, 96), (32, 64), 4),
+            (21, e4m3, e5m2, torch.float32, (1, 96), (32, 64), "auto"),
             (21, e4m3, e5m2, torch.float32, (32, 1), (7, 9), 2),
         )
         case_keys = set()
@@ -235,7 +341,11 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
                 key, selected = self._cache_entry(_gemm_nt_kernel, a, b, out_dtype, stages, False)
                 self.assertNotIn(key, case_keys)
                 case_keys.add(key)
-                self.assertEqual(selected.num_stages, stages)
+                if stages == "auto":
+                    self.assertIn(selected.num_stages, (1, 2, 3, 4))
+                else:
+                    self.assertEqual(selected.num_stages, stages)
+                self.assertEqual(selected.num_stages, selected.kwargs["NUM_STAGES"])
                 self.assertIs(selected, _gemm_nt_kernel.best_config)
                 if a_block[1] % 32 or b_block[1] % 32:
                     self.assertLessEqual(selected.kwargs["BLOCK_M"], 64)

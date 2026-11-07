@@ -53,7 +53,8 @@ class OptimizationWindow:
             raise
 
     def _backward(self, output: BatchOutput) -> bool:
-        with self.runtime.core.check_errors("loss preparation"):
+        with self.runtime.diagnostic_scope("deepopt.loss", phase="loss"), \
+             self.runtime.core.check_errors("loss preparation"):
             prepared, normalize, total_weight = self._prepare(output)
         self.runtime.backward(prepared.loss)
         self._normalize = normalize

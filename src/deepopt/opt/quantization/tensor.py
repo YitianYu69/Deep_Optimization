@@ -72,15 +72,19 @@ class QuantizedTensor:
         return values * expanded_scales[:rows, :cols]
 
     @torch.no_grad()
-    def transpose(self) -> "QuantizedTensor":
+    def transpose(self, *, contiguous: bool = True) -> "QuantizedTensor":
+        """Transpose scales and values; backends can pack a view directly."""
+        if type(contiguous) is not bool:
+            raise TypeError("contiguous must be a boolean")
         if self.block_shape is None:
             transposed_block_shape = None
         else:
             block_rows, block_cols = self.block_shape
             transposed_block_shape = (block_cols, block_rows)
 
+        values, scales = self.data.T, self.scale_inv.T
         return QuantizedTensor(
-            data=self.data.T.contiguous(),
-            scale_inv=self.scale_inv.T.contiguous(),
+            data=values.contiguous() if contiguous else values,
+            scale_inv=scales.contiguous() if contiguous else scales,
             block_shape=transposed_block_shape
         )

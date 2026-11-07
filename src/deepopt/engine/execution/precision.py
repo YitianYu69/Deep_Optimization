@@ -20,12 +20,18 @@ class PrecisionPolicy:
         self.device, self.precision = device, precision
         self.fp8 = fp8
         self.config = config
+        self.configure(fp8=fp8, config=config)
 
-    def autocast(self):
+    def configure(self, *, fp8=None, config=None):
+        self.fp8, self.config = fp8, config
         if self.precision == "fp32" and self.fp8 is None:
-            return nullcontext()
+            self._context = nullcontext()
+            return
         from deepopt.opt._autocast import autocast
 
-        return autocast(self.device.type, dtype=torch.bfloat16,
-                        enabled=self.precision == "bf16", fp8=self.fp8, config=self.config)
+        self._context = autocast(self.device.type, dtype=torch.bfloat16,
+                                 enabled=self.precision == "bf16", fp8=self.fp8, config=self.config)
+
+    def autocast(self):
+        return self._context
 

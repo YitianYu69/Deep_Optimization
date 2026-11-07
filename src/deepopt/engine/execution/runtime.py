@@ -1,6 +1,8 @@
 """Optional execution helpers shared by automatic and user-owned loops."""
 
 import torch
+from contextlib import ContextDecorator, contextmanager
+from contextvars import ContextVar
 from deepopt.distributed import _process as distributed_ops
 from deepopt.distributed.ddp import DDPCore
 from deepopt.engine.core import TrainingCore
@@ -8,7 +10,7 @@ from collections.abc import Callable
 from math import isfinite
 from numbers import Real
 from typing import Any, TypeVar
-from weakref import proxy
+from weakref import proxy, ref
 from copy import deepcopy
 from dataclasses import asdict
 
@@ -24,6 +26,28 @@ from deepopt.engine.strategies.gradients import ClipGradNorm, GradientStrategy
 
 
 Result = TypeVar("Result")
+_autocast_entries = ContextVar("deepopt_runtime_autocast_entries", default=())
+
+
+class _RuntimeAutocast(ContextDecorator):
+    """Reusable entries read current scheduling state without owning the runtime."""
+
+    def __init__(self, runtime):
+        self._runtime = ref(runtime)
+
+    def __enter__(self):
+        runtime = self._runtime()
+        if runtime is None:
+            raise RuntimeError("The autocast context's runtime no longer exists")
+        context = runtime._autocast()
+        result = context.__enter__()
+        _autocast_entries.set((*_autocast_entries.get(), context))
+        return result
+
+    def __exit__(self, *args):
+        entries = _autocast_entries.get()
+        _autocast_entries.set(entries[:-1])
+        return entries[-1].__exit__(*args)
 
 
 class TrainingRuntime:
@@ -75,6 +99,7 @@ class TrainingRuntime:
             if type(non_blocking) is not bool:
                 raise ValueError("non_blocking must be a boolean")
         self._in_compute = self._forward_pending = self._pending_gradients = False
+        self._diagnostic_depth = 0
         self.non_blocking = non_blocking
         self.precision = precision
         with distributed_ops.collective_errors("runtime preconditions"):
@@ -106,7 +131,6 @@ class TrainingRuntime:
         if self.core.distributed:
             self._config_snapshot.setdefault("runtime", {})["ddp"] = deepcopy(self.core.options)
         self._config_snapshot.setdefault("runtime", {})["fp8"] = asdict(self.fp8)
-        self._precision.fp8 = self.fp8 if self.fp8.enabled else None
         self._config_snapshot.setdefault("runtime", {}).update({
             "device": str(device), "precision": precision, "execution_mode": execution_mode,
             "diagnostics": deepcopy(diagnostics), "mode_schedule": deepcopy(configured_modes),
@@ -115,7 +139,8 @@ class TrainingRuntime:
         if type(checks) is bool:
             self._config_snapshot["runtime"]["checks"] = checks
         self._config_snapshot.setdefault("training", {})["grad_clip_norm"] = grad_clip_norm
-        self._precision.config = ResolvedConfig(deepcopy(self._config_snapshot))
+        self._precision.configure(fp8=self.fp8 if self.fp8.enabled else None,
+                                  config=ResolvedConfig(deepcopy(self._config_snapshot)))
         with self.core.check_errors("optimizer setup"):
             self._stepper = (OptimizerStepper(self.model, optimizer, self._precision, gradient_strategy,
                                              checks=self.checks)
@@ -151,11 +176,25 @@ class TrainingRuntime:
         self.checks = CheckObservers(checks, gate=self.mode_controller.permits)
         self.core.configure_checks(self.checks, self.mode_controller.configuration())
 
+    def _prepare_mode(self):
+        if not self._pending_gradients and not self._forward_pending and self.mode_controller.prepare_update():
+            self._configure_checks()
+
+    @contextmanager
+    def diagnostic_scope(self, name, *, phase="forward"):
+        """Apply the current passive-check policy without changing AMP or FP8 formats."""
+        self._diagnostic_depth += 1
+        try:
+            with self.mode_controller.scope(name, phase=phase, legacy_checks=self._checks_spec is not False):
+                yield
+        finally:
+            self._diagnostic_depth -= 1
+
     def set_execution_mode(self, mode):
         """Change passive diagnostics only at a completed update/epoch boundary."""
         self._require_healthy()
         with self.core.check_errors("execution mode transition"):
-            if (self._in_compute or self._forward_pending or self._pending_gradients
+            if (self._in_compute or self._diagnostic_depth or self._forward_pending or self._pending_gradients
                     or any(parameter.grad is not None for parameter in self.model.parameters())):
                 raise RuntimeError("Change execution mode only at an optimizer-update or epoch boundary")
             policy = DiagnosticPolicy.for_mode(mode)
@@ -229,7 +268,15 @@ class TrainingRuntime:
         return self._gradient_strategy
 
     def autocast(self):
-        return self._precision.autocast()
+        return _RuntimeAutocast(self)
+
+    @contextmanager
+    def _autocast(self):
+        self._require_eager()
+        if self.model.training and torch.is_grad_enabled():
+            self._prepare_mode()
+        with self.diagnostic_scope("deepopt.compute"), self._precision.autocast() as context:
+            yield context
 
     def compute(self, batch: Any, step: Callable[[Any], Result]) -> Result:
         """Transfer a batch and call any step under the precision context.
@@ -238,13 +285,10 @@ class TrainingRuntime:
         This does not change train/eval mode or disable autograd.
         """
         self._require_eager()
-        if self.model.training and torch.is_grad_enabled() and not self._pending_gradients:
-            if self.mode_controller.prepare_update():
-                self._configure_checks()
         self._in_compute = True
         try:
             batch = self.prepare_batch(batch)
-            with self.autocast(), self.mode_controller.scope("deepopt.compute"):
+            with self.autocast():
                 result = self.core.compute(batch, step)
             if self.model.training and torch.is_grad_enabled():
                 self._forward_pending = True
@@ -271,10 +315,9 @@ class TrainingRuntime:
         """Forward torch.Tensor.backward options, such as retain_graph."""
         self._require_healthy()
         try:
-            if not self._pending_gradients and not self._forward_pending and self.mode_controller.prepare_update():
-                self._configure_checks()
-            self._observe("loss", loss, name="backward loss")
-            with self.mode_controller.scope("deepopt.backward"):
+            self._prepare_mode()
+            with self.diagnostic_scope("deepopt.backward", phase="backward"):
+                self._observe("loss", loss, name="backward loss")
                 self.core.backward(loss, **kwargs)
             self._forward_pending = bool(kwargs.get("retain_graph", False))
             self._pending_gradients = True
@@ -301,6 +344,7 @@ class TrainingRuntime:
         if self._stepper is None:
             raise RuntimeError("step requires an optimizer")
         self._require_healthy()
+        self._prepare_mode()
         with self.core.check_errors("gradient divisor"):
             if type(samples) is not int or samples < 1:
                 raise ValueError("samples must be a positive integer")
@@ -327,7 +371,7 @@ class TrainingRuntime:
         try:
             self.core.validate_window(normalize, distributed_reduction)
             divisor = self.core.gradient_divisor(float(divisor), normalize=normalize, reduction=distributed_reduction)
-            with self.mode_controller.scope("deepopt.step"):
+            with self.diagnostic_scope("deepopt.step", phase="backward"):
                 self._stepper.step(divisor)
             self._forward_pending = self._pending_gradients = False
             self.mode_controller.completed_updates += 1

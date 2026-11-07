@@ -30,15 +30,16 @@ class TrainingCore:
         self.model, self.fp8, self.transformation_report = prepare_execution_model(
             model, self._config_snapshot, fp8)
         self._config_snapshot.setdefault("runtime", {})["fp8"] = asdict(self.fp8)
+        from deepopt.opt._autocast import _FP8Scope
+
+        self._fp8_scope = _FP8Scope(self.device.type, self.fp8 if self.fp8.enabled else None)
 
     @property
     def config(self):
         return deepcopy(self._config_snapshot)
 
     def compute(self, batch, step):
-        from deepopt.opt._autocast import fp8_context
-
-        with fp8_context(self.device.type, self.fp8 if self.fp8.enabled else None):
+        with self._fp8_scope.enter():
             return step(batch)
 
     def backward(self, loss, **kwargs):

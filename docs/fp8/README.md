@@ -100,7 +100,8 @@ Mappings use the same schema as the TOML table, including `enabled`.
 Optional `block_shapes` maps `activation`, `weight` and `grad` to positive
 two-dimensional shapes; roles without inherited settings use tensorwise scaling.
 Partial overrides preserve unspecified inherited roles. `num_stages`
-defaults to 3 and `out_dtype=None` uses the active AMP/input dtype.
+defaults to `"auto"` (search stages 1–4); an integer from 1–4 pins the depth.
+`out_dtype=None` uses the active AMP/input dtype.
 
 Automatic preparation runs before DDP wrapping. Configured experiments also
 prepare before compilation and optimizer creation. Direct constructors preserve
@@ -133,7 +134,7 @@ plan = {
             "weight": torch.float8_e4m3fn,
             "grad": torch.float8_e5m2,
         },
-        "num_stages": 3,
+        "num_stages": "auto",
         "out_dtype": None,
     },
     "block_shapes": {
@@ -157,8 +158,8 @@ Each operand role independently selects E4M3FN or E5M2 on either backend.
 `out_dtype=None` uses the active autocast dtype or the input dtype. Explicit
 output dtypes are FP32, BF16, and FP16. Input, weight, and bias tensors must be
 dense, on the same CPU/CUDA device, and use
-FP32/BF16/FP16. Empty operands, nonfinite quantization inputs, and second-order
-derivatives are unsupported. **Trainer-level AMP and FP8 operand formats are
+FP32/BF16/FP16. Empty operands and second-order derivatives are unsupported.
+Strict execution rejects nonfinite quantization inputs immediately. **Trainer-level AMP and FP8 operand formats are
 separate choices**: CPU/CUDA can use FP32 with AMP disabled, and CUDA can enable
 BF16 AMP. The FP8 plan independently selects the formats used by DO projections.
 
@@ -178,6 +179,26 @@ GEMM. With activation `(1, 32)`, weight `(32, 32)`, and gradient `(1, 32)` or
 `(32, 32)`, all three GEMMs select the native FP8 path. Other block grids still
 need compatible reduction widths (multiples of 32); arbitrary unaligned grids
 retain the dequantization fallback.
+
+Under `torch.no_grad()` or `torch.inference_mode()`, the projection skips saved
+activation orientations and other backward-only bookkeeping, even when its
+parameters still have `requires_grad=True`. Training retains the independent
+rowwise quantization described above. Other backward transposes can use views;
+the Triton backend packs those views directly into its required aligned layout.
+`QuantizedTensor.transpose()` keeps its contiguous-result default; the optional
+`contiguous=False` avoids an intermediate materialization.
+
+Prepared adapters reuse quantized weights while the owning parameter's PyTorch
+version, identity, storage/layout, dtype/device, FP8 format, scale blocks, finite
+check policy, and CUDA stream match. The bounded cache holds at most four layouts
+per adapter. Optimizer updates, `load_state_dict`, parameter replacement, and
+device/dtype changes invalidate reuse. DDP initialization clears rank-local
+caches after its initial parameter broadcast. Caches are absent from `state_dict` and
+are empty after a module copy or whole-module pickle; they add resident FP8
+weight/scale storage outside registered parameters and buffers. Use
+`module.clear_fp8_cache()` after an external write that bypasses PyTorch version
+tracking, such as a `.data` write or a custom raw-pointer kernel. Setting
+`cache_enabled=False` in the autocast context disables weight reuse.
 
 ## Combine FP8 with AMP in a context
 
@@ -242,6 +263,33 @@ It does not rewrite HF `addmm`, fused attention kernels, arbitrary `matmul`, or
 the model structure. Use automatic core preparation for the full set of supported
 adapters. Like native AMP, keep a context within one thread's synchronous work;
 do not suspend it across interleaved async tasks or generators.
+
+Runtime precision policies and core FP8 scopes resolve owned execution plans
+once during construction. Their repeated entries only establish context-local
+state; public `fp8_plan`/`validate_fp8_plan` results remain independently mutable.
+Prepared adapters suspend DeepOpt's own interception inside an already-selected
+operation while preserving user Torch modes. For a fully prepared model, set
+`FP8Config(enabled=True, intercept_linear=False)` or the corresponding TOML field
+to avoid installing the broad native-linear mode. In that mode, unconverted
+native `F.linear` calls stay dense; existing DO adapters still obey nested FP8
+enable/disable/override scopes. The default retains native-linear coverage.
+
+`execution_mode` covers FP8 as well as loss/gradient observers. `max_speed` and
+legacy `checks=False` runtimes skip quantization's passive finite-input scans.
+`balanced` checks forward quantization on `loss_finite_every` updates and
+backward quantization on `gradient_finite_every` updates (100 by default).
+Explicit weight/activation inspection also enables forward checks. The
+`analyze` preset checks every update; legacy/default strict execution checks
+every call. Standalone scopes can explicitly use
+`autocast(..., check_finite=False)`; `quantize_fp8(..., check_finite=False)` and
+`AmaxScaling.compute(..., check_finite=False)` provide direct controls. Omitted
+check arguments inherit the active runtime phase; explicit `True` forces an
+immediate check. A forward saves the independently selected backward-check
+choice, including for backward outside its scope. Enter `runtime.autocast()`
+for each manual forward (a saved context object can be reentered); scheduling
+is resolved before that forward. Unchecked inputs must be finite: no deferred error flag or automatic
+repair is introduced. Zero-amax handling stays on the GPU and requires no
+Python scalar read. Complete quantization fusion remains separate work.
 
 `runtime.autocast()` applies the runtime's configured AMP and FP8 together.
 `runtime.compute()` enters it automatically and also performs device transfer
@@ -621,9 +669,11 @@ native model/optimizer checkpoints for the supported conversions.
 
 The tests cover exact continuation at both step and epoch boundaries, including
 partial accumulation windows, two Gloo ranks, and conditional two-GPU NCCL runs.
-The FP8 path is currently not CUDA-Graph-capture-safe: scaling performs a
-host-visible finite-value check. CUDA Graph support for the surrounding framework
-does not imply this FP8 path can be captured.
+The FP8 path is not guaranteed CUDA-Graph-capture-safe. Strict scaling performs
+a host-visible finite-value check; disabling that check alone does not establish
+capture safety for policy dispatch, allocation, autotuning, or weight-cache
+lifetimes. CUDA Graph support for the surrounding framework does not imply
+this FP8 path can be captured.
 
 ## Actual CUDA execution
 
@@ -640,7 +690,8 @@ python examples/optimization/fp8_training.py --device cuda --backend triton --bl
 The Triton backend supports independent `e4m3fn`/`e5m2` formats. Fused CUDA
 quantization requires power-of-two block dimensions other than `[1, 1]`.
 For example, activation `[1, 32]` with weight and gradient
-`[32, 32]` is supported. Pipeline stages can be 1 through 4.
+`[32, 32]` is supported. Pipeline stages are tuned automatically by default;
+an explicit integer from 1 through 4 fixes the depth.
 
 Tensorwise scaling and blockwise scales whose reduction-axis widths are multiples
 of 32 use native FP8 dot products. Other layouts use fused per-element FP32
@@ -654,15 +705,33 @@ The backend packs strided/misaligned operands, pads partial tiles, and returns
 FP32/BF16/FP16 results. Correctness/performance must be measured on the target GPU.
 
 The kernel automatically uses Triton's native `@triton.autotune` to select
-matrix tile sizes and warp counts. The bounded candidate set accounts for the
-matrix shape, including 16- and 32-wide tiles for narrow dimensions, and retains
-the historical static configuration as a candidate. The configured `num_stages`
-remains fixed; candidates with incompatible reduction-scale boundaries or
-resource requirements are pruned. Quantization `block_shapes` stay independent
-of kernel tile sizes.
+matrix tile sizes, warp counts, pipeline stages, and eligible split-K factors.
+The search measures at most 48 configurations across at most 12 tile/reduction
+families, retaining the historical static launch as a measured candidate.
+Candidates include small tiles along long axes to increase parallelism for
+skinny products, two-warp small tiles, and larger tiles for dense products.
+Shortlisting ranks estimated padded work and memory traffic, reserves narrow-axis
+alternatives, and distributes the budget across reduction widths and split
+factors before stage/warp variants. Candidate-list order does not affect selection.
+An explicit `num_stages` from 1–4 constrains the search; `"auto"` searches pipeline
+depths with matching loop and compiler stages. Candidates with incompatible
+reduction-scale boundaries or resource requirements are pruned. Quantization
+`block_shapes` stay independent of kernel tile sizes: a 32-wide reduction-scale
+block still forbids 64/128-wide native FP8 reduction tiles.
 
-Candidate timing replays the prepared GEMM in a CUDA graph with a bounded
-repetition budget and compares median timings. This avoids Python launch gaps
+Split-K factors 2, 4, and 8 compete with unsplit launches for products with an
+output axis at most 32, K at least 512, and at most 262144 output elements.
+Pruning accounts for the GPU's SM count and requires at least two reduction tiles
+per split. Partial products use bounded FP32 scratch storage (at most eight
+padded output planes); a separate reduction adds bias once and converts to the
+requested output dtype. Both kernels are included in candidate timing. Each
+launch overwrites its partials, so cached launches need no clearing or atomics.
+Cached unsplit winners allocate no partial buffer; cached split winners allocate
+only their selected number of planes.
+Different reduction orders can produce small floating-point differences.
+
+Candidate timing replays the prepared GEMM in a CUDA graph with a
+20 ms repetition parameter and compares median timings. This avoids Python launch gaps
 and repeated L2-cache flushing dominating the ranking of short kernels.
 Packing and quantization run before this isolated timing; the training loop
 does not need CUDA Graph mode. The full FP8 path still has its documented
@@ -677,7 +746,7 @@ outside the matrix. Buffers therefore do not require padding to the largest
 tile in the candidate set, including on calls that reuse a cached winner.
 
 Autotuning compiles and benchmarks candidates on the first call for each new
-shape, operand/output format, scale layout, bias policy, pipeline stage count,
+shape, operand/output format, scale layout, bias policy, pipeline stage policy,
 or CUDA device. Forward, input-gradient, and weight-gradient products have
 different shapes; incomplete training and validation batches introduce more
 shapes. These searches add first-use latency, especially in short runs with
@@ -691,19 +760,26 @@ Compare source snapshots on the target GPU with the
 ```bash
 python benchmarks/benchmark_fp8_autotune.py
 # Repeat --source to compare the current implementation with earlier snapshots.
-python benchmarks/benchmark_fp8_autotune.py --source src --source /path/to/baseline/src
+python benchmarks/benchmark_fp8_autotune.py --source src --source /path/to/baseline/src --num-stages 3
 ```
 
 It uses generated tensors for a `512 -> 10` CIFAR-10 classifier, with batch sizes
 2048, 848 (training tail), and 1808 (validation tail). Each source and measurement
 scope runs in a fresh process with an isolated Triton compilation cache by
 default; `--reuse-cache` retains the normal disk cache. Reports separate first-use
-latency from synchronized warmed timings and include cached winning tiles when
-the source exposes them. The full projection measurement
+latency from synchronized warmed timings and include cached winning tiles and
+per-key candidate median/p20/p80 device timings when the source exposes a tuner.
+Unavailable candidates are marked explicitly. Timing instrumentation runs only
+during cold searches. Use `--num-stages auto` for the new default, or an integer
+to compare snapshots that predate automatic stages. The full projection measurement
 includes quantization, forward, backward, and gradient-buffer reset; it excludes
 the convolutional backbone, optimizer, and data loading. Prequantized GEMM
-measurements include packing, padding, and dispatch, so they are not kernel-only
-timings. Neither CPU tests nor this benchmark's existence establishes a GPU
+measurements capture each snapshot's actual autograd operands, including independently
+quantized rowwise transposes, before timing. They include packing, padding,
+dispatch, and split scratch allocation, so they are not kernel-only timings.
+Candidate timings include split reduction but exclude allocation and packing;
+compare warmed wrapper and full-projection timings as well. Neither CPU tests
+nor this benchmark's existence establishes a GPU
 speedup.
 
 ## Black-box and white-box validation
