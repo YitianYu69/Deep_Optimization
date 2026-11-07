@@ -27,7 +27,7 @@ class PackagedConfigBlackBoxTests(unittest.TestCase):
         # developer's checkout. Build-system dependencies come from this Python.
         for name in ("pyproject.toml", "MANIFEST.in", "README.md", "LICENSE"):
             shutil.copy2(ROOT / name, staging / name)
-        for name in ("src", "configs", "tests", "docs", "examples", "benchmarks"):
+        for name in ("src", "configs", "tests", "docs", "examples", "benchmarks", "scripts"):
             shutil.copytree(ROOT / name, staging / name,
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info", ".DS_Store"))
         distributions = cls.directory / "distributions"
@@ -71,6 +71,10 @@ print(json.dumps({"wheel": wheel, "sdist": sdist}))
                     self.assertEqual(wheel.read(member), (ROOT / "configs" / (name + ".toml")).read_bytes())
         with tarfile.open(self.sdist) as sdist:
             names = sdist.getnames()
+            sync_scripts = [name for name in names if name.endswith("/scripts/sync_configs.py")]
+            self.assertEqual(len(sync_scripts), 1)
+            with sdist.extractfile(sync_scripts[0]) as stream:
+                self.assertEqual(stream.read(), (ROOT / "scripts/sync_configs.py").read_bytes())
             self.assertTrue(any(name.endswith("/src/deepopt/config.py") for name in names))
             template_members = [name for name in names
                                 if name.endswith("/src/deepopt/configs/templates/complete.toml")]

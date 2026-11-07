@@ -7,6 +7,7 @@ from torch import nn
 
 from deepopt._config_resolution import _UNSET
 
+from ._configuration import _capture_settings
 from ._validation import (arguments, autocast_spec, capture_guard, check_arguments,
                           cuda_device, static_arguments, tensor_spec, warmup_count)
 from .capture import CapturedFunction
@@ -64,8 +65,6 @@ class CapturedCallable:
 
     def __init__(self, function, sample_args, *, device=_UNSET, warmup=_UNSET, allow_unused_input=_UNSET,
                  pool=None, autograd=_UNSET, config=None):
-        from .core import _capture_settings
-
         self.config, options = _capture_settings(config, device=device, warmup=warmup,
                                                 allow_unused_input=allow_unused_input, autograd=autograd)
         device, warmup = options["device"], options["warmup"]

@@ -8,7 +8,7 @@ from torch import nn
 
 from deepopt import CUDAGraphCore, cuda_graph_core
 from deepopt.config import load_config, reset_config
-from tests.cuda.test_global_config_white_box import graph_config
+from tests.cuda.config_support import graph_config
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "Real CUDA hardware is required")

@@ -281,6 +281,7 @@ class MemoryEstimationTests(unittest.TestCase):
         trainer = Trainer(model, torch.optim.SGD(model.parameters(), lr=0.1), loss_fn=F.mse_loss)
         with FakeTensorMode() as permissive:
             batch = (torch.empty(2, 3), torch.empty(2, 2))
+        self.assertTrue(permissive.allow_fallback_kernels)
         with self.assertRaisesRegex(MemoryEstimationError, "strict"):
             estimate_training_memory(trainer, batch)
         with FakeTensorMode(allow_fallback_kernels=False):

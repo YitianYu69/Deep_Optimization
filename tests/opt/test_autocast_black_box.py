@@ -13,7 +13,7 @@ from deepopt import FP8Config, autocast
 from deepopt.opt.do_nn.functional import do_linear
 from deepopt.opt.do_nn.linear_module import DOLinear
 from deepopt.opt.policy import fp8_plan
-from tests.opt.test_fp8_black_box import _round_fp8
+from tests.opt.fp8_support import round_fp8
 
 
 class AutocastBlackBoxTests(unittest.TestCase):
@@ -35,9 +35,9 @@ class AutocastBlackBoxTests(unittest.TestCase):
         grad = torch.randn_like(output)
         output.backward(grad)  # The backward policy survives scope exit.
 
-        qx = _round_fp8(x, torch.float8_e4m3fn, (2, 3))
-        qw = _round_fp8(module.weight, torch.float8_e4m3fn, (3, 4))
-        qg = _round_fp8(grad, torch.float8_e5m2, (4, 2))
+        qx = round_fp8(x, torch.float8_e4m3fn, (2, 3))
+        qw = round_fp8(module.weight, torch.float8_e4m3fn, (3, 4))
+        qg = round_fp8(grad, torch.float8_e5m2, (4, 2))
         torch.testing.assert_close(output, qx @ qw.T + module.bias)
         torch.testing.assert_close(x.grad, qg @ qw)
         torch.testing.assert_close(module.weight.grad, qg.T @ qx)

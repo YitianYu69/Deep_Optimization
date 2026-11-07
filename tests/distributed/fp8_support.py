@@ -14,7 +14,7 @@ from torch.nn import functional as F
 
 from deepopt import Checkpoint, DDPCore, Trainer
 from deepopt.opt import transform_model
-from tests.opt.test_training_black_box import InterruptedTraining, fp8_plan, make_training
+from tests.opt.fp8_support import InterruptedTraining, fp8_plan, make_training
 
 
 class SharedProjectionModel(nn.Module):

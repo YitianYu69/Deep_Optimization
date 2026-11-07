@@ -13,7 +13,7 @@ from torch import distributed as dist, nn
 import torch.multiprocessing as mp
 from torch.utils.data import Dataset, TensorDataset
 
-from deepopt import Checkpoint, DDPCore, FiniteCheck, LossResult, MultiOptimizer, Trainer, TrainingCore, TrainingModule, TrainingRuntime
+from deepopt import Checkpoint, DDPCore, FiniteCheck, LossResult, MultiOptimizer, Trainer, TrainingModule, TrainingRuntime
 from deepopt.data import ResumableDataLoader, build_loaders
 from deepopt.engine.checkpointing.checkpoint import read_checkpoint
 

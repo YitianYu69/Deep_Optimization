@@ -308,6 +308,20 @@ class ResumeRebatchLoaderTests(unittest.TestCase):
         self.assertEqual([len(batch[0]) for batch in loader], [3, 3, 3, 2])
         self.assertEqual(loader.batch_sampler.batch_origin, 0)
 
+    def test_remaining_batches_uses_delivery_cursor_and_new_batch_size(self):
+        loader = ResumableDataLoader(list(range(11)), batch_size=4, generator=torch.Generator().manual_seed(7))
+        self.assertEqual(loader.remaining_batches(), 3)
+        iterator = iter(loader)
+        next(iterator)
+        state = loader.state_dict()
+        loader.batch_sampler.position = 11  # Simulate dispatch running ahead.
+        self.assertEqual(loader.remaining_batches(), 2)
+        loader.load_state_dict(state)
+        loader.set_batch_size(3)
+        self.assertEqual(loader.remaining_batches(), 3)
+        list(loader)
+        self.assertEqual(loader.remaining_batches(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from deepopt import MultiOptimizer, Trainer
 from deepopt.config import get_config, load_config, reset_config
 from deepopt.logger import logging_session
-from deepopt.memory import summarize_model_memory, log_model_memory
+from deepopt.memory import summarize_model_memory
 
 
 class MemoryStatsTests(unittest.TestCase):

@@ -2,7 +2,6 @@ from dataclasses import asdict
 from functools import partial
 import unittest
 
-import torch
 from torch import nn
 
 from deepopt.config import ConfigError, config_from_dict

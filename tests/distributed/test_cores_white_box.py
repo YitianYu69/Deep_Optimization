@@ -136,6 +136,21 @@ class DDPCoreWhiteBoxTests(unittest.TestCase):
                     DDPCore(nn.Linear(1, 1), "cpu", options)
             constructor.assert_not_called()
 
+    def test_unobserved_events_and_unweighted_divisor_need_no_collective(self):
+        core = object.__new__(DDPCore)
+        core._observer_interests = set()
+        checks = CheckObservers(False)
+
+        def unavailable():
+            raise AssertionError("Disabled payload was inspected")
+            yield
+
+        with patch("torch.distributed.all_reduce", side_effect=AssertionError("redundant collective")), \
+                patch("torch.distributed.all_gather_object", side_effect=AssertionError("redundant object collective")):
+            self.assertFalse(core.interested(checks, "weights"))
+            core.observe(checks, "loss", unavailable())
+            self.assertEqual(core.gradient_divisor(1, normalize=False), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

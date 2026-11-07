@@ -3,6 +3,10 @@
 from dataclasses import asdict
 from importlib.resources import files
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +18,64 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class PackagedConfigWhiteBoxTests(unittest.TestCase):
+    def run_sync(self, root, *arguments):
+        return subprocess.run(
+            [sys.executable, str(root / "scripts/sync_configs.py"), *arguments],
+            cwd=root.parent, capture_output=True, text=True, timeout=10,
+        )
+
+    def make_sync_checkout(self, directory):
+        root = Path(directory) / "checkout"
+        (root / "scripts").mkdir(parents=True)
+        shutil.copyfile(ROOT / "scripts/sync_configs.py", root / "scripts/sync_configs.py")
+        source = root / "src/deepopt/configs"
+        source.mkdir(parents=True)
+        return root, source
+
+    def test_sync_check_detects_drift_without_changing_checkout_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, source = self.make_sync_checkout(directory)
+            (source / "baseline.toml").write_bytes(b"name = 'updated'\r\n")
+            (source / "templates").mkdir()
+            (source / "templates/complete.toml").write_bytes(b"# complete\n")
+            destination = root / "configs"
+            destination.mkdir()
+            stale = destination / "baseline.toml"
+            stale.write_bytes(b"name = 'old'\n")
+            before = stale.stat().st_mtime_ns
+
+            result = self.run_sync(root, "--check")
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("out of sync: configs/baseline.toml", result.stderr)
+            self.assertIn("out of sync: configs/templates/complete.toml", result.stderr)
+            self.assertEqual(stale.read_bytes(), b"name = 'old'\n")
+            self.assertEqual(stale.stat().st_mtime_ns, before)
+            self.assertFalse((destination / "templates").exists())
+
+            synced = self.run_sync(root)
+            self.assertEqual(synced.returncode, 0, synced.stdout + synced.stderr)
+            for relative in ("baseline.toml", "templates/complete.toml"):
+                self.assertEqual((source / relative).read_bytes(), (destination / relative).read_bytes())
+            self.assertEqual(self.run_sync(root, "--check").returncode, 0)
+            before = stale.stat().st_mtime_ns
+            self.assertEqual(self.run_sync(root).returncode, 0)
+            self.assertEqual(stale.stat().st_mtime_ns, before)
+
+    def test_sync_reports_extra_checkout_configs_without_deleting_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, source = self.make_sync_checkout(directory)
+            (source / "baseline.toml").write_bytes(b"# baseline\n")
+            (root / "configs").mkdir()
+            extra = root / "configs/personal.toml"
+            extra.write_bytes(b"# personal experiment\n")
+            for arguments in (("--check",), ()):
+                with self.subTest(arguments=arguments):
+                    result = self.run_sync(root, *arguments)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("no packaged source: configs/personal.toml", result.stderr)
+                    self.assertEqual(extra.read_bytes(), b"# personal experiment\n")
+
     def test_complete_template_is_packaged_separately_from_named_presets(self):
         resource = files("deepopt.configs").joinpath("templates", "complete.toml")
         self.assertEqual(resource.read_bytes(), (ROOT / "configs/templates/complete.toml").read_bytes())

@@ -9,7 +9,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from . import _process as distributed
-from deepopt._config_resolution import _UNSET, ResolvedConfig, resolve_config
+from deepopt._config_resolution import _UNSET
 from deepopt.opt.policy import resolve_fp8_config
 
 
@@ -44,11 +44,12 @@ class DDPCore:
                                                       ddp_options=options)
             runtime = self._config_snapshot.get("runtime", {})
             selected_device = runtime.get("device", "cpu")
-            if options is _UNSET:
-                options = runtime.get("ddp", {})
-            else:
-                self._config_snapshot.setdefault("runtime", {})["ddp"] = options or {}
-                self._config_snapshot = resolve_config(ResolvedConfig(self._config_snapshot))
+            if options is not _UNSET:
+                # Explicit options replace the inherited table. execution_config
+                # already validated them; preserve the original native kwargs
+                # without resolving the whole snapshot a second time.
+                runtime["ddp"] = deepcopy(options or {})
+            options = runtime.get("ddp", {})
         self.model = model
         self.device = (distributed.initialize_distributed("auto").device
                        if selected_device == "auto" else torch.device(selected_device))
@@ -57,23 +58,11 @@ class DDPCore:
         self.options = {"find_unused_parameters": False, "broadcast_buffers": True,
                         "gradient_as_bucket_view": True, **(options or {})}
         self.validation_sync_buffers = self.options.pop("validation_sync_buffers", True)
-        if type(self.validation_sync_buffers) is not bool:
-            raise ValueError("validation_sync_buffers must be a boolean")
         self._observer_interests = set()
         if distributed.world_size() < 2:
             raise ValueError("DDPCore requires an initialized multi-rank process group")
         if isinstance(model, DistributedDataParallel):
             raise ValueError("Pass the unwrapped model; DDPCore wraps the complete step in DDP")
-        allowed = {"find_unused_parameters", "broadcast_buffers", "gradient_as_bucket_view", "bucket_cap_mb", "static_graph"}
-        if set(self.options) - allowed:
-            raise ValueError("ddp_options supports find_unused_parameters, broadcast_buffers, "
-                             "gradient_as_bucket_view, bucket_cap_mb, and static_graph")
-        for name, value in self.options.items():
-            if name == "bucket_cap_mb":
-                if type(value) not in (int, float) or not 0 < value < float("inf"):
-                    raise ValueError("DDP bucket_cap_mb must be positive and finite")
-            elif type(value) is not bool:
-                raise ValueError(f"DDP {name} must be a boolean")
         with distributed.collective_errors("FP8 configuration"):
             self.fp8 = resolve_fp8_config(model, fp8, config=self._config_snapshot)
         distributed.require_equal(asdict(self.fp8), "FP8 configuration")

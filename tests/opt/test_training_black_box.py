@@ -4,58 +4,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
-import torch
-from torch import nn
-from torch.nn import functional as F
-from torch.utils.data import TensorDataset
-
-from deepopt import Checkpoint, Trainer
-from deepopt.data import ResumableDataLoader
-from deepopt.opt import transform_model
-
-
-def fp8_plan(backend="reference"):
-    return {
-        "fp8_training": {"fp8_dtypes": {
-            "activation": torch.float8_e4m3fn,
-            "weight": torch.float8_e4m3fn,
-            "grad": torch.float8_e4m3fn if backend == "triton" else torch.float8_e5m2,
-        }, "backend": backend},
-        "block_shapes": {name: None for name in ("activation", "weight", "grad")},
-    }
-
-
-def make_training(mode="full", *, device="cpu", backend="reference"):
-    torch.manual_seed(81)
-    model = nn.Sequential(nn.Linear(8, 16), nn.Tanh(), nn.Linear(16, 4)).to(device)
-    model, _ = transform_model(model, plan=fp8_plan(backend), trace_mode=mode)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=.002)
-    trainer = Trainer(model, optimizer, loss_fn=F.mse_loss, accumulation_steps=2, device=device,
-                      scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=.9))
-    rng = torch.Generator().manual_seed(12)
-    dataset = TensorDataset(torch.randn(13, 8, generator=rng), torch.randn(13, 4, generator=rng))
-    loader = ResumableDataLoader(dataset, batch_size=3,
-                                 generator=torch.Generator().manual_seed(27))
-    return trainer, loader
-
-
-def assert_state_equal(test, actual, expected):
-    if isinstance(expected, torch.Tensor):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    elif isinstance(expected, dict):
-        test.assertEqual(actual.keys(), expected.keys())
-        for key in expected:
-            assert_state_equal(test, actual[key], expected[key])
-    elif isinstance(expected, (tuple, list)):
-        test.assertEqual(len(actual), len(expected))
-        for value, reference in zip(actual, expected):
-            assert_state_equal(test, value, reference)
-    else:
-        test.assertEqual(actual, expected)
-
-
-class InterruptedTraining(Exception):
-    pass
+from deepopt import Checkpoint
+from tests.opt.fp8_support import InterruptedTraining, make_training
+from tests.state_support import assert_state_equal
 
 
 class FP8TrainingBlackBoxTests(unittest.TestCase):

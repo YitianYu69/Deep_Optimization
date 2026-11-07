@@ -184,12 +184,21 @@ separate from the four named `builtin:` presets.
 
 ## Packaged presets and local input contracts
 
-The repository has two preset locations:
+The packaged TOML files are the authoritative presets. The repository retains
+generated checkout copies so existing commands and file paths keep working:
 
 | Location | Use |
 | --- | --- |
-| [configs/](../../configs) | Editable TOML recipes for repository users |
-| [src/deepopt/configs/](../../src/deepopt/configs) | Packaged copies available as `deepopt.configs` in wheels and source distributions |
+| [src/deepopt/configs/](../../src/deepopt/configs) | Authoritative presets and template, available as `deepopt.configs` in wheels and source distributions |
+| [configs/](../../configs) | Generated, byte-identical copies for existing checkout commands |
+
+For a framework preset change, edit the packaged source and run
+`python scripts/sync_configs.py` from the repository root. CI runs the same
+script with `--check`, which reports missing, changed, or extra checkout TOML
+files without writing anything. Synchronization overwrites changed generated
+copies; extra TOML files are reported and left untouched for manual review.
+Keep personal experiments in a separate directory or use `write_config_template()`
+to create a new file. See the [development workflow](../architecture/README.md#configuration-and-lint-maintenance).
 
 The validation/schema API remains [deepopt.config](../../src/deepopt/config.py).
 Installed presets use package resources, so loading them does not depend on the
@@ -211,8 +220,8 @@ Use `builtin:baseline`, `builtin:ddp`, `builtin:fp8`, or `builtin:scheduling` in
 the CLI or full-experiment Python entry points. Only the explicit `builtin:`
 prefix selects a packaged preset: a missing local file raises an error instead
 of silently selecting a default. Each preset load returns independent data;
-modifying a returned dictionary does not modify installed files. Tests keep the
-repository and packaged copies in sync.
+modifying a returned dictionary does not modify installed files. Tests and the
+synchronization check enforce identical repository and packaged copies.
 
 | API | Accepted configuration input |
 | --- | --- |

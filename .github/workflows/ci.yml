@@ -36,7 +36,8 @@ jobs:
           scores = torch.tensor([0.9, 0.8])
           assert torchvision.ops.nms(boxes, scores, 0.5).tolist() == [0]
           PY
-      - run: python -m ruff check --select E9,F63,F7,F82 src tests
+      - run: python -m ruff check src tests examples benchmarks scripts
+      - run: python scripts/sync_configs.py --check
       - run: python -m mypy --strict --follow-imports=skip --ignore-missing-imports src/deepopt/engine/execution/policy.py
       - name: Fast CPU white-box and black-box tests
         env:

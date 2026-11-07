@@ -3,12 +3,11 @@
 from dataclasses import asdict, replace
 from functools import partial
 import json
-import os
 from pathlib import Path
-import tempfile
 
 from .config import config_from_dict
 from ._config_resolution import _UNSET, ResolvedConfig, config_scope, resolve_config
+from ._io import atomic_write_text
 from deepopt.engine.checkpointing.checkpoint import environment, read_checkpoint, require_step_loader, restore_checkpoint, save_checkpoint
 from deepopt.engine.checkpointing.checkpoint import restore_schedules_for_evaluation, restore_ema_for_evaluation
 from deepopt.memory.planning import apply_batch_size_plan, plan_batch_size
@@ -24,16 +23,7 @@ logger = init_logger(__name__)
 def _write_text(path: Path, text: str) -> None:
     if not distributed.is_main_process():
         return
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         delete=False, suffix=".tmp") as file:
-            temporary = Path(file.name)
-            file.write(text)
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    atomic_write_text(path, text)
 
 
 def _append_json_record(path: Path, record: dict) -> None:

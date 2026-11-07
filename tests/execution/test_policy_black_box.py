@@ -7,7 +7,7 @@ import unittest
 import torch
 from torch import nn
 
-from deepopt import Checkpoint, DiagnosticPolicy, LossResult, MultiOptimizer, Trainer
+from deepopt import Checkpoint, LossResult, MultiOptimizer, Trainer
 from deepopt.engine.strategies import ExplicitObjective
 from deepopt.engine.checkpointing.checkpoint import read_checkpoint
 

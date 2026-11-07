@@ -7,8 +7,10 @@ import torch
 
 from deepopt._config_resolution import _UNSET
 
+from ._configuration import _capture_settings
 from ._validation import (arguments, autocast_spec, capture_guard, check_arguments,
                           cuda_device, static_arguments, warmup_count)
+from ._warmup import warmup_on_stream
 
 
 class CapturedGraph:
@@ -21,8 +23,6 @@ class CapturedGraph:
 
     def __init__(self, *, device=_UNSET, pool=None, stream=None, capture_error_mode=_UNSET,
                  warmup=_UNSET, config=None):
-        from .core import _capture_settings
-
         self.config, options = _capture_settings(config, device=device, warmup=warmup,
                                                 capture_error_mode=capture_error_mode)
         device, warmup = options["device"], options["warmup"]
@@ -134,13 +134,8 @@ class CapturedFunction:
             if stream.device != device:
                 raise ValueError("Capture stream must belong to the graph's device")
             self._capture.stream = stream
-            stream.wait_stream(torch.cuda.current_stream(device))
-            try:
-                with torch.cuda.stream(stream):
-                    for _ in range(self._capture.warmup):
-                        self.function(*self._inputs)
-            finally:
-                torch.cuda.current_stream(device).wait_stream(stream)
+            warmup_on_stream(self.function, self._inputs, {}, iterations=self._capture.warmup,
+                             stream=stream, device=device)
             # Warmup may have modified inputs; start capture from caller values.
             for target, source in zip(self._inputs, args):
                 target.copy_(source)

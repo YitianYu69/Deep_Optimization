@@ -7,9 +7,19 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..quantization.tensor import QuantizedTensor
 from ._triton_autotune import (
-    AUTOTUNE_KEY, AUTOTUNE_TILES, MAX_BLOCK_M, MAX_BLOCK_N, MAX_BLOCK_K,
+    AUTOTUNE_KEY, AUTOTUNE_TILES, MAX_BLOCK_K,
     prune_gemm_configs, set_descriptor_block_shapes,
 )
+
+
+def _benchmark_gemm(kernel_call, quantiles):
+    """Rank short kernels without Python launch gaps or per-call L2 flushing."""
+    from triton.testing import do_bench_cudagraph
+
+    # The benchmark uses a separate stream; packing/scale copies on the caller's
+    # stream must finish first. Only the already-prepared GEMM is captured.
+    torch.cuda.synchronize()
+    return do_bench_cudagraph(kernel_call, rep=5, quantiles=quantiles)
 
 
 @triton.autotune(
@@ -21,6 +31,7 @@ from ._triton_autotune import (
     ],
     key=list(AUTOTUNE_KEY),
     prune_configs_by={"early_config_prune": prune_gemm_configs},
+    do_bench=_benchmark_gemm,
 )
 @triton.jit
 def _gemm_nt_kernel(
@@ -99,7 +110,6 @@ def _gemm_nt_kernel(
 
 
 
-
 def _pack_fp8_rows(data: torch.Tensor, block_k: int) -> torch.Tensor:
     """
     Make FP8 rows contiguous and pad K with zeros
@@ -128,7 +138,7 @@ def gemm_nt(
     *,
     out_dtype: torch.dtype = torch.float32,
     bias: torch.Tensor | None = None,
-    num_stages: int = 3
+    num_stages: int = 3,
 ) -> torch.Tensor:
 
     """
@@ -172,37 +182,43 @@ def gemm_nt(
 
     native_fp8 = all(operand.block_shape is None or operand.block_shape[1] % 32 == 0
                      for operand in (a, b))
-    # Allocate once for every candidate. Descriptor hooks and the launch grid
-    # follow the selected tiles, including on autotuner cache hits.
-    padded_k = triton.cdiv(k, MAX_BLOCK_K) * MAX_BLOCK_K
+    # Scalar scales cover the full logical K for every candidate. This metadata
+    # must not constrain BLOCK_K when physical row padding is smaller than a tile.
+    scale_k = triton.cdiv(k, MAX_BLOCK_K) * MAX_BLOCK_K
 
     # Represent tensorwise scaling as a single logical scale block when the other operands is blockwise
-    a_block_rows, a_block_cols = a.block_shape or (m, padded_k)
-    b_block_rows, b_block_cols = b.block_shape or (n, padded_k)
+    a_block_rows, a_block_cols = a.block_shape or (m, scale_k)
+    b_block_rows, b_block_cols = b.block_shape or (n, scale_k)
 
     tensorwise = a.block_shape is None and b.block_shape is None
     with torch.cuda.device(a.data.device):
-        a_packed = _pack_fp8_rows(a.data, MAX_BLOCK_K)
-        b_packed = _pack_fp8_rows(b.data, MAX_BLOCK_K)
+        # TMA needs 16-byte row strides, not whole-tile storage. Logical
+        # descriptor bounds zero-fill edge loads and discard edge stores.
+        # All candidates now benchmark exactly the same production layout.
+        a_packed = _pack_fp8_rows(a.data, 16)
+        b_packed = _pack_fp8_rows(b.data, 16)
 
+        # The kernel indexes scale grids as flat row-major arrays, including
+        # when callers supply a valid QuantizedTensor with strided scales.
         a_scale_inv = a.scale_inv.contiguous()
         b_scale_inv = b.scale_inv.contiguous()
 
         a_desc = TensorDescriptor.from_tensor(
-            a_packed, [64, 32]
+            a_packed[:, :k], [64, 32]
         )
         b_desc = TensorDescriptor.from_tensor(
-            b_packed, [64, 32]
+            b_packed[:, :k], [64, 32]
         )
 
-        padded_m = triton.cdiv(m, MAX_BLOCK_M) * MAX_BLOCK_M
-        padded_n = triton.cdiv(n, MAX_BLOCK_N) * MAX_BLOCK_N
+        output_alignment = 4 if out_dtype == torch.float32 else 8
+        padded_n = triton.cdiv(n, output_alignment) * output_alignment
 
         output_storage = torch.empty(
-            (padded_m, padded_n), dtype=out_dtype, device=a.data.device
+            (m, padded_n), dtype=out_dtype, device=a.data.device
         )
+        output = output_storage[:, :n]
         c_desc = TensorDescriptor.from_tensor(
-            output_storage, [64, 64]
+            output, [64, 64]
         )
 
         bias_arg = output_storage if bias is None else bias.contiguous()
@@ -227,4 +243,4 @@ def gemm_nt(
             PIPELINE_STAGES=num_stages,
         )
     
-    return output_storage[:m, :n]
+    return output

@@ -9,10 +9,7 @@ import torch
 from deepopt import Checkpoint, TrainingCore
 from deepopt.engine.checkpointing.checkpoint import read_checkpoint
 
-if __package__:
-    from .test_training_black_box import make_training
-else:
-    from test_training_black_box import make_training
+from tests.opt.fp8_support import make_training
 
 
 class FP8TrainingWhiteBoxTests(unittest.TestCase):

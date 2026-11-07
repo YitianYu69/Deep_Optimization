@@ -9,12 +9,7 @@ import torch
 from deepopt import CUDAGraphCore, cuda_graph_core
 from deepopt.config import get_config, load_config, reset_config
 from deepopt.cuda_graph import CapturedCallable, CapturedFunction, CapturedGraph
-
-
-def graph_config(**options):
-    return {"name": "capture-defaults", "seed": 17,
-            "training": {"epochs": 1, "batch_size": 4, "learning_rate": 0.01},
-            "runtime": {"device": "cpu", "cuda_graph": options}}
+from tests.cuda.config_support import graph_config
 
 
 class CUDAGlobalConfigWhiteBoxTests(unittest.TestCase):

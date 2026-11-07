@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from deepopt import CUDAGraphCore, TrainingRuntime, cuda_graph_core
-from deepopt.cuda_graph import CapturedFunction, CapturedGraph
+from deepopt.cuda_graph import CapturedFunction
 from deepopt.cuda_graph._validation import (arguments, capture_guard, check_arguments,
                                             static_arguments, tensor_spec)
 from deepopt.cuda_graph.model import _own_backward_gradients

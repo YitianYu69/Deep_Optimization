@@ -1,7 +1,6 @@
 from contextlib import redirect_stdout, redirect_stderr
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import io
-import json
 from pathlib import Path
 import tempfile
 import unittest
