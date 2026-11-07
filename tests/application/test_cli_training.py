@@ -34,6 +34,7 @@ validation_samples = 9
 
             first = cli("train", "--config", config, "--output", output)
             self.assertEqual(json.loads(first.stdout)["epoch"], 1)
+            self.assertEqual(json.loads(first.stdout)["batch_size"], 7)
             first_logs = list((output / "logs").glob("*.log"))
             self.assertEqual(len(first_logs), 1)
             first_text = first_logs[0].read_text()
@@ -50,7 +51,8 @@ validation_samples = 9
             result = json.loads(cli("evaluate", "--checkpoint", output / "last.pt", "--device", "cpu").stdout)
             self.assertEqual(result["epoch"], 2)
             self.assertEqual(result["validation"]["samples"], 9)
-            self.assertEqual(len((output / "metrics.jsonl").read_text().splitlines()), 2)
+            rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+            self.assertEqual([row["batch_size"] for row in rows], [7, 7])
             self.assertTrue((output / "best.pt").is_file())
             self.assertTrue((output / "last_step.pt").is_file())
             # Refinish the final epoch from its last optimizer update, without

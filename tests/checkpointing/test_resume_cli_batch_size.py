@@ -54,6 +54,7 @@ validation_samples = 9
         first = self.cli("train", "--config", self.config_path, "--output", output,
                          "--batch-size", 4, "--no-progress")
         first_row = json.loads(first.stdout)
+        self.assertEqual(first_row["batch_size"], 4)
         self.assertEqual(first_row["optimizer_steps"], 5)
         self.assertEqual(first_row["train"]["samples"], 17)
         self.assertEqual(json.loads((output / "config.json").read_text())["training"]["batch_size"], 4)
@@ -62,13 +63,15 @@ validation_samples = 9
                            "--batch-size", 6, "--batch-size-mode", "manual", "--no-progress")
         row = json.loads(resumed.stdout)
         self.assertEqual(row["epoch"], 2)
+        self.assertEqual(row["batch_size"], 6)
         self.assertEqual(row["optimizer_steps"], 8)  # Five old batches, then three new batches.
         self.assertEqual(row["train"]["samples"], 17)
         self.assertEqual(row["validation"]["samples"], 9)
         self.assertIn("batch", resumed.stderr.lower())
         self.assertIn("4", resumed.stderr)
         self.assertIn("6", resumed.stderr)
-        self.assertEqual(len((output / "metrics.jsonl").read_text().splitlines()), 2)
+        rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+        self.assertEqual([row["batch_size"] for row in rows], [4, 6])
         self.assertEqual(json.loads((output / "config.json").read_text())["training"]["batch_size"], 6)
         payload = torch.load(output / "last.pt", map_location="cpu", weights_only=True)
         self.assertEqual(payload["config"]["training"]["batch_size"], 6)

@@ -58,6 +58,12 @@ the transformation report and loss, and writes no checkpoints or downloads.
 `reference` quantizes to FP8, dequantizes, and multiplies in FP32. Its passing
 tests validate semantics; they do not establish GPU kernel correctness or speed.
 
+CPU scaling uses a PyTorch reference implementation for testing and does not
+require Triton. CUDA scaling lazily imports the fused Triton implementation;
+CUDA inputs never silently switch to the CPU reference path.
+CUDA fused scaling requires power-of-two block dimensions and excludes `(1, 1)`;
+CPU reference tests can use arbitrary positive block dimensions.
+
 `--block-size 32` uses `(32, 32)` scaling grids for activation, weight, and
 gradient operands. Omit it for tensorwise scaling. `--precision bf16` selects
 the runtime's CUDA autocast mode; it does not change the FP8 operand format.
@@ -155,6 +161,23 @@ FP32/BF16/FP16. Empty operands, nonfinite quantization inputs, and second-order
 derivatives are unsupported. **Trainer-level AMP and FP8 operand formats are
 separate choices**: CPU/CUDA can use FP32 with AMP disabled, and CUDA can enable
 BF16 AMP. The FP8 plan independently selects the formats used by DO projections.
+
+### Rowwise backward quantization
+
+Rowwise activation or gradient grids `(1, C)` with `C > 1` quantize each needed
+GEMM orientation independently from the original higher-precision tensor.
+Forward uses `Q_activation(X)` and `Q_weight(W)`. Input gradients use
+`Q_grad(G) @ Q_weight(W)`. For weight gradients, rowwise roles instead use
+`Q_grad(G.T)` and/or `Q_activation(X.T)`; other roles transpose their previously
+quantized values and scale grids. In particular, quantizing `X.T` rowwise is
+intentionally different from transposing a rowwise quantization of `X`.
+The CPU reference backend follows this same orientation-dependent contract.
+
+This keeps rowwise scales aligned with the reduction axis in the weight-gradient
+GEMM. With activation `(1, 32)`, weight `(32, 32)`, and gradient `(1, 32)` or
+`(32, 32)`, all three GEMMs select the native FP8 path. Other block grids still
+need compatible reduction widths (multiples of 32); arbitrary unaligned grids
+retain the dequantization fallback.
 
 ## Combine FP8 with AMP in a context
 
@@ -614,31 +637,74 @@ python examples/optimization/fp8_training.py --device cuda --backend triton
 python examples/optimization/fp8_training.py --device cuda --backend triton --block-size 32 --precision bf16
 ```
 
-The Triton backend supports independent `e4m3fn`/`e5m2` formats and any positive
-block dimensions. For example, activation `[1, 32]` with weight and gradient
+The Triton backend supports independent `e4m3fn`/`e5m2` formats. Fused CUDA
+quantization requires power-of-two block dimensions other than `[1, 1]`.
+For example, activation `[1, 32]` with weight and gradient
 `[32, 32]` is supported. Pipeline stages can be 1 through 4.
 
 Tensorwise scaling and blockwise scales whose reduction-axis widths are multiples
 of 32 use native FP8 dot products. Other layouts use fused per-element FP32
-dequantization followed by a `tf32x3` dot product. This includes the activation's
-transposed `[32, 1]` blocks in the weight-gradient computation for the example
-above. The fallback preserves the stored FP8 values and scales without additional
+dequantization followed by a `tf32x3` dot product. Rowwise activation and gradient
+roles use the independently quantized orientations described above to retain
+native FP8 reductions. Other transposes may still require the fallback when
+their reduction-axis scale widths are unaligned.
+The fallback preserves the stored FP8 values and scales without additional
 FP8 quantization, but may have lower throughput than native FP8 dot products.
 The backend packs strided/misaligned operands, pads partial tiles, and returns
 FP32/BF16/FP16 results. Correctness/performance must be measured on the target GPU.
 
-The kernel uses Triton's native `@triton.autotune` to select matrix tile sizes
-and warp counts. The configured `num_stages` remains fixed; candidates with a
-different stage count or incompatible reduction-scale boundaries are pruned.
-The FP32/TF32x3 path uses a smaller candidate set to limit resource use.
+The kernel automatically uses Triton's native `@triton.autotune` to select
+matrix tile sizes and warp counts. The bounded candidate set accounts for the
+matrix shape, including 16- and 32-wide tiles for narrow dimensions, and retains
+the historical static configuration as a candidate. The configured `num_stages`
+remains fixed; candidates with incompatible reduction-scale boundaries or
+resource requirements are pruned. Quantization `block_shapes` stay independent
+of kernel tile sizes.
 
-The first call for a new shape, operand/output format, scale layout, bias policy,
-pipeline stage count, or CUDA device benchmarks the compatible candidates.
-This adds first-use latency; subsequent matching calls reuse the in-process
-winner. TMA descriptor shapes and the launch grid follow the selected candidate
-on both tuning and cached calls. Padding accommodates all candidate tiles.
-Set `TRITON_PRINT_AUTOTUNING=1` to inspect Triton's selected configurations.
-No speedup is implied without measurements on the target GPU.
+Candidate timing replays the prepared GEMM in a CUDA graph with a bounded
+repetition budget and compares median timings. This avoids Python launch gaps
+and repeated L2-cache flushing dominating the ranking of short kernels.
+Packing and quantization run before this isolated timing; the training loop
+does not need CUDA Graph mode. The full FP8 path still has its documented
+capture limitation. The search follows the shape-aware approach used by
+[Inductor's GEMM heuristics](https://github.com/pytorch/pytorch/blob/main/torch/_inductor/heuristics/template/triton.py)
+and the descriptor-based tuning in
+[Triton's TMA matmul tutorial](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html).
+
+Packing uses only the stride alignment required by TMA. Logical descriptor
+bounds handle partial tiles through zero-filled loads and discarded stores
+outside the matrix. Buffers therefore do not require padding to the largest
+tile in the candidate set, including on calls that reuse a cached winner.
+
+Autotuning compiles and benchmarks candidates on the first call for each new
+shape, operand/output format, scale layout, bias policy, pipeline stage count,
+or CUDA device. Forward, input-gradient, and weight-gradient products have
+different shapes; incomplete training and validation batches introduce more
+shapes. These searches add first-use latency, especially in short runs with
+small projections. Matching calls reuse the in-process winner. Set
+`TRITON_PRINT_AUTOTUNING=1` to inspect selected configurations. A bounded search
+does not guarantee the fastest possible kernel; measure on the target GPU.
+
+Compare source snapshots on the target GPU with the
+[classifier benchmark](../../benchmarks/benchmark_fp8_autotune.py):
+
+```bash
+python benchmarks/benchmark_fp8_autotune.py
+# Repeat --source to compare the current implementation with earlier snapshots.
+python benchmarks/benchmark_fp8_autotune.py --source src --source /path/to/baseline/src
+```
+
+It uses generated tensors for a `512 -> 10` CIFAR-10 classifier, with batch sizes
+2048, 848 (training tail), and 1808 (validation tail). Each source and measurement
+scope runs in a fresh process with an isolated Triton compilation cache by
+default; `--reuse-cache` retains the normal disk cache. Reports separate first-use
+latency from synchronized warmed timings and include cached winning tiles when
+the source exposes them. The full projection measurement
+includes quantization, forward, backward, and gradient-buffer reset; it excludes
+the convolutional backbone, optimizer, and data loading. Prequantized GEMM
+measurements include packing, padding, and dispatch, so they are not kernel-only
+timings. Neither CPU tests nor this benchmark's existence establishes a GPU
+speedup.
 
 ## Black-box and white-box validation
 

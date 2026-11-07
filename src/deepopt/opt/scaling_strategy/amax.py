@@ -4,10 +4,12 @@ Current amax scaling for 2D tensor.
 
 from dataclasses import dataclass 
 
-
 import torch
 import torch.nn.functional as F 
 
+
+def is_not_power_of_2(n: int) -> bool:
+    return n <= 0 or (n & (n - 1)) != 0
 
 
 @dataclass(frozen=True)
@@ -45,51 +47,59 @@ class AmaxScaling:
             raise TypeError("Input must be FP32, BF16, FP16, or Int32")
         if fp8_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
             raise ValueError("Unsupported FP8 dtype")
+        if x.device.type not in ("cpu", "cuda"):
+            raise ValueError("AmaxScaling supports CPU and CUDA tensors")
+        if x.device.type == "cuda" and self.block_shape is not None:
+            # These restrictions belong to the fused CUDA kernel, not the CPU
+            # reference implementation used for numerical testing.
+            if all(size == 1 for size in self.block_shape):
+                raise ValueError("block_shape must not be (1, 1)")
+            if any(is_not_power_of_2(size) for size in self.block_shape):
+                raise ValueError("block_shape must be powers of two")
 
         x_fp32 = x.float()
         if not torch.isfinite(x_fp32).all():
             raise ValueError("AmaxScaling requires finite inputs")
         
+        fp8_max = torch.finfo(fp8_dtype).max
+        if x.device.type == "cpu":
+            return self._compute_cpu(x_fp32, fp8_max)
+
+        # Fused kernels use row-major addressing rather than tensor strides.
+        x_fp32 = x_fp32.contiguous()
+        # CUDA always uses the fused implementation. A missing Triton install
+        # remains an error on CUDA; CPU testing never imports this module.
+        from ..backends.scaling_utils.fused_amax import block_amax_scalar, global_amax_scalar
+
+        if self.block_shape is None:
+            scale, scale_inv = global_amax_scalar(x_fp32, fp8_max)
+            scale = scale.reshape(1, 1)
+            scale_inv = scale_inv.reshape(1, 1)
+        else:
+            block_rows, block_cols = self.block_shape
+            scale, scale_inv = block_amax_scalar(
+                x_fp32, block_rows, block_cols, fp8_max
+            )
+
+        return ScalingResult(
+            scale=scale,
+            scale_inv=scale_inv,
+            block_shape=self.block_shape
+        )
+
+    def _compute_cpu(self, x_fp32: torch.Tensor, fp8_max: float) -> ScalingResult:
+        """PyTorch reference scaling, including strided inputs and edge blocks."""
         abs_x = x_fp32.abs()
         if self.block_shape is None:
             amax = abs_x.amax().reshape(1, 1)
         else:
             block_rows, block_cols = self.block_shape
-            rows, cols = x.shape
-
-            pad_rows = (-rows) % block_rows
-            pad_cols = (-cols) % block_cols
-
-            padded = F.pad(
-                abs_x,
-                (0, pad_cols, 0, pad_rows),
-                value=0.0
-            )
-
-            num_row_blocks = padded.shape[0] // block_rows
-            num_col_blocks = padded.shape[1] // block_cols
-
-            blocks = padded.reshape(
-                num_row_blocks,
-                block_rows,
-                num_col_blocks,
-                block_cols
-            )
-
-            amax = blocks.amax(dim=(1, 3))
-        
-        fp8_max = torch.finfo(fp8_dtype).max
-
-        safe_amax = amax.clamp_min(1e-12)
-        scale = fp8_max / safe_amax
-        scale = torch.where(
-            amax == 0,
-            torch.ones_like(scale),
-            scale
-        )
-
-        return ScalingResult(
-            scale=scale,
-            scale_inv=scale.reciprocal(),
-            block_shape=self.block_shape
-        )
+            rows, cols = x_fp32.shape
+            padded = F.pad(abs_x, (0, (-cols) % block_cols, 0, (-rows) % block_rows))
+            amax = padded.reshape(
+                (rows + block_rows - 1) // block_rows, block_rows,
+                (cols + block_cols - 1) // block_cols, block_cols,
+            ).amax(dim=(1, 3))
+        scale = fp8_max / amax.clamp_min(1e-12)
+        scale = torch.where(amax == 0, torch.ones_like(scale), scale)
+        return ScalingResult(scale=scale, scale_inv=scale.reciprocal(), block_shape=self.block_shape)

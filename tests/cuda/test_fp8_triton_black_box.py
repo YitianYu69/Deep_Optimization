@@ -3,14 +3,15 @@
 from copy import deepcopy
 from itertools import product
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from deepopt.opt import transform_model
 from deepopt.opt.backends import gemm_nt
 from deepopt.opt.do_nn.functional import do_linear
-from deepopt.opt.quantization.quantizer import quantize_fp8
-from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
+from tests.opt.fp8_support import round_fp8
+from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON, quantize_gemm_operand as quantize_fp8
 from tests.opt.full_model_support import (
     assert_relative_error, fp8_plan, logits_and_loss, make_gpt2, make_llama,
     make_timm_vit, make_vit, move_inputs,
@@ -67,12 +68,12 @@ class TritonFP8BlackBoxTests(unittest.TestCase):
     def test_linear_forward_and_all_gradients_match_quantized_reference(self):
         fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
         roles = ("activation", "weight", "grad")
-        layouts = ((None, None, None), ((32, 96),) * 3, ((1, 32), (32, 32), (32, 32)))
+        layouts = ((None, None, None), ((32, 64),) * 3, ((1, 32), (32, 32), (32, 32)))
         cases = tuple(product(layouts, product(fp8_dtypes, repeat=3)))
         hybrid_formats = (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e5m2)
         cases += (
             (((1, 32),) * 3, hybrid_formats),
-            (((3, 5), (7, 9), (5, 3)), hybrid_formats),
+            (((4, 8), (8, 16), (8, 4)), hybrid_formats),
         )
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             for blocks, formats in cases:
@@ -95,6 +96,49 @@ class TritonFP8BlackBoxTests(unittest.TestCase):
                     for value, baseline in zip((actual, *gradients), (expected, *reference_gradients)):
                         self.assertTrue(torch.isfinite(value).all().item())
                         torch.testing.assert_close(value, baseline, rtol=tolerance, atol=tolerance)
+
+    def test_rowwise_gradients_match_independent_orientation_quantization(self):
+        for block in ((1, 2), (1, 32)):
+            with self.subTest(block=block):
+                plan = fp8_plan("triton")
+                plan["fp8_training"]["fp8_dtypes"]["grad"] = torch.float8_e5m2
+                plan["block_shapes"] = dict.fromkeys(("activation", "weight", "grad"), block)
+                x = torch.tensor([[1., 100.], [2., 2.]], device=self.device, requires_grad=True)
+                weight = torch.tensor([[1., -.5], [.25, 2.]], device=self.device, requires_grad=True)
+                gradient = torch.tensor([[1., 100.], [2., 2.]], device=self.device)
+                output = do_linear(x, weight, plan=plan)
+                output.backward(gradient)
+                qx, qw, qg = (
+                    round_fp8(tensor.detach().cpu(), plan["fp8_training"]["fp8_dtypes"][role], block)
+                    for tensor, role in ((x, "activation"), (weight, "weight"), (gradient, "grad"))
+                )
+                qxt = round_fp8(x.detach().cpu().T, torch.float8_e4m3fn, block)
+                qgt = round_fp8(gradient.cpu().T, torch.float8_e5m2, block)
+                for actual, expected in ((output, qx @ qw.T), (x.grad, qg @ qw),
+                                          (weight.grad, qgt @ qxt.T)):
+                    torch.testing.assert_close(actual.cpu(), expected, rtol=4e-4, atol=5e-4)
+
+    def test_rowwise_activation_and_gradient_use_native_fp8_for_all_three_gemms(self):
+        from deepopt.opt.backends import triton_fp8
+
+        for gradient_block in ((1, 32), (32, 32)):
+            with self.subTest(gradient_block=gradient_block):
+                plan = fp8_plan("triton")
+                plan["fp8_training"]["fp8_dtypes"]["grad"] = torch.float8_e5m2
+                plan["block_shapes"] = {"activation": (1, 32), "weight": (32, 32),
+                                         "grad": gradient_block}
+                x = (torch.randn(17, 65, device=self.device) * .1).requires_grad_()
+                weight = (torch.randn(37, 65, device=self.device) * .1).requires_grad_()
+                gradient = torch.randn(17, 37, device=self.device) * .1
+                with patch.object(triton_fp8._gemm_nt_kernel, "run",
+                                  wraps=triton_fp8._gemm_nt_kernel.run) as launch:
+                    do_linear(x, weight, plan=plan).backward(gradient)
+                self.assertEqual(launch.call_count, 3)
+                for call in launch.call_args_list:
+                    self.assertTrue(call.kwargs["NATIVE_FP8"])
+                    self.assertFalse(call.kwargs["TENSORWISE"])
+                self.assertTrue(torch.isfinite(x.grad).all().item())
+                self.assertTrue(torch.isfinite(weight.grad).all().item())
 
 
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)

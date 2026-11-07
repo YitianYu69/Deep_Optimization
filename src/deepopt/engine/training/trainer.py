@@ -16,6 +16,7 @@ from deepopt.engine.execution.configuration import execution_config, prepare_exe
 
 from deepopt.tasks.base import Task
 from deepopt.logger import init_logger
+from deepopt.memory.planning import loader_batch_size
 from deepopt.memory.statistics import log_model_memory, summarize_model_memory
 from deepopt.engine.training.loops import EpochRunner
 from deepopt.engine.training.progress import EpochProgress
@@ -29,6 +30,17 @@ from deepopt.engine.strategies import ExplicitObjective, GradientStrategy, LossS
 logger = init_logger("deepopt.engine.trainer")
 
 _DEFAULT_MONITOR = object()
+
+
+def _resolve_scheduler(scheduler, optimizer, config):
+    """Select a configured scheduler once, preserving explicit None/instances."""
+    if scheduler is not _UNSET:
+        return scheduler
+    training = config.get("training", {})
+    if training.get("lr_schedule") is not None or training.get("lr_gamma", 1.0) != 1.0:
+        from deepopt.scheduling.lr import build_scheduler
+        return build_scheduler(optimizer, config)
+    return None
 
 
 class Trainer:
@@ -113,9 +125,7 @@ class Trainer:
                     if optimizer is None:
                         from deepopt.optimizer_factory import build_optimizer
                         optimizer = build_optimizer(model, self._config_snapshot)
-                    if scheduler is _UNSET and (training.get("lr_schedule") is not None or training.get("lr_gamma", 1.0) != 1.0):
-                        from deepopt.scheduling.lr import build_scheduler
-                        scheduler = build_scheduler(optimizer, self._config_snapshot)
+                    scheduler = _resolve_scheduler(scheduler, optimizer, self._config_snapshot)
                 self.runtime = TrainingRuntime(
                     model, optimizer, grad_clip_norm=grad_clip_norm, gradient_strategy=gradient_strategy,
                     checks=checks if checks is not None else _UNSET, ddp_options=ddp_options,
@@ -126,12 +136,7 @@ class Trainer:
                 "accumulation_steps": accumulation_steps, "scheduler_interval": scheduler_interval,
                 "grad_clip_norm": self.runtime.grad_clip_norm,
             })
-            if scheduler is _UNSET:
-                if training.get("lr_schedule") is not None or training.get("lr_gamma", 1.0) != 1.0:
-                    from deepopt.scheduling.lr import build_scheduler
-                    scheduler = build_scheduler(self.runtime.optimizer, self._config_snapshot)
-                else:
-                    scheduler = None
+            scheduler = _resolve_scheduler(scheduler, self.runtime.optimizer, self._config_snapshot)
             if scheduler_was_explicit and scheduler is None:
                 self._config_snapshot["training"].update(lr_schedule=None, lr_gamma=1.0)
             if self.runtime.optimizer is None:
@@ -372,6 +377,7 @@ class Trainer:
                     if self._resume_pending and self.epoch_progress.learning_rates is not None else
                     [group.get("lr") for group in self.optimizer.param_groups])
                 lr = learning_rates[0] if learning_rates else None
+                batch_size = loader_batch_size(train_loader)
                 training = self.train_epoch(train_loader, step_callbacks=step_callbacks)
                 validation = self.evaluate(validation_loader) if validation_loader is not None else {}
                 if monitor is not None:
@@ -385,7 +391,7 @@ class Trainer:
                     improved = best is None or (score > best if monitor_mode == "max" else score < best)
                     if improved:
                         self.state.best_score, self.state.best_epoch = score, self.state.completed_epochs
-                row = {"epoch": self.state.completed_epochs, "learning_rate": lr,
+                row = {"epoch": self.state.completed_epochs, "batch_size": batch_size, "learning_rate": lr,
                        "learning_rates": learning_rates, "optimizer_steps": self.state.optimizer_steps,
                        "train": training, "validation": validation}
                 if self.schedules is not None:

@@ -13,7 +13,7 @@ from importlib.metadata import version
 import torch
 from deepopt.distributed import _process as distributed
 from deepopt._config_resolution import _merge, resolve_config
-from deepopt.config import compile_config_from_dict, ema_config_from_dict
+from deepopt.config import compile_config_from_dict, ema_config_from_dict, fp8_config_from_dict
 
 from deepopt.engine.training.state import TrainingState
 from deepopt.engine.training.progress import EpochProgress, type_name
@@ -157,6 +157,19 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
     if (configured_ema["enabled"] != (trainer.ema is not None)
             or (trainer.ema is not None and configured_ema["decay"] != trainer.ema.decay)):
         raise ValueError("Checkpoint configuration must match the trainer's EMA settings")
+    runtime_config = saved_config.setdefault("runtime", {})
+    actual_fp8 = trainer.runtime.fp8
+    if "fp8" in runtime_config:
+        configured_fp8 = runtime_config["fp8"]
+        if not isinstance(configured_fp8, Mapping):
+            raise ValueError("Checkpoint FP8 configuration must be a table")
+        configured_fp8 = fp8_config_from_dict(_merge(asdict(actual_fp8), configured_fp8))
+        if (configured_fp8.enabled != actual_fp8.enabled
+                or (actual_fp8.enabled and configured_fp8 != actual_fp8)):
+            raise ValueError("Checkpoint configuration must match the trainer's FP8 settings")
+    # Explicit recipe metadata may omit runtime settings. Always retain the
+    # actual preparation policy so reconstruction uses the saved computation.
+    runtime_config["fp8"] = asdict(actual_fp8)
     batch_size = loader_batch_size(train_loader)
     if batch_size is None:
         batch_size = _config_batch_size(saved_config)
@@ -280,16 +293,66 @@ def _validate_checkpoint(payload) -> None:
         raise ValueError("Step checkpoint is missing loader or epoch progress")
 
 
-def restore_checkpoint(payload, trainer, config=None, *, generators, train_loader=None,
-                       validation_loader=None, batch_size_mode="auto", sample_batch_fn=None,
-                       memory_budget_bytes=None) -> list[dict]:
-    """Restore training state, then plan physical batching before continuing.
+def _resume_config_for_comparison(config) -> dict:
+    """Keep training-affecting metadata while accepting legacy passive defaults.
 
-    Auto uses caller-supplied representative batches and fake tensor execution
-    on CUDA (or when an explicit tensor-memory budget is supplied). Manual
-    keeps the requested size. Neither policy changes LR, accumulation, or the
-    number of previously consumed samples. No real training probes are run.
+    Work on an owned copy: comparison must never rewrite a caller's config or
+    a checkpoint. Unknown application and extension metadata remains strict.
     """
+    settings = deepcopy(config)
+    if "training" in settings:
+        settings["training"] = {k: v for k, v in settings["training"].items()
+                                if k not in ("epochs", "checkpoint_every_steps", "batch_size")
+                                and not (k == "scheduler_interval" and v == "epoch")}
+        if settings["training"].get("lr_schedule") is None:
+            settings["training"].pop("lr_schedule", None)
+        ema = ema_config_from_dict(settings["training"].get("ema", {}))
+        if ema["enabled"]:
+            settings["training"]["ema"] = ema
+        else:
+            # Existing checkpoints predate EMA; disabled is equivalent.
+            settings["training"].pop("ema", None)
+    if not settings.get("schedules"):
+        settings.pop("schedules", None)
+    if not settings.get("loader"):
+        settings.pop("loader", None)
+    # Logging is passive and can change without changing training state.
+    settings.pop("logging", None)
+    if "runtime" in settings:
+        # Passive diagnostics may be enabled after a resume. Their objects
+        # and counters are not part of optimization or checkpoint state.
+        settings["runtime"] = {k: v for k, v in settings["runtime"].items()
+                               if k not in ("checks", "execution_mode", "diagnostics", "mode_schedule", "non_blocking")}
+        # Old checkpoints omit the compiler table. Disabled compilation is
+        # equivalent; enabled settings remain strict for reproducibility.
+        if not settings["runtime"].get("compile", {}).get("enabled", False):
+            settings["runtime"].pop("compile", None)
+        if not settings["runtime"].get("fp8", {}).get("enabled", False):
+            settings["runtime"].pop("fp8", None)
+        else:
+            # JSON/TOML grids use lists; runtime policies use tuples. Compare
+            # their validated meaning rather than their container spelling.
+            settings["runtime"]["fp8"] = asdict(fp8_config_from_dict(settings["runtime"]["fp8"]))
+        defaults = {
+            "ddp": {"find_unused_parameters": False, "broadcast_buffers": True,
+                    "gradient_as_bucket_view": True, "static_graph": False,
+                    "validation_sync_buffers": True},
+            "cuda_graph": {"device": None, "warmup": 3, "allow_unused_input": False,
+                           "autograd": True, "capture_error_mode": "global"},
+        }
+        for field, values in defaults.items():
+            if field in settings["runtime"]:
+                settings["runtime"][field] = {key: value for key, value in settings["runtime"][field].items()
+                                              if key not in values or value != values[key]}
+            if not settings["runtime"].get(field):
+                settings["runtime"].pop(field, None)
+    if not settings.get("experiment_identity"):
+        settings.pop("experiment_identity", None)
+    return settings
+
+
+def _checkpoint_for_rank(payload):
+    """Select rank-local state without applying it to the trainer."""
     _validate_checkpoint(payload)
     saved_distributed = payload.get("distributed")
     saved_world = saved_distributed.get("world_size") if isinstance(saved_distributed, Mapping) else 1
@@ -306,20 +369,11 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
             raise ValueError("Distributed checkpoint is missing rank-local resume state")
         payload = {**payload, **{key: local[key] for key in required if key != "buffers"}}
         rank_buffers = local["buffers"]
-    if batch_size_mode not in ("auto", "manual"):
-        raise ValueError("batch_size_mode must be auto or manual")
-    saved = deepcopy(payload["config"])
-    if config is None:
-        requested = deepcopy(saved)
-    elif isinstance(config, (str, Path)):
-        requested = dict(resolve_config(config))
-    elif isinstance(config, Mapping):
-        requested = _merge(saved, config)
-    else:
-        requested = _config_dict(config)
-    saved_identity = payload.get("experiment_identity", {}).get("required", {})
-    if saved_identity != validate_identity(trainer.experiment_identity):
-        raise ValueError("Resume requires the same experiment_identity (recipe/data/code versions)")
+    return payload, rank_buffers, saved_world
+
+
+def _requested_resume_batch_size(payload, trainer, requested, train_loader, *,
+                                 batch_size_mode, memory_budget_bytes):
     old_batch_size = _saved_batch_size(payload)
     requested_batch_size = loader_batch_size(train_loader)
     configured_batch_size = _config_batch_size(requested)
@@ -338,53 +392,13 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
             and (trainer.device.type == "cuda" or memory_budget_bytes is not None)):
         raise ValueError("Automatic resume sizing requires train_loader so the selected size can be applied; "
                          "use estimate_training_memory separately or select manual mode")
-    # Physical batching may change; objective/scaling/schedule settings may not.
-    for settings in (saved, requested):
-        if "training" in settings:
-            settings["training"] = {k: v for k, v in settings["training"].items()
-                                    if k not in ("epochs", "checkpoint_every_steps", "batch_size")
-                                    and not (k == "scheduler_interval" and v == "epoch")}
-            if settings["training"].get("lr_schedule") is None:
-                settings["training"].pop("lr_schedule", None)
-            ema = ema_config_from_dict(settings["training"].get("ema", {}))
-            if ema["enabled"]:
-                settings["training"]["ema"] = ema
-            else:
-                # Existing checkpoints predate EMA; disabled is equivalent.
-                settings["training"].pop("ema", None)
-        if not settings.get("schedules"):
-            settings.pop("schedules", None)
-        if not settings.get("loader"):
-            settings.pop("loader", None)
-        # Logging is passive and can change without changing training state.
-        settings.pop("logging", None)
-        if "runtime" in settings:
-            # Passive diagnostics may be enabled after a resume. Their objects
-            # and counters are not part of optimization or checkpoint state.
-            settings["runtime"] = {k: v for k, v in settings["runtime"].items()
-                                   if k not in ("checks", "execution_mode", "diagnostics", "mode_schedule", "non_blocking")}
-            # Old checkpoints omit the compiler table. Disabled compilation is
-            # equivalent; enabled settings remain strict for reproducibility.
-            if not settings["runtime"].get("compile", {}).get("enabled", False):
-                settings["runtime"].pop("compile", None)
-            if not settings["runtime"].get("fp8", {}).get("enabled", False):
-                settings["runtime"].pop("fp8", None)
-            defaults = {
-                "ddp": {"find_unused_parameters": False, "broadcast_buffers": True,
-                        "gradient_as_bucket_view": True, "static_graph": False,
-                        "validation_sync_buffers": True},
-                "cuda_graph": {"device": None, "warmup": 3, "allow_unused_input": False,
-                               "autograd": True, "capture_error_mode": "global"},
-            }
-            for field, values in defaults.items():
-                if field in settings["runtime"]:
-                    settings["runtime"][field] = {key: value for key, value in settings["runtime"][field].items()
-                                                  if key not in values or value != values[key]}
-                if not settings["runtime"].get(field):
-                    settings["runtime"].pop(field, None)
-        if not settings.get("experiment_identity"):
-            settings.pop("experiment_identity", None)
-    if saved != requested:
+    return old_batch_size, requested_batch_size
+
+
+def _validate_resume_state(payload, trainer, requested, *, generators, train_loader,
+                           old_batch_size, requested_batch_size, saved_world):
+    """Check compatibility before any state-loading hooks can mutate objects."""
+    if _resume_config_for_comparison(payload["config"]) != _resume_config_for_comparison(requested):
         raise ValueError("Resume configuration differs from checkpoint "
                          "(only epochs, batch size, checkpoint cadence, and diagnostic checks may change)")
     if payload["components"] != _component_types(trainer) or payload["trainer_settings"] != _trainer_settings(trainer):
@@ -432,16 +446,11 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
                 and getattr(train_loader, "supports_batch_size_change", False) is not True):
             raise ValueError("Changing batch size during step resume requires a loader declaring "
                              "supports_batch_size_change=True and preserving its consumed-data position")
-    # Component load_state_dict hooks can fail after mutating their component.
-    # Never permit another automatic epoch on a partially restored trainer.
-    # A later complete restore is the only operation that re-enables training.
-    trainer.at_epoch_boundary = False
-    trainer.at_step_boundary = False
-    trainer._resume_pending = False
-    trainer.epoch_progress = None
-    trainer.resume_adjustment = None
-    trainer.batch_size_adjustment = None
-    trainer.runtime.invalidate()
+    return state
+
+
+def _restore_loader_progress(payload, trainer, state, train_loader, requested_batch_size):
+    """Restore metric/loader state only after the trainer has been invalidated."""
     progress = None
     if payload["kind"] == "step":
         progress = EpochProgress.restore(payload["epoch_progress"], trainer.new_metrics(), trainer.device)
@@ -468,6 +477,11 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
             raise ValueError("The loader restored a different batch size instead of retaining the requested size")
     elif train_loader is not None and callable(getattr(train_loader, "reset_epoch", None)):
         train_loader.reset_epoch()
+    return progress
+
+
+def _restore_training_state(payload, trainer, state, *, rank_buffers, generators, saved_world):
+    """Load components, then restore RNG after all component loading hooks."""
     trainer.model.load_state_dict(payload["model"])
     if rank_buffers is not None:
         with torch.no_grad():
@@ -482,7 +496,7 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
         trainer.scheduler.load_state_dict(payload["scheduler"])
     restore_strategies(payload.get("strategies"), trainer)
     if trainer.schedules is not None:
-        trainer.schedules.load_state_dict(saved_schedules, completed_update=state.optimizer_steps)
+        trainer.schedules.load_state_dict(payload["schedules"], completed_update=state.optimizer_steps)
     if trainer.ema is not None:
         trainer.ema.load_state_dict(payload["ema"], completed_updates=state.optimizer_steps)
     trainer.state = state
@@ -495,6 +509,54 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
             torch.cuda.set_rng_state(payload["rng"]["cuda"][0], trainer.device)
         else:
             torch.cuda.set_rng_state_all(payload["rng"]["cuda"])
+
+
+def restore_checkpoint(payload, trainer, config=None, *, generators, train_loader=None,
+                       validation_loader=None, batch_size_mode="auto", sample_batch_fn=None,
+                       memory_budget_bytes=None) -> list[dict]:
+    """Restore training state, then plan physical batching before continuing.
+
+    Auto uses caller-supplied representative batches and fake tensor execution
+    on CUDA (or when an explicit tensor-memory budget is supplied). Manual
+    keeps the requested size. Neither policy changes LR, accumulation, or the
+    number of previously consumed samples. No real training probes are run.
+    """
+    payload, rank_buffers, saved_world = _checkpoint_for_rank(payload)
+    if batch_size_mode not in ("auto", "manual"):
+        raise ValueError("batch_size_mode must be auto or manual")
+    saved = payload["config"]
+    if config is None:
+        requested = saved
+    elif isinstance(config, (str, Path)):
+        requested = dict(resolve_config(config))
+    elif isinstance(config, Mapping):
+        requested = _merge(saved, config)
+    else:
+        requested = _config_dict(config)
+    saved_identity = payload.get("experiment_identity", {}).get("required", {})
+    if saved_identity != validate_identity(trainer.experiment_identity):
+        raise ValueError("Resume requires the same experiment_identity (recipe/data/code versions)")
+    old_batch_size, requested_batch_size = _requested_resume_batch_size(
+        payload, trainer, requested, train_loader,
+        batch_size_mode=batch_size_mode, memory_budget_bytes=memory_budget_bytes,
+    )
+    state = _validate_resume_state(
+        payload, trainer, requested, generators=generators, train_loader=train_loader,
+        old_batch_size=old_batch_size, requested_batch_size=requested_batch_size, saved_world=saved_world,
+    )
+    # Component load_state_dict hooks can fail after mutating their component.
+    # Never permit another automatic epoch on a partially restored trainer.
+    # A later complete restore is the only operation that re-enables training.
+    trainer.at_epoch_boundary = False
+    trainer.at_step_boundary = False
+    trainer._resume_pending = False
+    trainer.epoch_progress = None
+    trainer.resume_adjustment = None
+    trainer.batch_size_adjustment = None
+    trainer.runtime.invalidate()
+    progress = _restore_loader_progress(payload, trainer, state, train_loader, requested_batch_size)
+    _restore_training_state(payload, trainer, state, rank_buffers=rank_buffers,
+                            generators=generators, saved_world=saved_world)
     if requested_batch_size is not None:
         adjustment = plan_batch_size(
             trainer, requested_batch_size=requested_batch_size, mode=batch_size_mode,
@@ -518,7 +580,7 @@ def restore_checkpoint(payload, trainer, config=None, *, generators, train_loade
     trainer._resume_pending = progress is not None
     trainer.at_epoch_boundary = progress is None
     trainer.at_step_boundary = False
-    return list(history)
+    return list(payload["history"])
 
 
 def restore_schedules_for_evaluation(payload, trainer):

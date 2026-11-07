@@ -24,7 +24,7 @@ from deepopt.opt._autocast import _get_fp8_plan, fp8_context
 from deepopt.optimizer_factory import build_optimizer
 from deepopt.scheduling import ScheduleController
 from deepopt.scheduling.lr import build_scheduler
-from tests.application.test_global_config_consumers_black_box import configuration
+from tests.application.config_support import configuration
 
 
 class GlobalConsumerWhiteBoxTests(unittest.TestCase):

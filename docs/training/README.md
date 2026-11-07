@@ -257,6 +257,9 @@ best-score/state updates. The progress bar advances after every callback
 succeeds. Each row contains:
 
 - `epoch` and cumulative `optimizer_steps`;
+- `batch_size`, the training loader's batch size per rank before gradient
+  accumulation, captured when starting or resuming the epoch (`null` in JSON
+  when the loader does not expose a fixed batch size);
 - `learning_rate` and `learning_rates`, captured at the epoch's start;
 - `train` and `validation` metric dictionaries.
 

@@ -4,32 +4,11 @@ import torch
 
 from deepopt._config_resolution import _UNSET, resolve_config
 
+from ._configuration import _capture_settings
 from ._validation import cuda_device, warmup_count
+from ._warmup import warmup_on_stream
 from .capture import CapturedGraph
 from .model import CapturedCallable
-
-
-def _capture_settings(config=None, *, base=_UNSET, device=_UNSET, warmup=_UNSET,
-                      allow_unused_input=_UNSET, autograd=_UNSET, capture_error_mode=_UNSET):
-    """Resolve capture-only defaults without querying or initializing CUDA."""
-    explicit = {name: value for name, value in {
-        "device": device, "warmup": warmup, "allow_unused_input": allow_unused_input,
-        "autograd": autograd, "capture_error_mode": capture_error_mode,
-    }.items() if value is not _UNSET}
-    if explicit.get("device") is not None:
-        explicit["device"] = str(explicit["device"])
-    snapshot = resolve_config(config, base=base,
-                              overrides={"runtime": {"cuda_graph": explicit}} if explicit else None)
-    runtime = snapshot.get("runtime", {})
-    configured = runtime.get("cuda_graph", {})
-    if "device" in configured:
-        selected_device = configured["device"]
-    else:
-        runtime_device = runtime.get("device")
-        selected_device = runtime_device if isinstance(runtime_device, str) and runtime_device.startswith("cuda") else None
-    options = {"device": selected_device, "warmup": 3, "allow_unused_input": False,
-               "autograd": True, "capture_error_mode": "global", **configured}
-    return snapshot, options
 
 
 class CUDAGraphCore:
@@ -101,11 +80,4 @@ class CUDAGraphCore:
             stream = stream or torch.cuda.Stream(device=device)
             if stream.device != device:
                 raise ValueError("Warmup stream must belong to the graph's device")
-            current = torch.cuda.current_stream(device)
-            stream.wait_stream(current)
-            try:
-                with torch.cuda.stream(stream):
-                    for _ in range(iterations):
-                        function(*args, **kwargs)
-            finally:
-                current.wait_stream(stream)
+            warmup_on_stream(function, args, kwargs, iterations=iterations, stream=stream, device=device)

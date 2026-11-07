@@ -20,6 +20,7 @@ from deepopt.opt.do_nn.mha_module import DOMultiheadAttention
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from deepopt.opt.quantization.tensor import QuantizedTensor
 from deepopt.opt.scaling_strategy.amax import AmaxScaling
+from tests.opt.fp8_support import round_fp8
 
 
 def _plan(blocks=None):
@@ -154,6 +155,32 @@ class FP8AutogradWhiteBoxTests(unittest.TestCase):
         dispatch.assert_not_called()
         quantizer.assert_not_called()
         torch.testing.assert_close(bias.grad, torch.full((4,), 5.))
+
+    def test_rowwise_backward_operands_keep_native_fp8_reduction_grids(self):
+        for gradient_block in ((1, 32), (32, 32)):
+            for needs_input_grad in (False, True):
+                with self.subTest(gradient_block=gradient_block, input_grad=needs_input_grad):
+                    plan = _plan()
+                    plan["block_shapes"] = {"activation": (1, 32), "weight": (32, 32),
+                                             "grad": gradient_block}
+                    x = torch.randn(5, 7, requires_grad=needs_input_grad)
+                    weight = torch.randn(4, 7, requires_grad=True)
+                    gradient = torch.randn(5, 4)
+                    with patch.object(linear_autograd_func, "gemm_nt", wraps=gemm_nt) as dispatch:
+                        do_linear(x, weight, plan=plan).backward(gradient)
+                    for call in dispatch.call_args_list:
+                        for operand in call.args[:2]:
+                            self.assertTrue(operand.block_shape is None or operand.block_shape[1] % 32 == 0)
+                    dweight = dispatch.call_args_list[-1]
+                    qxt = round_fp8(x.T, torch.float8_e4m3fn, (1, 32))
+                    qgt = (round_fp8(gradient.T, torch.float8_e5m2, (1, 32))
+                           if gradient_block == (1, 32) else
+                           round_fp8(gradient, torch.float8_e5m2, gradient_block).T)
+                    torch.testing.assert_close(dweight.args[0].dequantize(), qgt, rtol=0, atol=0)
+                    torch.testing.assert_close(dweight.args[1].dequantize(), qxt, rtol=0, atol=0)
+                    # The independent oracle may retain transposed strides;
+                    # FP32 GEMM accumulation order can then differ slightly.
+                    torch.testing.assert_close(weight.grad, qgt @ qxt.T, rtol=1e-6, atol=1e-6)
 
     def test_second_order_differentiation_is_explicitly_unsupported(self):
         x = torch.randn(5, 7, requires_grad=True)

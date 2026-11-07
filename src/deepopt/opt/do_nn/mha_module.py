@@ -94,13 +94,15 @@ class DOMultiheadAttention(nn.Module):
             additive = torch.zeros(
                 mask.shape,
                 device=mask.device,
-                dtype=reference.dtype
+                dtype=torch.float32
             )
             return additive.masked_fill(mask, float("-inf"))
 
         if mask.dtype not in (torch.float32, torch.bfloat16, torch.float16):
             raise TypeError("Attention masks must be boolean, FP32, BF16, or FP16")
-        return mask.to(dtype=reference.dtype)
+        # Keep finite biases finite and combine masks before any low-precision
+        # conversion. SDPA accepts FP32 additive masks with FP16/BF16 queries.
+        return mask.float()
 
     def _attention_mask(
         self,

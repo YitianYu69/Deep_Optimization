@@ -13,7 +13,7 @@ from deepopt import Checkpoint, Trainer, TrainingCore, TrainingModule, TrainingR
 from deepopt.config import FP8Config
 from deepopt.opt import transform_model
 from deepopt.opt.policy import fp8_plan
-from tests.opt.test_training_black_box import assert_state_equal
+from tests.state_support import assert_state_equal
 
 
 class SharedProjections(nn.Module):

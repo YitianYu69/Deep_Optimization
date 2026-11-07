@@ -4,13 +4,12 @@ from copy import deepcopy
 from collections import deque
 from dataclasses import asdict, is_dataclass
 import json
-import os
 from pathlib import Path
-import tempfile
 
 import torch
 from deepopt.distributed import _process as distributed
 from deepopt._config_resolution import _UNSET, _merge, resolve_config
+from deepopt._io import atomic_write_text
 
 from deepopt.memory.planning import loader_batch_size
 from deepopt.engine.checkpointing.checkpoint import (read_checkpoint, read_checkpoint_progress, require_step_loader,
@@ -109,17 +108,8 @@ class Checkpoint:
         distributed.rank_zero_call(self._write_history_local)
 
     def _write_history_local(self):
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.directory,
-                                             delete=False, suffix=".tmp") as file:
-                temporary = Path(file.name)
-                for row in self.history:
-                    file.write(json.dumps(row) + "\n")
-            os.replace(temporary, self.directory / "metrics.jsonl")
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        atomic_write_text(self.directory / "metrics.jsonl",
+                          (json.dumps(row) + "\n" for row in self.history))
 
     def __call__(self, trainer, row):
         if trainer is not self._trainer or len(self.history) + 1 != trainer.state.completed_epochs:

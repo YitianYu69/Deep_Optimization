@@ -59,6 +59,7 @@ class RecipeTrainingTests(unittest.TestCase):
         self.assertEqual(state.best_epoch, 0)
         self.assertEqual(len(rows), 2)
         for row in rows:
+            self.assertIsNone(row["batch_size"])
             self.assertEqual(row["validation"], {})
             self.assertIn("loss", row["train"])
             self.assertEqual(row["train"]["samples"], 6)

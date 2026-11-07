@@ -4,7 +4,6 @@ FP8 linear with explicit forward and backward computations.
 
 import torch
 from torch import nn
-from torch.autograd.function import once_differentiable
 
 from .functional import do_linear, validate_fp8_plan
 

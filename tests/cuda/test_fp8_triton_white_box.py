@@ -1,20 +1,76 @@
 """TMA packing, strided quantized operands, and scale-grid transposition on CUDA."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from deepopt.opt.backends import gemm_nt
 from deepopt.opt.backends._triton_autotune import AUTOTUNE_KEY
-from deepopt.opt.quantization.quantizer import quantize_fp8
 from deepopt.opt.quantization.tensor import QuantizedTensor
-from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
+from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON, quantize_gemm_operand as quantize_fp8
 
 
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
 class TritonFP8WhiteBoxTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(271)
+
+    def test_classifier_autotunes_with_minimal_padding_and_logical_descriptors(self):
+        from deepopt.opt.backends import triton_fp8
+        from triton.runtime.autotuner import Autotuner
+
+        self.assertIsInstance(triton_fp8._gemm_nt_kernel, Autotuner)
+        for batch in (2048, 848):
+            x = quantize_fp8(torch.randn(batch, 512, device="cuda") * 0.1, block_shape=(1, 32))
+            w = quantize_fp8(torch.randn(10, 512, device="cuda") * 0.1, block_shape=(32, 32))
+            g = quantize_fp8(torch.randn(batch, 10, device="cuda") * 0.1,
+                             fp8_dtype=torch.float8_e5m2, block_shape=(32, 32))
+            cases = ((x, w), (g, w.transpose()), (g.transpose(), x.transpose()))
+            for a, b in cases:
+                with self.subTest(batch=batch, shape=(a.data.shape, b.data.shape)):
+                    expected = a.dequantize().cpu() @ b.dequantize().cpu().T
+                    with patch.object(triton_fp8._gemm_nt_kernel, "run",
+                                      wraps=triton_fp8._gemm_nt_kernel.run) as launch, \
+                         patch.object(triton_fp8, "_pack_fp8_rows",
+                                      wraps=triton_fp8._pack_fp8_rows) as pack:
+                        actual = gemm_nt(a, b, backend="triton", num_stages=2)
+                    torch.testing.assert_close(actual.cpu(), expected, rtol=3e-4, atol=5e-4)
+                    self.assertEqual([call.args[1] for call in pack.call_args_list], [16, 16])
+                    self.assertEqual(actual.stride(0), ((b.data.shape[0] + 3) // 4) * 4)
+                    self.assertEqual(actual.untyped_storage().nbytes(),
+                                     a.data.shape[0] * actual.stride(0) * 4)
+                    self.assertEqual(launch.call_count, 1)
+                    a_desc, b_desc, c_desc = launch.call_args.args[:3]
+                    self.assertEqual(tuple(a_desc.shape), tuple(a.data.shape))
+                    self.assertEqual(tuple(b_desc.shape), tuple(b.data.shape))
+                    self.assertEqual(tuple(c_desc.shape), tuple(actual.shape))
+                    self.assertEqual(launch.call_args.kwargs["PIPELINE_STAGES"], 2)
+                    _, selected = self._cache_entry(triton_fp8._gemm_nt_kernel, a, b, torch.float32, 2, False)
+                    self.assertEqual(selected.num_stages, 2)
+
+    def test_partial_tma_stores_preserve_guard_rows_and_stride_padding(self):
+        from deepopt.opt.backends import triton_fp8
+
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            a = quantize_fp8(torch.randn(13, 7, device="cuda") * 0.1, block_shape=(1, 32))
+            b = quantize_fp8(torch.randn(19, 7, device="cuda") * 0.1, block_shape=(32, 32))
+            alignment = 4 if dtype == torch.float32 else 8
+            stride = ((19 + alignment - 1) // alignment) * alignment
+            guarded = torch.full((14, stride), 123.0, dtype=dtype, device="cuda")
+            allocate = torch.empty
+
+            def output_with_guard(size, **kwargs):
+                if size == (13, stride) and kwargs.get("dtype") == dtype:
+                    return guarded[:13]
+                return allocate(size, **kwargs)
+
+            with patch.object(triton_fp8.torch, "empty", side_effect=output_with_guard):
+                actual = gemm_nt(a, b, backend="triton", out_dtype=dtype)
+            expected = (a.dequantize().cpu() @ b.dequantize().cpu().T).to(dtype)
+            torch.testing.assert_close(actual.cpu(), expected, rtol=1e-2, atol=3e-4)
+            self.assertTrue(torch.all(guarded[13] == 123).item())
+            self.assertTrue(torch.all(guarded[:13, 19:] == 123).item())
 
     def test_aligned_rows_reuse_storage_and_ragged_rows_get_zero_padding(self):
         from deepopt.opt.backends.triton_fp8 import _pack_fp8_rows
@@ -54,6 +110,37 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
         expected = a.dequantize().cpu() @ b.dequantize().cpu().T
         actual = gemm_nt(a_strided, b, backend="triton")
         torch.testing.assert_close(actual.cpu(), expected, rtol=3e-4, atol=5e-4)
+
+    def test_noncontiguous_scale_grids_match_dequantized_oracle(self):
+        for a_block, b_block in (((16, 32), (32, 32)), ((3, 5), (7, 9))):
+            with self.subTest(blocks=(a_block, b_block)):
+                operands = []
+                for rows, blocks in ((37, a_block), (29, b_block)):
+                    quantized = quantize_fp8(torch.randn(rows, 99, device="cuda") * .1,
+                                             block_shape=blocks)
+                    scale_rows, scale_cols = quantized.scale_inv.shape
+                    storage = torch.empty(scale_rows, scale_cols * 2, device="cuda")
+                    scales = storage[:, ::2]
+                    scales.copy_(quantized.scale_inv)
+                    self.assertFalse(scales.is_contiguous())
+                    operands.append(QuantizedTensor(quantized.data, scales, blocks))
+                a, b = operands
+                expected = a.dequantize().cpu() @ b.dequantize().cpu().T
+                actual = gemm_nt(a, b, backend="triton")
+                torch.testing.assert_close(actual.cpu(), expected, rtol=3e-4, atol=5e-4)
+
+    def test_fused_scaling_matches_cpu_for_strided_inputs_and_edge_blocks(self):
+        from deepopt.opt.scaling_strategy.amax import AmaxScaling
+
+        for dtype in (torch.float32, torch.bfloat16):
+            x = torch.arange(1, 36, device="cuda", dtype=dtype).reshape(5, 7).T
+            self.assertFalse(x.is_contiguous())
+            for blocks in (None, (1, 32), (2, 4), (4, 8)):
+                with self.subTest(dtype=dtype, blocks=blocks):
+                    actual = AmaxScaling(blocks).compute(x)
+                    expected = AmaxScaling(blocks).compute(x.cpu())
+                    torch.testing.assert_close(actual.scale.cpu(), expected.scale, rtol=1e-5, atol=1e-7)
+                    torch.testing.assert_close(actual.scale_inv.cpu(), expected.scale_inv, rtol=1e-5, atol=1e-7)
 
     def _cache_entry(self, kernel, a, b, out_dtype, stages, has_bias):
         import triton.language as tl

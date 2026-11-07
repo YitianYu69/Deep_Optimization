@@ -1,0 +1,159 @@
+import torch
+
+import triton
+import triton.language as tl
+
+
+
+@triton.jit
+def block_amax_kernel(
+    x_ptr, amax_ptr,
+    M, N,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    NUM_COLS_BLOCKS: tl.constexpr,
+):
+
+    pid = tl.program_id(0)
+
+    row = pid // NUM_COLS_BLOCKS
+    col = pid % NUM_COLS_BLOCKS
+
+    row_offsets = row * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_offsets = col * BLOCK_N + tl.arange(0, BLOCK_N)
+    x_ptrs = x_ptr + row_offsets[:, None] * N + col_offsets[None, :]
+    mask = (row_offsets[:, None] < M) & (col_offsets[None, :] < N)
+
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-12)
+
+    tl.store(amax_ptr + pid, amax)
+
+
+def block_amax(x, block_row, block_col):
+    M, N = x.shape
+
+    num_row_blocks = triton.cdiv(M, block_row)
+    num_col_blocks = triton.cdiv(N, block_col)
+
+    amax = torch.empty(
+        (num_row_blocks, num_col_blocks),
+        dtype=torch.float32,
+        device=x.device,
+    )
+
+    grid = (num_row_blocks * num_col_blocks,)
+    block_amax_kernel[grid](
+        x, amax,
+        M, N,
+        BLOCK_M=block_row,
+        BLOCK_N=block_col,
+        NUM_COLS_BLOCKS=num_col_blocks,
+    )
+
+    return amax
+
+
+
+
+@triton.jit
+def block_amax_scalar_kernel(
+    x_ptr, scalar_ptr, scalar_inv_ptr,
+    M, N,
+    FP8_MAX: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    NUM_COL_BLOCKS: tl.constexpr
+):
+    pid = tl.program_id(0)
+
+    row = pid // NUM_COL_BLOCKS
+    col = pid % NUM_COL_BLOCKS
+
+    row_offsets = row * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_offsets = col * BLOCK_N + tl.arange(0, BLOCK_N)
+    x_ptrs = x_ptr + row_offsets[:, None] * N + col_offsets[None, :]
+    mask = (row_offsets[:, None] < M) & (col_offsets[None, :] < N)
+
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-12)
+
+    if amax != 0:
+        scalar = FP8_MAX / amax
+        scalar_inv = 1 / scalar
+    else:
+        scalar = 1.0
+        scalar_inv = 1.0
+
+    tl.store(scalar_ptr + pid, scalar)
+    tl.store(scalar_inv_ptr + pid, scalar_inv)
+
+
+
+def block_amax_scalar(x, block_row, block_col, fp8_max):
+    M, N = x.shape
+
+    num_row_blocks = triton.cdiv(M, block_row)
+    num_col_blocks = triton.cdiv(N, block_col)
+
+    scalar = torch.empty(
+        (num_row_blocks, num_col_blocks),
+        dtype=torch.float32,
+        device=x.device
+    )
+
+    scalar_inv = torch.empty(
+        (num_row_blocks, num_col_blocks),
+        dtype=torch.float32,
+        device=x.device
+    )
+
+    grid = (num_row_blocks * num_col_blocks,)
+    block_amax_scalar_kernel[grid](
+        x, scalar, scalar_inv,
+        M, N,
+        FP8_MAX=fp8_max,
+        BLOCK_M=block_row,
+        BLOCK_N=block_col,
+        NUM_COL_BLOCKS=num_col_blocks,
+    )
+
+    return scalar, scalar_inv
+
+
+
+
+@triton.jit
+def global_amax_kernel(
+    x_ptr, amax_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-12)
+    tl.atomic_max(amax_ptr, amax)
+
+
+def global_amax_scalar(x, fp8_max):
+    N = x.numel()
+
+    amax = torch.zeros((1,), dtype=torch.float32, device=x.device)
+
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    global_amax_kernel[grid](
+      x, amax,
+      BLOCK_SIZE=BLOCK_SIZE,
+      N=N,
+    )
+
+    if amax != 0:
+        scalar = fp8_max / amax
+    else:
+        scalar = 1.0
+    scalar_inv = 1 / scalar
+
+    return scalar, scalar_inv

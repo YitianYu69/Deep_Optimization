@@ -183,7 +183,7 @@ class ProgressBarTests(unittest.TestCase):
 
     def test_real_bar_uses_stderr_and_keeps_json_callback_stdout_readable(self):
         try:
-            import tqdm.auto
+            import tqdm.auto  # noqa: F401 -- Exercise the dependency import before the real-bar test.
         except ImportError:
             self.skipTest("tqdm dependency is not installed in the test environment")
         stdout, stderr = io.StringIO(), io.StringIO()

@@ -123,6 +123,8 @@ class LoggerTests(unittest.TestCase):
                 train(config, output=run, progress_bar=False)
             resolved = json.loads((run / "config.json").read_text())
             self.assertEqual(resolved["training"]["batch_size"], 4)
+            rows = [json.loads(line) for line in (run / "metrics.jsonl").read_text().splitlines()]
+            self.assertEqual([row["batch_size"] for row in rows], [4])
             logs = list((run / "logs").glob("*.log"))
             self.assertEqual([p.name for p in logs], [log_filename(resolved)])
             self.assertIn("Training batch size changed from requested 8 to 4", logs[0].read_text())

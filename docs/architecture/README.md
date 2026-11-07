@@ -27,11 +27,14 @@ flowchart TD
     Manual[Caller-owned loop] --> Runtime
 ```
 
-`Trainer` controls lifecycle and update timing. It receives components instead
-of creating datasets, models, or optimizers. It does not parse TOML or choose
-artifact paths. Progress bars are an optional presentation feature of `fit()`;
-The trainer emits lifecycle events through the shared logger. File ownership
-and structured JSON/checkpoint writes belong to the application layer.
+`Trainer` controls lifecycle and update timing around caller-supplied models
+and loaders. It can construct an omitted optimizer and scheduler from resolved
+configuration; supplied components remain caller-owned. Configuration resolution
+is shared with the runtime and accepts dictionaries, typed settings, TOML paths,
+and installed presets. The trainer does not construct datasets or models, or
+choose artifact paths. Progress bars are optional in `fit()`, and lifecycle
+events use the shared logger. File ownership and structured JSON/checkpoint
+writes belong to the application layer and callbacks.
 
 `TrainingRuntime` offers individual execution operations without epochs or
 metric ownership. `OptimizationWindow` is an optional helper shared by the
@@ -138,6 +141,33 @@ Persistent state belongs in registered model parameters/buffers, optimizer or
 scheduler state, registered metric state, or strategy state. Arbitrary runtime
 attributes, callback closures, observer state, datasets and Python function
 bodies are not reconstructed by checkpoints.
+
+## Configuration and lint maintenance
+
+[src/deepopt/configs/](../../src/deepopt/configs) owns the built-in TOML presets
+and complete template. Edit these sources, then regenerate the byte-identical
+[configs/](../../configs) copies retained for existing checkout commands:
+
+```bash
+python scripts/sync_configs.py
+python scripts/sync_configs.py --check
+python -m ruff check src tests examples benchmarks scripts
+```
+
+The [sync script](../../scripts/sync_configs.py) works independently of the
+current directory and does not import DeepOpt or PyTorch. `--check` is read-only
+and fails on missing, different, or extra checkout TOML files. Normal sync
+updates missing/different copies but leaves extra files untouched and reports
+them for review. Store personal experiments elsewhere; generated copies are
+overwritten by synchronization. The same workflow is included in source
+distributions. Installed applications should use `builtin:NAME` or export their
+own template; see [configuration inputs](../runs/README.md).
+
+[pyproject.toml](../../pyproject.toml) owns the shared Ruff policy: syntax errors
+(`E9`) and Pyflakes checks (`F`), including unused imports and variables. CI uses
+the same command above. Intentional dependency probes and compatibility exports
+should be explicit rather than removing necessary imports or suppressing entire
+files. Formatting is separate from this lint policy.
 
 ## Tests and examples
 

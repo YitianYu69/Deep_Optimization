@@ -1,43 +1,13 @@
+"""Stateless sample seeds and transform identity during loader recovery."""
+
 import unittest
-from unittest.mock import patch
 
 import torch
 
 from deepopt.data import ResumableDataLoader, SeededTransformDataset, sample_seed
-from deepopt.distributed.ddp import DDPCore
-from deepopt.observers import CheckObservers
 
 
-class ReviewWhiteBoxTests(unittest.TestCase):
-    def test_remaining_batches_uses_delivery_cursor_and_new_batch_size(self):
-        loader = ResumableDataLoader(list(range(11)), batch_size=4, generator=torch.Generator().manual_seed(7))
-        self.assertEqual(loader.remaining_batches(), 3)
-        iterator = iter(loader)
-        next(iterator)
-        state = loader.state_dict()
-        loader.batch_sampler.position = 11  # Simulate dispatch running ahead.
-        self.assertEqual(loader.remaining_batches(), 2)
-        loader.load_state_dict(state)
-        loader.set_batch_size(3)
-        self.assertEqual(loader.remaining_batches(), 3)
-        list(loader)
-        self.assertEqual(loader.remaining_batches(), 0)
-
-    def test_unobserved_events_and_unweighted_divisor_need_no_collective(self):
-        core = object.__new__(DDPCore)
-        core._observer_interests = set()
-        checks = CheckObservers(False)
-
-        def unavailable():
-            raise AssertionError("Disabled payload was inspected")
-            yield
-
-        with patch("torch.distributed.all_reduce", side_effect=AssertionError("redundant collective")), \
-                patch("torch.distributed.all_gather_object", side_effect=AssertionError("redundant object collective")):
-            self.assertFalse(core.interested(checks, "weights"))
-            core.observe(checks, "loss", unavailable())
-            self.assertEqual(core.gradient_divisor(1, normalize=False), 1)
-
+class SeededDatasetTests(unittest.TestCase):
     def test_seed_components_are_stable_and_do_not_touch_global_rng(self):
         before = torch.get_rng_state().clone()
         seed = sample_seed(17, 2, 8, 0)

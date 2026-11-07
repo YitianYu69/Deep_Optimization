@@ -13,6 +13,7 @@ from deepopt.opt.do_nn.functional import do_linear
 from deepopt.opt.do_nn.linear_module import DOLinear
 from deepopt.opt.do_nn.mha_module import DOMultiheadAttention
 from deepopt.opt.quantization.quantizer import quantize_fp8
+from tests.opt.fp8_support import round_fp8
 
 
 def _plan(blocks=None, *, out_dtype=None):
@@ -30,26 +31,8 @@ def _plan(blocks=None, *, out_dtype=None):
     }
 
 
-def _round_fp8(matrix, dtype, block_shape):
-    """Independent, deliberately slow scalar-block oracle; no deepopt helpers."""
-    matrix = matrix.detach().float()
-    reconstructed = torch.empty_like(matrix)
-    block_rows, block_cols = block_shape or tuple(matrix.shape)
-    fp8_max = torch.finfo(dtype).max
-    for row in range(0, matrix.shape[0], block_rows):
-        for col in range(0, matrix.shape[1], block_cols):
-            block = matrix[row:row + block_rows, col:col + block_cols]
-            amax = block.abs().max()
-            scale = torch.ones_like(amax) if amax == 0 else fp8_max / amax.clamp_min(1e-12)
-            values = (block * scale).clamp(-fp8_max, fp8_max).to(dtype)
-            reconstructed[row:row + block_rows, col:col + block_cols] = (
-                values.float() * scale.reciprocal()
-            )
-    return reconstructed
-
-
 def _operand(matrix, plan, role):
-    return _round_fp8(
+    return round_fp8(
         matrix, plan["fp8_training"]["fp8_dtypes"][role],
         plan["block_shapes"][role],
     )
@@ -61,7 +44,7 @@ class FP8LinearBlackBoxTests(unittest.TestCase):
 
     def test_forward_backward_match_independent_quantized_math(self):
         for blocks, shape, bias_enabled in itertools.product(
-            (None, (2, 3)), ((7,), (5, 7), (2, 3, 7)), (False, True)
+            (None, (2, 3), (1, 3), (1, 32)), ((7,), (5, 7), (2, 3, 7)), (False, True)
         ):
             with self.subTest(blocks=blocks, shape=shape, bias=bias_enabled):
                 plan = _plan(blocks)
@@ -80,9 +63,29 @@ class FP8LinearBlackBoxTests(unittest.TestCase):
                     expected += bias.detach()
                 torch.testing.assert_close(output, expected.reshape(output.shape))
                 torch.testing.assert_close(x.grad, (qg @ qw).reshape(x.shape))
-                torch.testing.assert_close(weight.grad, qg.T @ qx)
+                if blocks in ((1, 3), (1, 32)):
+                    # Rowwise training quantizes each GEMM orientation
+                    # independently from the original higher-precision values.
+                    qxt = _operand(x.reshape(-1, 7).T, plan, "activation")
+                    qgt = _operand(grad.reshape(-1, 4).T, plan, "grad")
+                    expected_weight_grad = qgt @ qxt.T
+                else:
+                    expected_weight_grad = qg.T @ qx
+                torch.testing.assert_close(weight.grad, expected_weight_grad)
                 if bias is not None:
                     torch.testing.assert_close(bias.grad, grad.reshape(-1, 4).sum(0))
+
+    def test_rowwise_weight_gradient_quantizes_original_transpose_independently(self):
+        plan = _plan()
+        plan["block_shapes"]["activation"] = (1, 2)
+        x = torch.tensor([[1., 100.], [2., 2.]])
+        weight = torch.ones(1, 2, requires_grad=True)
+        gradient = torch.tensor([[1.], [0.]])
+        do_linear(x, weight, plan=plan).backward(gradient)
+        expected = _operand(gradient, plan, "grad").T @ _operand(x.T, plan, "activation").T
+        stored_forward_math = _operand(gradient, plan, "grad").T @ _operand(x, plan, "activation")
+        self.assertNotEqual(expected[0, 0].item(), stored_forward_math[0, 0].item())
+        torch.testing.assert_close(weight.grad, expected, rtol=0, atol=0)
 
     def test_each_operand_can_use_a_distinct_scaling_grid(self):
         plan = _plan()
@@ -330,7 +333,7 @@ class FP8QuantizationBlackBoxTests(unittest.TestCase):
         ):
             with self.subTest(dtype=dtype, block=block):
                 actual = quantize_fp8(matrix, fp8_dtype=dtype, block_shape=block)
-                torch.testing.assert_close(actual.dequantize(), _round_fp8(matrix, dtype, block), rtol=0, atol=0)
+                torch.testing.assert_close(actual.dequantize(), round_fp8(matrix, dtype, block), rtol=0, atol=0)
                 transposed = actual.transpose()
                 torch.testing.assert_close(transposed.dequantize(), actual.dequantize().T, rtol=0, atol=0)
                 torch.testing.assert_close(transposed.transpose().dequantize(), actual.dequantize(), rtol=0, atol=0)

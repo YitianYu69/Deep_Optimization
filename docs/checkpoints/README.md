@@ -201,8 +201,13 @@ def record_epoch(trainer, row):
 
 `config` may be an `ExperimentConfig` or a dictionary of recipe metadata. On
 save, omitted configuration uses `trainer.config`; on restore it uses the saved
-configuration. Direct recipes may still supply explicit metadata. `history`
-must contain exactly one row per completed epoch;
+configuration. Direct recipes may still supply explicit metadata.
+
+Checkpoint FP8 metadata records the trainer's effective runtime policy; explicit
+FP8 overrides must match it. Conflicting settings are rejected before writing,
+so loading the saved configuration reconstructs the same FP8 computation.
+
+`history` must contain exactly one row per completed epoch;
 an in-progress step checkpoint retains completed rows only. Append the row before
 saving in an epoch callback. `generators` maps stable names to Torch generators;
 use `{}` if the recipe has none. Include a `train_loader` for step saves and
