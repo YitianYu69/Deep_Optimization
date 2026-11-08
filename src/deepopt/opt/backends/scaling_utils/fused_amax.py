@@ -23,7 +23,7 @@ def block_amax_kernel(
     x_ptrs = x_ptr + row_offsets[:, None] * N + col_offsets[None, :]
     mask = (row_offsets[:, None] < M) & (col_offsets[None, :] < N)
 
-    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(x)), 1e-12)
 
     tl.store(amax_ptr + pid, amax)
@@ -73,7 +73,7 @@ def block_amax_scalar_kernel(
     x_ptrs = x_ptr + row_offsets[:, None] * N + col_offsets[None, :]
     mask = (row_offsets[:, None] < M) & (col_offsets[None, :] < N)
 
-    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
     amax = tl.max(tl.abs(x))
     scalar = tl.where(amax == 0, 1.0, FP8_MAX / tl.maximum(amax, 1e-12))
     scalar_inv = 1.0 / scalar
@@ -84,34 +84,10 @@ def block_amax_scalar_kernel(
 
 
 def block_amax_scalar(x, block_row, block_col, fp8_max):
-    M, N = x.shape
+    # Preserve the legacy helper while sharing strided, bounded reductions.
+    from ..triton_quantization import amax_scale
 
-    num_row_blocks = triton.cdiv(M, block_row)
-    num_col_blocks = triton.cdiv(N, block_col)
-
-    scalar = torch.empty(
-        (num_row_blocks, num_col_blocks),
-        dtype=torch.float32,
-        device=x.device
-    )
-
-    scalar_inv = torch.empty(
-        (num_row_blocks, num_col_blocks),
-        dtype=torch.float32,
-        device=x.device
-    )
-
-    grid = (num_row_blocks * num_col_blocks,)
-    block_amax_scalar_kernel[grid](
-        x, scalar, scalar_inv,
-        M, N,
-        FP8_MAX=fp8_max,
-        BLOCK_M=block_row,
-        BLOCK_N=block_col,
-        NUM_COL_BLOCKS=num_col_blocks,
-    )
-
-    return scalar, scalar_inv
+    return amax_scale(x, fp8_max, (block_row, block_col), False)
 
 
 
@@ -127,25 +103,13 @@ def global_amax_kernel(
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < N
 
-    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     amax = tl.max(tl.abs(x))
     tl.atomic_max(amax_ptr, amax)
 
 
 def global_amax_scalar(x, fp8_max):
-    N = x.numel()
+    from ..triton_quantization import amax_scale
 
-    amax = torch.zeros((1,), dtype=torch.float32, device=x.device)
-
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(N, BLOCK_SIZE),)
-    global_amax_kernel[grid](
-      x, amax,
-      BLOCK_SIZE=BLOCK_SIZE,
-      N=N,
-    )
-
-    scalar = torch.where(amax == 0, torch.ones_like(amax), fp8_max / amax.clamp_min(1e-12))
-    scalar_inv = scalar.reciprocal()
-
-    return scalar, scalar_inv
+    scalar, scalar_inv = amax_scale(x, fp8_max, None, False)
+    return scalar.reshape(1), scalar_inv.reshape(1)

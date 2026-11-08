@@ -1,4 +1,4 @@
-"""Compare FP8 classifier implementations on a compatible CUDA GPU.
+"""Compare FP8 projection implementations on a compatible CUDA GPU.
 
 python benchmarks/benchmark_fp8_autotune.py
 python benchmarks/benchmark_fp8_autotune.py --source src --source /path/to/baseline/src --num-stages 3
@@ -174,9 +174,13 @@ def _worker(args):
             "num_stages": args.num_stages,
             "out_dtype": torch.bfloat16,
         },
-        "block_shapes": {"activation": (1, 32), "weight": (32, 32), "grad": (32, 32)},
+        "block_shapes": {"activation": (1, args.scale_k), "weight": (args.scale_k, args.scale_k),
+                         "grad": (args.scale_k, args.scale_k)},
     }
-    with _record_autotune_trials() as trials:
+    # Keep strict comparisons compatible with snapshots predating check_finite.
+    check_scope = (nullcontext() if args.check_finite else
+                   deepopt.autocast("cuda", enabled=False, fp8=None, check_finite=False))
+    with check_scope, _record_autotune_trials() as trials:
         rows = _measure_batches(args, torch, device, plan, do_linear, gemm_nt)
     return {
         "source": str(args.source[0]),
@@ -193,11 +197,11 @@ def _worker(args):
 def _measure_batches(args, torch, device, plan, do_linear, gemm_nt):
     rows = []
     for batch in args.batches:
-        x = torch.randn(batch, 512, device=device, dtype=torch.bfloat16, requires_grad=True)
+        x = torch.randn(batch, args.input_features, device=device, dtype=torch.bfloat16, requires_grad=True)
         # Keep FP32 master parameters, as with ordinary BF16 autocast training.
-        weight = torch.randn(10, 512, device=device, requires_grad=True)
-        bias = torch.randn(10, device=device, requires_grad=True)
-        grad = torch.randn(batch, 10, device=device, dtype=torch.bfloat16) / batch
+        weight = torch.randn(args.output_features, args.input_features, device=device, requires_grad=True)
+        bias = torch.randn(args.output_features, device=device, requires_grad=True)
+        grad = torch.randn(batch, args.output_features, device=device, dtype=torch.bfloat16) / batch
         if args.scope == "linear":
             def projection():
                 x.grad = weight.grad = bias.grad = None
@@ -205,6 +209,32 @@ def _measure_batches(args, torch, device, plan, do_linear, gemm_nt):
 
             rows.append({"batch": batch, "operation": "forward_backward",
                          **_measure(projection, torch, device, args)})
+        elif args.scope in ("quantize", "scale", "dequantize"):
+            from deepopt.opt.quantization.quantizer import quantize_fp8
+            from deepopt.opt.scaling_strategy.amax import AmaxScaling
+
+            operands = [("activation", x, "activation"), ("weight", weight, "weight"),
+                        ("gradient", grad, "grad")]
+            for name, value, role in tuple(operands):
+                blocks = plan["block_shapes"][role]
+                if role in ("activation", "grad") and blocks is not None and blocks[0] == 1 and blocks[1] > 1:
+                    operands.append((name + "_transposed", value.T, role))
+            for name, value, role in operands:
+                def quantize():
+                    return quantize_fp8(value, fp8_dtype=plan["fp8_training"]["fp8_dtypes"][role],
+                                        block_shape=plan["block_shapes"][role])
+
+                if args.scope == "scale":
+                    def operation():
+                        return AmaxScaling(plan["block_shapes"][role]).compute(
+                            value, fp8_dtype=plan["fp8_training"]["fp8_dtypes"][role])
+                elif args.scope == "dequantize":
+                    # Prepare FP8 operands outside reconstruction timing.
+                    operation = quantize().dequantize
+                else:
+                    operation = quantize
+                rows.append({"batch": batch, "operation": name, "shape": list(value.shape),
+                             "stride": list(value.stride()), **_measure(operation, torch, device, args)})
         else:
             products = _prepare_gemm_products(x, weight, bias, grad, plan)
             for name, left, right, product_bias, output_dtype in products:
@@ -228,6 +258,10 @@ def _run(args):
                        "--warmups", str(args.warmups), "--iterations", str(args.iterations),
                        "--repeats", str(args.repeats), "--batches", *map(str, args.batches)]
             command.extend(["--num-stages", str(args.num_stages)])
+            command.extend(["--input-features", str(args.input_features),
+                            "--output-features", str(args.output_features), "--scale-k", str(args.scale_k)])
+            if not args.check_finite:
+                command.append("--no-check-finite")
             cache = nullcontext(None) if args.reuse_cache else tempfile.TemporaryDirectory(prefix="deepopt-fp8-")
             with cache as cache_dir:
                 environment = os.environ.copy()
@@ -258,6 +292,9 @@ def _run(args):
             "Later batch shapes may reuse already compiled kernels from earlier shapes in the same process.",
             "Warm timings are synchronized wall-clock milliseconds per invocation.",
             "Linear scope includes quantization, forward/backward, and gradient reset; no backbone, optimizer, or data loading.",
+            "Quantize/scale/dequantize scopes measure one operation and allocation per operand and independently scaled transpose.",
+            "Dequantize scope prepares FP8 operands before timing and does not perform finite validation during reconstruction.",
+            "Finite checks are strict by default; --no-check-finite models unchecked runtime updates in supporting snapshots.",
             "GEMM scope uses prequantized inputs but includes packing, padding, and host dispatch; these are not kernel-only timings.",
             "Forward output and input gradients are BF16; master parameters and weight gradients are FP32.",
             "Autotune selections are inspected after timing; null means the source exposes no compatible tuner cache.",
@@ -272,12 +309,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", type=Path, action="append",
                         help="Directory containing deepopt; repeat to compare snapshots. Defaults to this checkout's src.")
-    parser.add_argument("--scope", choices=("both", "linear", "gemm"), default="both")
+    parser.add_argument("--scope", choices=("both", "linear", "gemm", "quantize", "scale", "dequantize"), default="both")
+    parser.add_argument("--check-finite", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--num-stages", choices=("auto", "1", "2", "3", "4"), default="auto",
+    parser.add_argument("--num-stages", choices=("auto", "1", "2", "3", "4", "5"), default="auto",
                         help="Tune pipeline stages by default; use an integer to compare older source snapshots.")
     parser.add_argument("--batches", nargs="+", type=int, default=[2048, 848, 1808],
                         help="Batch sizes; defaults include CIFAR-10 training and validation tails.")
+    parser.add_argument("--input-features", type=int, default=512)
+    parser.add_argument("--output-features", type=int, default=10)
+    parser.add_argument("--scale-k", type=int, choices=(32, 64, 128, 256, 512, 1024), default=32,
+                        help="Scale width; 128+ permits K=128 FP8 tiles, and larger grids exercise chunked fusion.")
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=3)
@@ -288,8 +330,9 @@ def main():
     args.source = [source.resolve() for source in (args.source or [Path(__file__).resolve().parents[1] / "src"])]
     if any(not (source / "deepopt").is_dir() for source in args.source):
         parser.error("Each --source must be a directory containing the deepopt package.")
-    if any(batch < 1 for batch in args.batches) or args.iterations < 1 or args.repeats < 1 or args.warmups < 0:
-        parser.error("Batches, iterations, and repeats must be positive; warmups must be nonnegative.")
+    if (any(batch < 1 for batch in args.batches) or args.input_features < 1 or args.output_features < 1
+            or args.iterations < 1 or args.repeats < 1 or args.warmups < 0):
+        parser.error("Dimensions, iterations, and repeats must be positive; warmups must be nonnegative.")
     if args._worker:
         if len(args.source) != 1 or args.scope == "both":
             parser.error("A worker needs one source and one scope.")

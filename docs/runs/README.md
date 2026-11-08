@@ -331,7 +331,7 @@ python -m deepopt evaluate --checkpoint runs/fp8/best.pt --device cpu
 | `intercept_linear` | `true` (default) also intercepts native `F.linear`; `false` scopes only prepared DO operations |
 | `activation_dtype`, `weight_dtype`, `grad_dtype` | Each independently accepts `e4m3fn` (default) or `e5m2` on either backend |
 | `block_shapes` | Optional table with `activation`, `weight`, and `grad` two-integer arrays; omitted roles use tensorwise scaling |
-| `num_stages` | `"auto"` (default) tunes Triton pipeline depth; integer 1–4 fixes it |
+| `num_stages` | `"auto"` (default) tunes Triton pipeline depth; integer 1–5 fixes it |
 | `out_dtype` | Optional `fp32`, `bf16`, or `fp16`; omit to follow the active AMP/input dtype |
 
 For example, `[runtime.fp8.block_shapes]` with `weight = [32, 64]` applies

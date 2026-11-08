@@ -57,7 +57,7 @@ class _DOLinearFunction(Function):
             # Rowwise scaling is orientation-dependent. Quantize the original
             # transpose independently to retain reduction-axis scale blocks.
             qx = quantize_fp8(
-                x_matrix.T.contiguous(), fp8_dtype=fp8_dtypes["activation"],
+                x_matrix.T, fp8_dtype=fp8_dtypes["activation"],
                 block_shape=block_shapes["activation"]
             )
 
@@ -125,7 +125,7 @@ class _DOLinearFunction(Function):
                 )
                 if needs_qg_special_transpose:
                     qg = quantize_fp8(
-                        grad_matrix.T.contiguous(),
+                        grad_matrix.T,
                         fp8_dtype=ctx.fp8_dtypes["grad"],
                         block_shape=ctx.block_shapes["grad"],
                         check_finite=ctx.check_finite,

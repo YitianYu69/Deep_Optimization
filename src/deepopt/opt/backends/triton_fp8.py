@@ -7,9 +7,13 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..quantization.tensor import QuantizedTensor
 from ._triton_autotune import (
-    AUTOTUNE_KEY, AUTOTUNE_TILES, MAX_BLOCK_K, SPLIT_K_CHOICES,
+    AUTOTUNE_KEY, AUTOTUNE_TILES, AUTOTUNE_STAGES, GROUP_SIZE_M_CHOICES, MAX_BLOCK_K, SPLIT_K_CHOICES,
     autotune_cache_key, prune_gemm_configs, set_descriptor_block_shapes, split_k_enabled,
+    grouped_tile_coordinates,
 )
+
+
+_grouped_tile_coordinates = triton.jit(grouped_tile_coordinates)
 
 
 def _benchmark_gemm(kernel_call, quantiles):
@@ -55,11 +59,12 @@ def _finish_gemm(args, exception=None):
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk,
-                       "NUM_STAGES": stages, "SPLIT_K": split},
+                       "NUM_STAGES": stages, "SPLIT_K": split, "GROUP_SIZE_M": group},
                       num_warps=warps, num_stages=stages, pre_hook=set_descriptor_block_shapes)
         for bm, bn, bk, warps in AUTOTUNE_TILES
-        for stages in (1, 2, 3, 4)
+        for stages in AUTOTUNE_STAGES
         for split in SPLIT_K_CHOICES
+        for group in GROUP_SIZE_M_CHOICES
     ],
     key=list(AUTOTUNE_KEY),
     prune_configs_by={"early_config_prune": prune_gemm_configs},
@@ -87,16 +92,21 @@ def _gemm_nt_kernel(
     BLOCK_K: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
     NUM_STAGES: tl.constexpr, SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
 
-    start_m = tl.program_id(0) * BLOCK_M
-    start_n = tl.program_id(1) * BLOCK_N
+    pid_m, pid_n = _grouped_tile_coordinates(
+        tl.program_id(0), tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N), GROUP_SIZE_M)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    start_m = pid_m * BLOCK_M
+    start_n = pid_n * BLOCK_N
 
     rows = start_m + tl.arange(0, BLOCK_M)
     cols = start_n + tl.arange(0, BLOCK_N)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k_tile in tl.range(tl.program_id(2), tl.cdiv(K, BLOCK_K), SPLIT_K, num_stages=NUM_STAGES):
+    for k_tile in tl.range(tl.program_id(1), tl.cdiv(K, BLOCK_K), SPLIT_K, num_stages=NUM_STAGES):
         start_k = k_tile * BLOCK_K
 
         a_tile = a_desc.load([start_m, start_k])
@@ -147,7 +157,7 @@ def _gemm_nt_kernel(
     else:
         # Each CTA owns its partial tile; every valid element is overwritten on
         # every invocation. No clearing or nondeterministic atomics are needed.
-        addresses = (tl.program_id(2) * M * OUTPUT_STRIDE
+        addresses = (tl.program_id(1) * M * OUTPUT_STRIDE
                      + rows[:, None] * OUTPUT_STRIDE + cols[None, :])
         tl.store(partials_ptr + addresses, acc, mask=(rows[:, None] < M) & (cols[None, :] < N))
 
@@ -201,8 +211,8 @@ def gemm_nt(
         raise ValueError("This backend requires compute cabaility >= 9")
     if a.data.shape[1] != b.data.shape[1]:
         raise ValueError("Operands must have the same reduction dimension")
-    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4)):
-        raise ValueError("num_stages must be 'auto', 1, 2, 3, or 4")
+    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in AUTOTUNE_STAGES):
+        raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
     
     output_types = {
         torch.float32 : tl.float32,
@@ -266,7 +276,7 @@ def gemm_nt(
 
         bias_arg = output_storage if bias is None else bias.contiguous()
         def grid(meta):
-            return (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]), meta["SPLIT_K"])
+            return (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]), meta["SPLIT_K"])
 
         launch_args = dict(
             A_BLOCK_ROWS=a_block_rows, A_BLOCK_COLS=a_block_cols,

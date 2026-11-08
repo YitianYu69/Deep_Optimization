@@ -35,8 +35,37 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
         from deepopt.opt.backends._triton_autotune import set_descriptor_block_shapes
 
         return triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 32,
-                              "SPLIT_K": split, "NUM_STAGES": 2},
+                              "SPLIT_K": split, "NUM_STAGES": 2, "GROUP_SIZE_M": 1},
                              num_warps=4, num_stages=2, pre_hook=set_descriptor_block_shapes)
+
+    def test_grouped_stage_five_launches_cover_partial_groups_and_cached_split_k(self):
+        import triton
+        from deepopt.opt.backends import triton_fp8
+        from deepopt.opt.backends._triton_autotune import set_descriptor_block_shapes
+
+        kernel = triton_fp8._gemm_nt_kernel
+        # Nine M tiles: the last eight-row group contains just one row of tiles.
+        # N has two partial tiles, so grouping changes the launch order.
+        m, n, k = 133, 29, 515
+        sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+        splits = (1, 4) if sms > 18 else (1,)
+        for blocks in ((None, None), ((1, 32), (32, 32)), ((32, 1), (32, 32))):
+            a = quantize_fp8(torch.randn(m, k, device="cuda") * .1, block_shape=blocks[0])
+            b = quantize_fp8(torch.randn(n, k, device="cuda") * .1, block_shape=blocks[1])
+            product = a.dequantize().cpu() @ b.dequantize().cpu().T
+            bias = torch.randn(n, device="cuda") * .1
+            for group in (1, 8):
+                for split in splits:
+                    config = triton.Config({"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 32,
+                                            "NUM_STAGES": 5, "SPLIT_K": split, "GROUP_SIZE_M": group},
+                                           num_warps=4, num_stages=5, pre_hook=set_descriptor_block_shapes)
+                    with self.subTest(blocks=blocks, group=group, split=split), \
+                         patch.object(kernel, "configs", [config]), patch.object(kernel, "cache", {}):
+                        for _ in range(2):
+                            bias.add_(.01)
+                            actual = gemm_nt(a, b, backend="triton", bias=bias, num_stages=5)
+                            torch.testing.assert_close(actual.cpu(), product + bias.cpu(), rtol=5e-4, atol=5e-4)
+                        self.assertEqual(len(kernel.cache), 1)
 
     def test_split_k_matches_oracle_for_partial_tiles_scaling_and_output_types(self):
         from deepopt.opt.backends import triton_fp8
@@ -342,7 +371,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
                 self.assertNotIn(key, case_keys)
                 case_keys.add(key)
                 if stages == "auto":
-                    self.assertIn(selected.num_stages, (1, 2, 3, 4))
+                    self.assertIn(selected.num_stages, (1, 2, 3, 4, 5))
                 else:
                     self.assertEqual(selected.num_stages, stages)
                 self.assertEqual(selected.num_stages, selected.kwargs["NUM_STAGES"])

@@ -437,8 +437,8 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     stages = raw.get("num_stages", "auto")
     if stages != "auto":
         stages = _integer(stages, "runtime.fp8.num_stages", 1)
-        if stages > 4:
-            raise ConfigError("runtime.fp8.num_stages must be 'auto', 1, 2, 3, or 4")
+        if stages > 5:
+            raise ConfigError("runtime.fp8.num_stages must be 'auto', 1, 2, 3, 4, or 5")
     out_dtype = raw.get("out_dtype")
     if out_dtype not in (None, "fp32", "bf16", "fp16"):
         raise ConfigError("runtime.fp8.out_dtype must be fp32, bf16, fp16, or null")

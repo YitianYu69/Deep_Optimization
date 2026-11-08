@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F 
+from torch._subclasses.fake_tensor import FakeTensor
 
 from .._execution import finite_checks_enabled
 
@@ -44,6 +45,29 @@ class AmaxScaling:
                 *, check_finite: bool | None = None) -> ScalingResult:
         if check_finite is None:
             check_finite = finite_checks_enabled()
+        self._validate_input(x, fp8_dtype, check_finite)
+
+        fp8_max = torch.finfo(fp8_dtype).max
+        if x.device.type == "cpu":
+            # FP32 tensors belong only to the CPU reference implementation.
+            x_fp32 = x.float()
+            if check_finite and not torch.isfinite(x_fp32).all():
+                raise ValueError("AmaxScaling requires finite inputs")
+            return self._compute_cpu(x_fp32, fp8_max)
+        if isinstance(x, FakeTensor):
+            rows, cols = x.shape
+            shape = ((1, 1) if self.block_shape is None else
+                     tuple((size + block - 1) // block for size, block in zip((rows, cols), self.block_shape)))
+            scale = torch.empty(shape, device=x.device, dtype=torch.float32)
+            scale_inv = torch.empty_like(scale)
+        else:
+            from ..backends.triton_quantization import amax_scale
+
+            scale, scale_inv = amax_scale(x, fp8_max, self.block_shape, check_finite)
+        return ScalingResult(scale=scale, scale_inv=scale_inv, block_shape=self.block_shape)
+
+    def _validate_input(self, x, fp8_dtype, check_finite):
+        """Share structural checks with quantization without scanning payloads."""
         if type(check_finite) is not bool:
             raise TypeError("check_finite must be a boolean")
         if x.ndim != 2:
@@ -63,36 +87,6 @@ class AmaxScaling:
                 raise ValueError("block_shape must not be (1, 1)")
             if any(is_not_power_of_2(size) for size in self.block_shape):
                 raise ValueError("block_shape must be powers of two")
-
-        x_fp32 = x.float()
-        if check_finite and not torch.isfinite(x_fp32).all():
-            raise ValueError("AmaxScaling requires finite inputs")
-        
-        fp8_max = torch.finfo(fp8_dtype).max
-        if x.device.type == "cpu":
-            return self._compute_cpu(x_fp32, fp8_max)
-
-        # Fused kernels use row-major addressing rather than tensor strides.
-        x_fp32 = x_fp32.contiguous()
-        # CUDA always uses the fused implementation. A missing Triton install
-        # remains an error on CUDA; CPU testing never imports this module.
-        from ..backends.scaling_utils.fused_amax import block_amax_scalar, global_amax_scalar
-
-        if self.block_shape is None:
-            scale, scale_inv = global_amax_scalar(x_fp32, fp8_max)
-            scale = scale.reshape(1, 1)
-            scale_inv = scale_inv.reshape(1, 1)
-        else:
-            block_rows, block_cols = self.block_shape
-            scale, scale_inv = block_amax_scalar(
-                x_fp32, block_rows, block_cols, fp8_max
-            )
-
-        return ScalingResult(
-            scale=scale,
-            scale_inv=scale_inv,
-            block_shape=self.block_shape
-        )
 
     def _compute_cpu(self, x_fp32: torch.Tensor, fp8_max: float) -> ScalingResult:
         """PyTorch reference scaling, including strided inputs and edge blocks."""

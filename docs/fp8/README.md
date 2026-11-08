@@ -100,7 +100,7 @@ Mappings use the same schema as the TOML table, including `enabled`.
 Optional `block_shapes` maps `activation`, `weight` and `grad` to positive
 two-dimensional shapes; roles without inherited settings use tensorwise scaling.
 Partial overrides preserve unspecified inherited roles. `num_stages`
-defaults to `"auto"` (search stages 1–4); an integer from 1–4 pins the depth.
+defaults to `"auto"` (search stages 1–5); an integer from 1–5 pins the depth.
 `out_dtype=None` uses the active AMP/input dtype.
 
 Automatic preparation runs before DDP wrapping. Configured experiments also
@@ -174,6 +174,43 @@ quantized values and scale grids. In particular, quantizing `X.T` rowwise is
 intentionally different from transposing a rowwise quantization of `X`.
 The CPU reference backend follows this same orientation-dependent contract.
 
+CUDA quantization fuses block amax, scale calculation, clamping, FP8 conversion,
+and inverse-scale output in one kernel for tiles with at most 16384 elements. Small
+independent blocks share a CTA; input strides are read directly, including
+transpose views and partial edge blocks. This avoids expanded scale grids and
+full-sized FP32/contiguous input intermediates. Both FP8 formats retain
+round-to-nearest-even conversion and the existing zero-amax and minimum-amax
+rules. Larger scale blocks use bounded chunked reductions followed by fused
+scaling/conversion; 16384 is an algorithm threshold, not a supported block-size
+limit. Scale tiles are clipped to the actual input dimensions to avoid excessive
+padded work. Standalone `AmaxScaling.compute` shares the same kernels in scale-only
+mode and returns both scales without producing FP8 data. It reads the original
+dtype and strides, with no full FP32 conversion or contiguous input copy. Layout
+selection stays inside the CUDA launch wrapper. CPU emulation retains its FP32
+reference tensors.
+
+Small tensorwise inputs (at most 4096 elements) use one fused kernel. Larger
+tensorwise inputs use partial amax reduction, a bounded reduction to a global
+scale, and fused scaling/conversion. Very large reductions add hierarchical
+partial-reduction stages. Oversized blockwise groups use the same staged
+approach with a separate reduction per scale block. Current tensorwise scaling still reads the original
+input twice; no global barrier or delayed-scaling recipe is introduced.
+
+Checked fused kernels write a finite-error flag per CTA while reading the
+input, then synchronously validate those flags before returning. `max_speed`,
+unchecked `balanced` updates, and explicit `check_finite=False` compile out that
+work and allocate no error buffer. `analyze`, checked cadence updates, and
+explicit `check_finite=True` retain immediate nonfinite-input rejection.
+The independent backward-check choice saved by forward remains in force.
+Metadata-only FakeTensor probes allocate the fused result and scale layouts
+without importing Triton or tracing the old unfused intermediates.
+
+CUDA `QuantizedTensor.dequantize()` fuses FP8-to-FP32 conversion and inverse-scale
+multiplication in one kernel. Strided values, transpose views, and noncontiguous
+scale grids are supported directly; no expanded scale tensor or intermediate
+FP32 value tensor is materialized. Reconstruction retains its existing behavior
+in every execution mode and introduces no additional finite scans or scalar reads.
+
 This keeps rowwise scales aligned with the reduction axis in the weight-gradient
 GEMM. With activation `(1, 32)`, weight `(32, 32)`, and gradient `(1, 32)` or
 `(32, 32)`, all three GEMMs select the native FP8 path. Other block grids still
@@ -183,7 +220,9 @@ retain the dequantization fallback.
 Under `torch.no_grad()` or `torch.inference_mode()`, the projection skips saved
 activation orientations and other backward-only bookkeeping, even when its
 parameters still have `requires_grad=True`. Training retains the independent
-rowwise quantization described above. Other backward transposes can use views;
+rowwise quantization described above, passing original transpose views directly
+to the strided quantizer without dense high-precision transpose copies.
+Other backward transposes can use views;
 the Triton backend packs those views directly into its required aligned layout.
 `QuantizedTensor.transpose()` keeps its contiguous-result default; the optional
 `contiguous=False` avoids an intermediate materialization.
@@ -289,7 +328,7 @@ choice, including for backward outside its scope. Enter `runtime.autocast()`
 for each manual forward (a saved context object can be reentered); scheduling
 is resolved before that forward. Unchecked inputs must be finite: no deferred error flag or automatic
 repair is introduced. Zero-amax handling stays on the GPU and requires no
-Python scalar read. Complete quantization fusion remains separate work.
+Python scalar read. Fused quantization uses the same phase-local check policy.
 
 `runtime.autocast()` applies the runtime's configured AMP and FP8 together.
 `runtime.compute()` enters it automatically and also performs device transfer
@@ -669,8 +708,8 @@ native model/optimizer checkpoints for the supported conversions.
 
 The tests cover exact continuation at both step and epoch boundaries, including
 partial accumulation windows, two Gloo ranks, and conditional two-GPU NCCL runs.
-The FP8 path is not guaranteed CUDA-Graph-capture-safe. Strict scaling performs
-a host-visible finite-value check; disabling that check alone does not establish
+The FP8 path is not guaranteed CUDA-Graph-capture-safe. Strict quantization
+performs a host-visible finite-error check; disabling that check alone does not establish
 capture safety for policy dispatch, allocation, autotuning, or weight-cache
 lifetimes. CUDA Graph support for the surrounding framework does not imply
 this FP8 path can be captured.
@@ -691,7 +730,7 @@ The Triton backend supports independent `e4m3fn`/`e5m2` formats. Fused CUDA
 quantization requires power-of-two block dimensions other than `[1, 1]`.
 For example, activation `[1, 32]` with weight and gradient
 `[32, 32]` is supported. Pipeline stages are tuned automatically by default;
-an explicit integer from 1 through 4 fixes the depth.
+an explicit integer from 1 through 5 fixes the depth.
 
 Tensorwise scaling and blockwise scales whose reduction-axis widths are multiples
 of 32 use native FP8 dot products. Other layouts use fused per-element FP32
@@ -705,19 +744,34 @@ The backend packs strided/misaligned operands, pads partial tiles, and returns
 FP32/BF16/FP16 results. Correctness/performance must be measured on the target GPU.
 
 The kernel automatically uses Triton's native `@triton.autotune` to select
-matrix tile sizes, warp counts, pipeline stages, and eligible split-K factors.
-The search measures at most 48 configurations across at most 12 tile/reduction
-families, retaining the historical static launch as a measured candidate.
+matrix tile sizes, warp counts, pipeline stages, grouped launch ordering, and
+eligible split-K factors. The search measures at most 48 configurations,
+retaining the historical tile/warp/stage choice as a measured candidate.
+Compatible CUDA configurations from
+[Triton's GEMM tutorial](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html)
+are reserved in the measured set, including 128x256/256x128 FP8 tiles with
+K=128 and the two-warp, five-stage small tiles. Shape-aware pruning still
+excludes inappropriate sizes and incompatible scale boundaries. Up to 12
+additional heuristic tile/reduction families supply narrow and split-K choices.
 Candidates include small tiles along long axes to increase parallelism for
 skinny products, two-warp small tiles, and larger tiles for dense products.
 Shortlisting ranks estimated padded work and memory traffic, reserves narrow-axis
 alternatives, and distributes the budget across reduction widths and split
 factors before stage/warp variants. Candidate-list order does not affect selection.
-An explicit `num_stages` from 1–4 constrains the search; `"auto"` searches pipeline
+The shortlist reserves stage-depth coverage before filling the remaining budget.
+An explicit `num_stages` from 1–5 constrains the search; `"auto"` searches pipeline
 depths with matching loop and compiler stages. Candidates with incompatible
 reduction-scale boundaries or resource requirements are pruned. Quantization
 `block_shapes` stay independent of kernel tile sizes: a 32-wide reduction-scale
 block still forbids 64/128-wide native FP8 reduction tiles.
+
+Grouped launches traverse up to eight M tiles before advancing along N to
+promote L2 reuse. Row-major order (`GROUP_SIZE_M=1`) competes with grouped order
+(`GROUP_SIZE_M=8`); up to eight otherwise-identical configuration pairs isolate
+the scheduling choice without consuming the entire search budget. When either
+output axis has a single tile, the equivalent grouped variant is omitted.
+The final partial M group and split-K planes use the same coordinate mapping.
+These CUDA/TMA choices do not introduce a HIP backend.
 
 Split-K factors 2, 4, and 8 compete with unsplit launches for products with an
 output axis at most 32, K at least 512, and at most 262144 output elements.
@@ -761,10 +815,29 @@ Compare source snapshots on the target GPU with the
 python benchmarks/benchmark_fp8_autotune.py
 # Repeat --source to compare the current implementation with earlier snapshots.
 python benchmarks/benchmark_fp8_autotune.py --source src --source /path/to/baseline/src --num-stages 3
+# Dense projection with scale widths that allow K=128 native FP8 tiles.
+python benchmarks/benchmark_fp8_autotune.py --batches 1024 --input-features 1024 --output-features 1024 --scale-k 128
+# Isolate quantization, including independently scaled transpose views.
+python benchmarks/benchmark_fp8_autotune.py --scope quantize
+python benchmarks/benchmark_fp8_autotune.py --scope quantize --no-check-finite
+python benchmarks/benchmark_fp8_autotune.py --scope scale --no-check-finite
+python benchmarks/benchmark_fp8_autotune.py --scope dequantize
+# Larger scale groups use chunked fusion rather than the unfused fallback.
+python benchmarks/benchmark_fp8_autotune.py --scope quantize --batches 1024 --input-features 1024 --output-features 1024 --scale-k 256 --no-check-finite
 ```
 
-It uses generated tensors for a `512 -> 10` CIFAR-10 classifier, with batch sizes
-2048, 848 (training tail), and 1808 (validation tail). Each source and measurement
+By default it uses generated tensors for a `512 -> 10` CIFAR-10 classifier,
+with batch sizes 2048, 848 (training tail), and 1808 (validation tail).
+`--input-features`, `--output-features`, and `--batches` select other projection
+shapes; `--scale-k` selects a power-of-two scale width from 32 through 1024 (default 32).
+The report records group sizes, stages, and split factors for winners and trials.
+`--scope quantize`, `--scope scale`, and `--scope dequantize` report each operation's
+allocation/latency, operand shapes, and strides independently of GEMM.
+Dequantization prepares FP8 inputs outside the timed region. Finite checks are enabled by default;
+`--no-check-finite` applies the unchecked policy to all measured scopes and
+requires a source snapshot that supports the explicit check override. Use it
+to compare unchecked updates; keep checks enabled when comparing strict runs.
+Each source and measurement
 scope runs in a fresh process with an isolated Triton compilation cache by
 default; `--reuse-cache` retains the normal disk cache. Reports separate first-use
 latency from synchronized warmed timings and include cached winning tiles and

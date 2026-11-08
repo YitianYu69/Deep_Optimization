@@ -17,8 +17,8 @@ def gemm_nt(
     num_stages: int | str = "auto",
 ) -> torch.Tensor:
 
-    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4)):
-        raise ValueError("num_stages must be 'auto', 1, 2, 3, or 4")
+    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4, 5)):
+        raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
 
     if backend == "reference":
         from .reference import gemm_nt as implementation

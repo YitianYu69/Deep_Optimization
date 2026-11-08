@@ -8,6 +8,25 @@ import unittest
 
 
 class CPUScalingTests(unittest.TestCase):
+    def test_fake_cuda_scaling_does_not_materialize_fp32_or_contiguous_inputs(self):
+        import torch
+        from unittest.mock import patch
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from deepopt.opt.scaling_strategy.amax import AmaxScaling
+
+        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton_quantization": None}):
+            x = torch.empty(257, 259, device="cuda", dtype=torch.bfloat16).T
+            with patch.object(torch.Tensor, "float", side_effect=AssertionError("full FP32 copy")), \
+                 patch.object(torch.Tensor, "contiguous", side_effect=AssertionError("dense input copy")):
+                for blocks in (None, (1, 32), (32, 32), (256, 256), (1024, 1024)):
+                    result = AmaxScaling(blocks).compute(x, check_finite=False)
+                    expected = ((1, 1) if blocks is None else
+                                tuple((size + block - 1) // block for size, block in zip(x.shape, blocks)))
+                    self.assertEqual(result.scale.shape, expected)
+                    self.assertEqual(result.scale_inv.shape, expected)
+                    self.assertEqual(result.scale.dtype, torch.float32)
+                    self.assertEqual(result.scale.device, x.device)
+
     def test_cpu_fp8_scaling_and_training_do_not_require_triton(self):
         root = Path(__file__).resolve().parents[2]
         code = '''
