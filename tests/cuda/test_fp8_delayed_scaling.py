@@ -20,6 +20,38 @@ def state(device, dtype):
 
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
 class DelayedScalingCUDATests(unittest.TestCase):
+    def test_unchecked_nonfinite_conversion_preserves_payload_and_previous_scale(self):
+        for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            for nonfinite in (float("nan"), float("inf"), -float("inf")):
+                with self.subTest(dtype=dtype, nonfinite=nonfinite):
+                    actual, expected = state("cuda", dtype), state("cpu", dtype)
+                    actual.scales.fill_(.5)
+                    expected.scales.fill_(.5)
+                    source = torch.full((17, 33), 2.)
+                    source[0, 0] = nonfinite
+                    a, at, _ = actual.quantize(source.cuda(), "activation", transposed=True, check_finite=False)
+                    b, bt, _ = expected.quantize(source, "activation", transposed=True, check_finite=False)
+                    for value, oracle in ((a, b), (at, bt)):
+                        torch.testing.assert_close(value.data.float().cpu(), oracle.data.float(),
+                                                   rtol=0, atol=0, equal_nan=True)
+                        torch.testing.assert_close(value.scale_inv.cpu(), oracle.scale_inv, rtol=0, atol=0)
+                    torch.testing.assert_close(actual.scales.cpu(), expected.scales, rtol=0, atol=0)
+                    torch.testing.assert_close(actual.history.cpu(), expected.history,
+                                               rtol=0, atol=0, equal_nan=True)
+                    self.assertEqual(actual.updates.cpu().tolist(), [1, 0, 0])
+
+    def test_checked_nonfinite_conversion_raises_without_updating_history(self):
+        actual = state("cuda", torch.float8_e4m3fn)
+        for nonfinite in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(nonfinite=nonfinite):
+                source = torch.ones((17, 33), device="cuda")
+                source[0, 0] = nonfinite
+                with self.assertRaisesRegex(ValueError, "finite inputs"):
+                    actual.quantize(source, "activation", check_finite=True)
+                self.assertEqual(actual.updates.cpu().tolist(), [0, 0, 0])
+                self.assertEqual(torch.count_nonzero(actual.history).item(), 0)
+                torch.testing.assert_close(actual.scales, torch.ones_like(actual.scales), rtol=0, atol=0)
+
     def test_flat_chunk_reduction_preserves_nonfinite_and_activity_flags(self):
         from deepopt.opt.backends.triton_delayed import reduce_observations
         from deepopt.opt.backends._delayed_launch import MetadataCache

@@ -27,7 +27,9 @@ def _convert(x, scale_ptr, normal, transpose, snapshot, amax, db, errors,
                      mask=(rows[:, None] < M) & (cols[None, :] < N), other=0.).to(tl.float32)
     scale = tl.load(scale_ptr)
     scaled = tl.minimum(tl.maximum(values * scale, -MAXIMUM), MAXIMUM)
-    converted = tl.where(tl.isnan(values), float("nan"), scaled).to(normal.dtype.element_ty,
+    # Triton exposes neither isnan nor isinf in triton.language. IEEE
+    # comparisons preserve NaN handling without a CUDA-only libdevice import.
+    converted = tl.where(values != values, float("nan"), scaled).to(normal.dtype.element_ty,
                                                                                 fp_downcast_rounding="rtne")
     if NORMAL:
         tl.store(normal + rows[:, None] * PAD_N + cols[None, :], converted,
@@ -113,7 +115,7 @@ def _observations(metadata, packed, COUNT, GROUPS: tl.constexpr, BLOCK: tl.const
     group = tl.load(metadata + observation * 4 + 2)
     offsets = (pid - first) * BLOCK + tl.arange(0, BLOCK)
     values = tl.load(pointer + offsets, mask=offsets < size, other=0.)
-    kind = tl.max(tl.where(tl.isnan(values), 2, tl.where(tl.isinf(values), 1, 0)), 0)
+    kind = tl.max(tl.where(values != values, 2, tl.where(tl.abs(values) == float("inf"), 1, 0)), 0)
     maximum = tl.max(tl.where(tl.abs(values) < float("inf"), values, 0.), 0)
     tl.atomic_max(packed + group, maximum, sem="relaxed")
     tl.atomic_max(packed + GROUPS + group, 1., sem="relaxed")
