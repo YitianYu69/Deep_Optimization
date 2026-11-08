@@ -137,8 +137,10 @@ class ViTFP8OptimizationTests(unittest.TestCase):
                     raise AssertionError("Fresh process benchmarked instead of loading disk results")
                 kernel._bench = fail
             a = quantize_fp8(torch.ones(64, 64, device="cuda"), check_finite=False)
-            result = gemm_nt(a, a, backend="triton", num_stages=2)
-            torch.testing.assert_close(result.cpu(), torch.full((64, 64), 64.))
+            for dtype in (torch.float32, torch.bfloat16, torch.float16):
+                result = gemm_nt(a, a, backend="triton", num_stages=2, out_dtype=dtype)
+                torch.testing.assert_close(result.cpu(), torch.full((64, 64), 64., dtype=dtype))
+            json.dumps(list(kernel.cache))
             print("CACHE_RESULT=" + json.dumps({"benchmarks": len(calls)}))
         ''')
         with tempfile.TemporaryDirectory() as directory:
@@ -148,4 +150,4 @@ class ViTFP8OptimizationTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=180)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 record = next(line for line in result.stdout.splitlines() if line.startswith("CACHE_RESULT="))
-                self.assertEqual(json.loads(record.split("=", 1)[1])["benchmarks"], 2 if phase == "cold" else 0)
+                self.assertEqual(json.loads(record.split("=", 1)[1])["benchmarks"], 6 if phase == "cold" else 0)

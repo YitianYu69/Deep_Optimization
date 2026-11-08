@@ -1,6 +1,7 @@
 """Exercise the real host-side tuning policy without importing a GPU backend."""
 
 from itertools import product
+import json
 from types import SimpleNamespace
 import unittest
 
@@ -27,6 +28,20 @@ def tile(config):
 
 
 class TritonAutotunePolicyTests(unittest.TestCase):
+    def test_disk_cache_key_serializes_without_kernel_dtype_objects(self):
+        keys = []
+        for output_format in ("torch.float32", "torch.bfloat16", "torch.float16"):
+            named = dict.fromkeys(AUTOTUNE_KEY, 1)
+            # The compile-time dtype is opaque to JSON; only its format label
+            # belongs in the persisted tuning key.
+            named.update(OUTPUT_DTYPE=object(), OUTPUT_FORMAT=output_format,
+                         output_ptr=SimpleNamespace(dtype=output_format))
+            key = autotune_cache_key(named)
+            self.assertEqual(json.loads(json.dumps(key)), list(key))
+            self.assertIn(output_format, key[:len(AUTOTUNE_KEY)])
+            keys.append(key)
+        self.assertEqual(len(set(keys)), 3)
+
     def setUp(self):
         self.configs = [
             SimpleNamespace(kwargs={"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk,
@@ -219,7 +234,7 @@ class TritonAutotunePolicyTests(unittest.TestCase):
 
     def test_cache_key_covers_format_device_and_pruning_policy(self):
         required = {
-            "M", "N", "K", "A_FP8_FORMAT", "B_FP8_FORMAT", "OUTPUT_DTYPE",
+            "M", "N", "K", "A_FP8_FORMAT", "B_FP8_FORMAT", "OUTPUT_FORMAT",
             "A_BLOCK_ROWS", "A_BLOCK_COLS", "B_BLOCK_ROWS", "B_BLOCK_COLS",
             "A_SCALE_COLS", "B_SCALE_COLS", "TENSORWISE", "NATIVE_FP8", "HAS_BIAS",
             "PIPELINE_STAGES", "DEVICE_INDEX", "DEVICE_CAPABILITY", "NUM_SMS",
