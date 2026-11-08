@@ -4,7 +4,7 @@ from torch.autograd.function import once_differentiable
 
 from ...backends import gemm_nt
 from ...quantization.tensor import QuantizedTensor
-from ...quantization.quantizer import quantize_fp8, _quantize_tensorwise_pair
+from ...quantization.quantizer import quantize_fp8, _quantize_tensorwise_pair, _quantize_tensorwise_transpose
 from ..._execution import backward_finite_check_policy
 
 
@@ -25,7 +25,6 @@ class _DOLinearFunction(Function):
         block_shapes = plan["block_shapes"]
         backend = fp8_trainig_plan.get("backend", "reference")
         num_stages = fp8_trainig_plan.get("num_stages", "auto")
-        accumulation = fp8_trainig_plan.get("max_num_imprecise_acc", 32)
 
         x_matrix = x.reshape(-1, weight.shape[1])
         need_dx, need_dw = ctx.needs_input_grad[:2]
@@ -46,8 +45,7 @@ class _DOLinearFunction(Function):
                                                      paired=paired_w)
         qw, qw_transposed = quantized_weight if paired_w else (quantized_weight, None)
 
-        output = gemm_nt(qx, qw, backend=backend, bias=bias, out_dtype=out_dtype, num_stages=num_stages,
-                         max_num_imprecise_acc=accumulation)
+        output = gemm_nt(qx, qw, backend=backend, bias=bias, out_dtype=out_dtype, num_stages=num_stages)
         if not backward_enabled:
             return output.reshape(*x.shape[:-1], weight.shape[0])
 
@@ -87,7 +85,6 @@ class _DOLinearFunction(Function):
         ctx.block_shapes = dict(block_shapes)
         ctx.backend = backend
         ctx.num_stages = num_stages
-        ctx.max_num_imprecise_acc = accumulation
         ctx.save_qx_transpose = save_qx_transpose or paired_x
         ctx.weight_transposed = paired_w
         ctx.check_finite = backward_finite_check_policy()
@@ -108,8 +105,11 @@ class _DOLinearFunction(Function):
         if need_dx or need_dw:
             paired_g = (need_dw and ctx.backend == "triton" and grad_matrix.device.type == "cuda"
                         and ctx.block_shapes["grad"] is None and grad_matrix.numel() > 4096)
-            if paired_g:
+            if paired_g and need_dx:
                 qg, qg_transposed = _quantize_tensorwise_pair(
+                    grad_matrix, fp8_dtype=ctx.fp8_dtypes["grad"], check_finite=ctx.check_finite)
+            elif paired_g:
+                qg_transposed = _quantize_tensorwise_transpose(
                     grad_matrix, fp8_dtype=ctx.fp8_dtypes["grad"], check_finite=ctx.check_finite)
             else:
                 qg = quantize_fp8(grad_matrix, fp8_dtype=ctx.fp8_dtypes["grad"],
@@ -127,7 +127,6 @@ class _DOLinearFunction(Function):
                     backend=ctx.backend,
                     out_dtype=ctx.input_dtype,
                     num_stages=ctx.num_stages,
-                    max_num_imprecise_acc=ctx.max_num_imprecise_acc,
                 ).reshape(ctx.input_shape)
             
             if need_dw:
@@ -156,7 +155,6 @@ class _DOLinearFunction(Function):
                     backend=ctx.backend,
                     out_dtype=ctx.weight_dtype,
                     num_stages=ctx.num_stages,
-                    max_num_imprecise_acc=ctx.max_num_imprecise_acc,
                 )
         
         if need_db:

@@ -122,14 +122,29 @@ class FP8PolicySnapshotTests(unittest.TestCase):
         payload = _checkpoint_payload(trainer, {}, generators={}, history=[])
         payload["config"]["runtime"]["fp8"].pop("intercept_linear")
         payload["trainer_settings"]["fp8"].pop("intercept_linear")
-        payload["config"]["runtime"]["fp8"].pop("max_num_imprecise_acc")
-        payload["trainer_settings"]["fp8"].pop("max_num_imprecise_acc")
         restored = make_trainer()
         restore_checkpoint(payload, restored, payload["config"], generators={}, batch_size_mode="manual")
         self.assertTrue(restored.runtime.fp8.intercept_linear)
-        self.assertEqual(restored.runtime.fp8.max_num_imprecise_acc, 32)
         for name, value in trainer.model.state_dict().items():
             torch.testing.assert_close(restored.model.state_dict()[name], value, rtol=0, atol=0)
+
+    def test_recipe_is_recorded_and_legacy_or_changed_policy_rejects_resume_before_loading(self):
+        trainer = make_trainer()
+        original = _checkpoint_payload(trainer, {}, generators={}, history=[])
+        self.assertEqual(original["trainer_settings"]["fp8_recipe"],
+                         {"version": 2, "accumulation": "reference-fp32", "triton_version": None})
+        for recipe in (None, {"version": 1}, {"version": 2, "accumulation": "triton-native", "triton_version": "old"}):
+            payload = deepcopy(original)
+            if recipe is None:
+                payload["trainer_settings"].pop("fp8_recipe")
+            else:
+                payload["trainer_settings"]["fp8_recipe"] = recipe
+            restored = make_trainer()
+            with torch.no_grad():
+                restored.model[0].weight.fill_(123)
+            with self.assertRaisesRegex(ValueError, "FP8 numerical recipe.*original library"):
+                restore_checkpoint(payload, restored, payload["config"], generators={}, batch_size_mode="manual")
+            self.assertTrue(torch.all(restored.model[0].weight == 123))
 
 
 if __name__ == "__main__":

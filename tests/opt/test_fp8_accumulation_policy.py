@@ -1,5 +1,8 @@
-"""Accumulation precision is explicit, validated, and propagated to every GEMM."""
+"""Native accumulation is a versioned numerical policy, with no forced limit."""
 
+import ast
+from dataclasses import asdict
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -10,34 +13,35 @@ from deepopt.opt.backends import gemm_nt
 from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
 from deepopt.opt.do_nn.functional import do_linear, validate_fp8_plan
 from deepopt.opt.policy import fp8_plan
-from deepopt.opt.quantization.quantizer import quantize_fp8
 
 
 class FP8AccumulationPolicyTests(unittest.TestCase):
-    def test_default_is_unchanged_and_valid_limits_round_trip(self):
-        self.assertEqual(FP8Config().max_num_imprecise_acc, 32)
-        for limit in (32, 64, 128, 256, 1024):
-            config = fp8_config_from_dict({"enabled": True, "max_num_imprecise_acc": limit})
-            self.assertEqual(fp8_plan(config)["fp8_training"]["max_num_imprecise_acc"], limit)
+    def test_removed_setting_has_an_explicit_migration_error(self):
+        self.assertNotIn("max_num_imprecise_acc", asdict(FP8Config()))
+        for limit in (32, 128, None):
+            with self.assertRaisesRegex(ConfigError, "removed.*native Triton"):
+                fp8_config_from_dict({"max_num_imprecise_acc": limit})
+            plan = fp8_plan(True)
+            plan["fp8_training"]["max_num_imprecise_acc"] = limit
+            with self.assertRaisesRegex(ValueError, "removed"):
+                validate_fp8_plan(plan)
 
-    def test_invalid_limits_fail_at_config_plan_and_dispatch_boundaries(self):
-        operand = quantize_fp8(torch.ones(2, 3))
-        for limit in (True, None, "128", 32., 0, -32, 31, 33, 2147483648):
-            with self.subTest(limit=limit):
-                with self.assertRaises(ConfigError):
-                    fp8_config_from_dict({"max_num_imprecise_acc": limit})
-                plan = fp8_plan(True)
-                plan["fp8_training"]["max_num_imprecise_acc"] = limit
-                with self.assertRaisesRegex(ValueError, "max_num_imprecise_acc"):
-                    validate_fp8_plan(plan)
-                with self.assertRaisesRegex(ValueError, "max_num_imprecise_acc"):
-                    gemm_nt(operand, operand, backend="reference", max_num_imprecise_acc=limit)
-
-    def test_forward_and_both_gradients_receive_the_selected_policy(self):
+    def test_forward_and_both_gradients_leave_accumulation_to_the_backend(self):
         x = torch.randn(7, 5, requires_grad=True)
         weight = torch.randn(3, 5, requires_grad=True)
-        plan = fp8_plan(FP8Config(enabled=True, max_num_imprecise_acc=128))
         with patch.object(linear_autograd_func, "gemm_nt", wraps=gemm_nt) as calls:
-            do_linear(x, weight, plan=plan).square().sum().backward()
+            do_linear(x, weight, plan=fp8_plan(True)).square().sum().backward()
         self.assertEqual(len(calls.call_args_list), 3)
-        self.assertTrue(all(call.kwargs["max_num_imprecise_acc"] == 128 for call in calls.call_args_list))
+        self.assertTrue(all("max_num_imprecise_acc" not in call.kwargs for call in calls.call_args_list))
+        self.assertEqual(x.grad.dtype, x.dtype)
+        self.assertEqual(weight.grad.dtype, weight.dtype)
+
+    def test_native_dot_calls_omit_limit_and_keep_chained_fp32_accumulator(self):
+        path = Path(__file__).resolve().parents[2] / "src/deepopt/opt/backends/triton_fp8.py"
+        tree = ast.parse(path.read_text())
+        dots = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute) and node.func.attr == "dot"]
+        self.assertEqual(len(dots), 3)
+        self.assertTrue(all("max_num_imprecise_acc" not in {kw.arg for kw in node.keywords} for node in dots))
+        self.assertEqual(ast.unparse(dots[0].args[2]), "acc")
+        self.assertEqual(ast.unparse(dots[0].keywords[0].value), "tl.float32")

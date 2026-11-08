@@ -243,7 +243,8 @@ def dequantize(values, inverse, block_shape):
 @triton.jit
 def _cast_tensorwise_pair(x_ptr, normal_ptr, transpose_ptr, scale_ptr, M, N,
                           STRIDE_M, STRIDE_N, PADDED_M: tl.constexpr, PADDED_N: tl.constexpr,
-                          N_TILES: tl.constexpr, FP8_MAX: tl.constexpr, BLOCK: tl.constexpr):
+                          N_TILES: tl.constexpr, FP8_MAX: tl.constexpr, BLOCK: tl.constexpr,
+                          WRITE_NORMAL: tl.constexpr):
     rows = (tl.program_id(0) // N_TILES) * BLOCK + tl.arange(0, BLOCK)
     cols = (tl.program_id(0) % N_TILES) * BLOCK + tl.arange(0, BLOCK)
     values = tl.load(x_ptr + rows[:, None] * STRIDE_M + cols[None, :] * STRIDE_N,
@@ -251,23 +252,25 @@ def _cast_tensorwise_pair(x_ptr, normal_ptr, transpose_ptr, scale_ptr, M, N,
     scale = tl.load(scale_ptr)
     values = tl.minimum(tl.maximum(values * scale, -FP8_MAX), FP8_MAX)
     converted = values.to(normal_ptr.dtype.element_ty, fp_downcast_rounding="rtne")
-    tl.store(normal_ptr + rows[:, None] * PADDED_N + cols[None, :], converted,
-             mask=(rows[:, None] < M) & (cols[None, :] < PADDED_N))
+    if WRITE_NORMAL:
+        tl.store(normal_ptr + rows[:, None] * PADDED_N + cols[None, :], converted,
+                 mask=(rows[:, None] < M) & (cols[None, :] < PADDED_N))
     tl.store(transpose_ptr + cols[:, None] * PADDED_M + rows[None, :], converted.T,
              mask=(cols[:, None] < N) & (rows[None, :] < PADDED_M))
 
 
-def quantize_tensorwise_pair(x, fp8_dtype, check_finite):
+def quantize_tensorwise_pair(x, fp8_dtype, check_finite, *, transpose_only=False):
     """Emit both TMA-ready orientations without a later FP8 transpose/pack."""
     with torch.cuda.device(x.device):
         maximum = torch.finfo(fp8_dtype).max
         scale, inverse = _run_scaling(x, maximum, None, check_finite)
         m, n = x.shape
         padded_m, padded_n = triton.cdiv(m, 16) * 16, triton.cdiv(n, 16) * 16
-        normal = torch.empty((m, padded_n), device=x.device, dtype=fp8_dtype)
+        normal = None if transpose_only else torch.empty((m, padded_n), device=x.device, dtype=fp8_dtype)
         transposed = torch.empty((n, padded_m), device=x.device, dtype=fp8_dtype)
         tiles_n = triton.cdiv(n, 32)
         _cast_tensorwise_pair[(triton.cdiv(m, 32) * tiles_n,)](
-            x, normal, transposed, scale, m, n, *x.stride(), PADDED_M=padded_m, PADDED_N=padded_n,
+            x, transposed if transpose_only else normal, transposed, scale, m, n, *x.stride(),
+            PADDED_M=padded_m, PADDED_N=padded_n, WRITE_NORMAL=not transpose_only,
             N_TILES=tiles_n, FP8_MAX=maximum, BLOCK=32, num_warps=4)
-        return normal[:, :n], inverse, transposed[:, :m]
+        return None if transpose_only else normal[:, :n], inverse, transposed[:, :m]

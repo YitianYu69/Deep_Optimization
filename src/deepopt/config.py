@@ -56,7 +56,6 @@ class FP8Config:
     num_stages: int | str = "auto"
     out_dtype: str | None = None
     intercept_linear: bool = True
-    max_num_imprecise_acc: int = 32
 
 
 @dataclass(frozen=True)
@@ -413,9 +412,12 @@ def compile_config_from_dict(raw: Mapping[str, Any]) -> CompileConfig:
 
 def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     """Validate FP8 settings without importing Torch or loading a GPU backend."""
+    if isinstance(raw, Mapping) and "max_num_imprecise_acc" in raw:
+        raise ConfigError("runtime.fp8.max_num_imprecise_acc was removed: FP8 now uses native Triton accumulation; "
+                          "remove the setting for a new run, or use the original library to resume an older run")
     _require_keys(raw, set(), "runtime.fp8", {
         "enabled", "backend", "trace_mode", "activation_dtype", "weight_dtype",
-        "grad_dtype", "block_shapes", "num_stages", "out_dtype", "intercept_linear", "max_num_imprecise_acc",
+        "grad_dtype", "block_shapes", "num_stages", "out_dtype", "intercept_linear",
     })
     raw = _copy_tables(raw)
     enabled = raw.get("enabled", False)
@@ -441,9 +443,6 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
         if stages > 5:
             raise ConfigError("runtime.fp8.num_stages must be 'auto', 1, 2, 3, 4, or 5")
     out_dtype = raw.get("out_dtype")
-    accumulation = _integer(raw.get("max_num_imprecise_acc", 32), "runtime.fp8.max_num_imprecise_acc", 32)
-    if accumulation % 32 or accumulation > 2147483616:
-        raise ConfigError("runtime.fp8.max_num_imprecise_acc must be a multiple of 32 up to 2147483616")
     if out_dtype not in (None, "fp32", "bf16", "fp16"):
         raise ConfigError("runtime.fp8.out_dtype must be fp32, bf16, fp16, or null")
     blocks = raw.get("block_shapes", {})
@@ -460,7 +459,7 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
                      intercept_linear=intercept_linear,
                      activation_dtype=dtypes["activation"], weight_dtype=dtypes["weight"],
                      grad_dtype=dtypes["grad"], block_shapes=block_shapes,
-                     num_stages=stages, out_dtype=out_dtype, max_num_imprecise_acc=accumulation)
+                     num_stages=stages, out_dtype=out_dtype)
 
 
 def normalize_config(value: ExperimentConfig | Mapping[str, Any]) -> ExperimentConfig:
