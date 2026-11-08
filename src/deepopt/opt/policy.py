@@ -39,6 +39,8 @@ def fp8_plan(settings=_UNSET, *, config=None) -> dict:
             "backend": settings.backend,
             "num_stages": settings.num_stages,
             "out_dtype": output_types[settings.out_dtype],
+            "scaling_recipe": settings.scaling_recipe,
+            "delayed_scaling": asdict(settings.delayed_scaling),
         },
         "block_shapes": dict(settings.block_shapes),
     })

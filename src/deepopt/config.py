@@ -43,6 +43,14 @@ class CompileConfig:
 
 
 @dataclass(frozen=True)
+class DelayedScalingConfig:
+    history_length: int = 1024
+    amax_algorithm: str = "max"
+    margin: int = 0
+    reduce_amax: bool = True
+
+
+@dataclass(frozen=True)
 class FP8Config:
     enabled: bool = False
     backend: str = "reference"
@@ -56,6 +64,8 @@ class FP8Config:
     num_stages: int | str = "auto"
     out_dtype: str | None = None
     intercept_linear: bool = True
+    scaling_recipe: str = "current"
+    delayed_scaling: DelayedScalingConfig = field(default_factory=DelayedScalingConfig)
 
 
 @dataclass(frozen=True)
@@ -410,6 +420,26 @@ def compile_config_from_dict(raw: Mapping[str, Any]) -> CompileConfig:
     return CompileConfig(raw.get("enabled", False), backend, mode, raw.get("fullgraph", False), dynamic, dict(options))
 
 
+def delayed_scaling_config_from_dict(raw) -> DelayedScalingConfig:
+    if isinstance(raw, DelayedScalingConfig):
+        raw = asdict(raw)
+    _require_keys(raw, set(), "runtime.fp8.delayed_scaling",
+                  {"history_length", "amax_algorithm", "margin", "reduce_amax"})
+    history = _integer(raw.get("history_length", 1024), "runtime.fp8.delayed_scaling.history_length", 1)
+    if history > 4096:
+        raise ConfigError("delayed_scaling.history_length must be at most 4096")
+    algorithm = raw.get("amax_algorithm", "max")
+    if algorithm not in ("max", "most_recent"):
+        raise ConfigError("delayed_scaling.amax_algorithm must be max or most_recent")
+    margin = raw.get("margin", 0)
+    if type(margin) is not int or not -32 <= margin <= 32:
+        raise ConfigError("delayed_scaling.margin must be an integer from -32 to 32")
+    reduce = raw.get("reduce_amax", True)
+    if type(reduce) is not bool:
+        raise ConfigError("delayed_scaling.reduce_amax must be boolean")
+    return DelayedScalingConfig(history, algorithm, margin, reduce)
+
+
 def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     """Validate FP8 settings without importing Torch or loading a GPU backend."""
     if isinstance(raw, Mapping) and "max_num_imprecise_acc" in raw:
@@ -418,6 +448,7 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     _require_keys(raw, set(), "runtime.fp8", {
         "enabled", "backend", "trace_mode", "activation_dtype", "weight_dtype",
         "grad_dtype", "block_shapes", "num_stages", "out_dtype", "intercept_linear",
+        "scaling_recipe", "delayed_scaling",
     })
     raw = _copy_tables(raw)
     enabled = raw.get("enabled", False)
@@ -455,11 +486,17 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
                 raise ConfigError(f"runtime.fp8.block_shapes.{role} must contain two positive integers or be null")
             shape = tuple(_integer(size, f"runtime.fp8.block_shapes.{role}", 1) for size in shape)
         block_shapes[role] = shape
+    recipe = raw.get("scaling_recipe", "current")
+    if recipe not in ("current", "delayed"):
+        raise ConfigError("runtime.fp8.scaling_recipe must be current or delayed")
+    delayed = delayed_scaling_config_from_dict(raw.get("delayed_scaling", {}))
+    if recipe == "delayed" and any(block is not None for block in block_shapes.values()):
+        raise ConfigError("Delayed FP8 scaling currently requires tensorwise block_shapes")
     return FP8Config(enabled=enabled, backend=backend, trace_mode=trace_mode,
                      intercept_linear=intercept_linear,
                      activation_dtype=dtypes["activation"], weight_dtype=dtypes["weight"],
                      grad_dtype=dtypes["grad"], block_shapes=block_shapes,
-                     num_stages=stages, out_dtype=out_dtype)
+                     num_stages=stages, out_dtype=out_dtype, scaling_recipe=recipe, delayed_scaling=delayed)
 
 
 def normalize_config(value: ExperimentConfig | Mapping[str, Any]) -> ExperimentConfig:

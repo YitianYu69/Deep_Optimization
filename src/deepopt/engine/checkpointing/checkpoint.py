@@ -85,7 +85,7 @@ def _trainer_settings(trainer) -> dict:
         settings["ddp"] = trainer.runtime.core.options
     if trainer.runtime.fp8.enabled:
         settings["fp8"] = asdict(trainer.runtime.fp8)
-        settings["fp8_recipe"] = fp8_recipe(trainer.runtime.fp8.backend)
+        settings["fp8_recipe"] = fp8_recipe(trainer.runtime.fp8.backend, trainer.runtime.fp8)
     if trainer.ema is not None:
         settings["ema"] = {"enabled": True, "decay": trainer.ema.decay}
     # Earlier checkpoints already used epoch scheduling. Keep that default's
@@ -133,6 +133,9 @@ def _validate_model_state(saved, model) -> None:
                 raise ValueError(f"Checkpoint model tensor {name!r} has a different shape")
             if expected.dtype != actual.dtype:
                 raise ValueError(f"Checkpoint model tensor {name!r} has a different dtype")
+        elif isinstance(expected, dict) and {"version", "options", "dtypes"}.issubset(expected):
+            if actual != expected:
+                raise ValueError(f"Checkpoint delayed-scaling metadata {name!r} differs from the current recipe")
 
 
 def environment() -> dict:
@@ -401,7 +404,7 @@ def _validate_resume_state(payload, trainer, requested, *, generators, train_loa
                            old_batch_size, requested_batch_size, saved_world):
     """Check compatibility before any state-loading hooks can mutate objects."""
     if payload["trainer_settings"].get("fp8", {}).get("enabled", False):
-        if payload["trainer_settings"].get("fp8_recipe") != fp8_recipe(trainer.runtime.fp8.backend):
+        if payload["trainer_settings"].get("fp8_recipe") != fp8_recipe(trainer.runtime.fp8.backend, trainer.runtime.fp8):
             raise ValueError("FP8 numerical recipe or Triton version differs from checkpoint; "
                              "resume with the original library/environment, or load model weights for a new run")
     if _resume_config_for_comparison(payload["config"]) != _resume_config_for_comparison(requested):

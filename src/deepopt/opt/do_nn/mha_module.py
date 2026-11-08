@@ -18,6 +18,14 @@ class DOMultiheadAttention(CachedWeightModule):
             raise NotImplementedError("add_zero_attn is not supported yet")
         
         self.plan = _prepare_fp8_plan(plan)
+        self._projection_scaling = nn.ModuleDict()
+        if self.plan["fp8_training"]["scaling_recipe"] == "delayed":
+            from ..scaling_strategy.delayed import DelayedScalingState
+
+            device = next(original.parameters()).device
+            for role in ("qkv", "q", "k", "v", "out"):
+                self._projection_scaling[role] = DelayedScalingState(
+                    self.plan["fp8_training"]["delayed_scaling"], self.plan["fp8_training"]["fp8_dtypes"], device=device)
 
         self.embed_dim = original.embed_dim
         self.num_heads = original.num_heads
@@ -57,6 +65,8 @@ class DOMultiheadAttention(CachedWeightModule):
                     query,
                     self.in_proj_weight, self.in_proj_bias,
                     plan=self.plan, _weight_cache=self._fp8_weight_cache,
+                    _scaling_state=self._projection_scaling["qkv"] if self._projection_scaling else None,
+                    _state_training=self.training,
                 )
                 return packed.chunk(3, dim=-1)
             weights = self.in_proj_weight.chunk(3, dim=0)
@@ -74,12 +84,15 @@ class DOMultiheadAttention(CachedWeightModule):
         
         q = do_linear(
             query, weights[0], biases[0], plan=self.plan, _weight_cache=self._fp8_weight_cache,
+            _scaling_state=self._projection_scaling["q"] if self._projection_scaling else None, _state_training=self.training,
         )
         k = do_linear(
             key, weights[1], biases[1], plan=self.plan, _weight_cache=self._fp8_weight_cache,
+            _scaling_state=self._projection_scaling["k"] if self._projection_scaling else None, _state_training=self.training,
         )
         v = do_linear(
             value, weights[2], biases[2], plan=self.plan, _weight_cache=self._fp8_weight_cache,
+            _scaling_state=self._projection_scaling["v"] if self._projection_scaling else None, _state_training=self.training,
         )
         return q, k, v
 
@@ -244,6 +257,7 @@ class DOMultiheadAttention(CachedWeightModule):
         output = do_linear(
             attended, self.out_proj.weight, self.out_proj.bias,
             plan=self.plan, _weight_cache=self._fp8_weight_cache,
+            _scaling_state=self._projection_scaling["out"] if self._projection_scaling else None, _state_training=self.training,
         )
 
         if weights is not None and average_attn_weights:

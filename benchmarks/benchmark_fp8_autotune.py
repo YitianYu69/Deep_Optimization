@@ -184,7 +184,7 @@ def _profile_summary(profiler, torch, iterations, limit):
     cpu.sort(key=lambda row: row["self_cpu_ms_per_call"], reverse=True)
     activities = {}
     for event in profiler.events():
-        if event.device_type != torch.autograd.DeviceType.CUDA:
+        if event.device_type != torch.autograd.DeviceType.CUDA or getattr(event, "is_user_annotation", False):
             continue
         row = activities.setdefault(event.name, {"name": event.name, "count": 0, "total_ms_per_call": 0.0})
         row["count"] += 1

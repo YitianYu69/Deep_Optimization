@@ -20,6 +20,7 @@ class DOLinear(CachedWeightModule):
             raise ValueError("original must be an nn.Linear")
         
         self.plan = _prepare_fp8_plan(plan)
+        self.configure_delayed_scaling(self.plan, original.weight.device)
 
         self.in_features = original.in_features
         self.out_features = original.out_features
@@ -47,6 +48,7 @@ class DOLinear(CachedWeightModule):
         return do_linear(
             x, self.weight, self.bias,
             plan=self.plan, _weight_cache=self._fp8_weight_cache,
+            _scaling_state=self.fp8_scaling, _state_training=self.training,
         )
 
     def extra_repr(self) -> str:

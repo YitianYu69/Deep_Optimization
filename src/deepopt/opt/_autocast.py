@@ -110,7 +110,14 @@ class _FP8Scope:
         interception_token = _active_interception.set({**previous_interception,
                                                       self.device_type: self.intercept_linear})
         try:
-            with _FP8LinearMode() if self.intercept_linear else nullcontext():
+            delayed = self.plan is not False and self.plan["fp8_training"]["scaling_recipe"] == "delayed"
+            scaling = nullcontext()
+            if delayed:
+                from .scaling_strategy.delayed import fp8_scaling_scope
+
+                scaling = fp8_scaling_scope()
+            with scaling, \
+                 _FP8LinearMode() if self.intercept_linear else nullcontext():
                 yield
         finally:
             _active_interception.reset(interception_token)
