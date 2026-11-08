@@ -27,6 +27,20 @@ def rowwise_plan():
 
 
 class FP8ExecutionOverheadTests(unittest.TestCase):
+    def test_device_metadata_is_cached_per_explicit_device_without_tensor_storage(self):
+        from types import SimpleNamespace
+        from deepopt.opt.backends._cuda_launch import device_metadata
+
+        device_metadata.cache_clear()
+        self.addCleanup(device_metadata.cache_clear)
+        properties = [SimpleNamespace(major=9, minor=0, multi_processor_count=132),
+                      SimpleNamespace(major=10, minor=0, multi_processor_count=148)]
+        with patch.object(torch.cuda, "get_device_properties", side_effect=properties) as query:
+            for _ in range(3):
+                self.assertEqual(device_metadata(0), (90, 132))
+                self.assertEqual(device_metadata(1), (100, 148))
+        self.assertEqual(query.call_count, 2)
+
     def setUp(self):
         torch.manual_seed(1401)
 

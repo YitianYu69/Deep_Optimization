@@ -332,8 +332,12 @@ python -m deepopt evaluate --checkpoint runs/fp8/best.pt --device cpu
 | `activation_dtype`, `weight_dtype`, `grad_dtype` | Each independently accepts `e4m3fn` (default) or `e5m2` on either backend |
 | `block_shapes` | Optional table with `activation`, `weight`, and `grad` two-integer arrays; omitted roles use tensorwise scaling |
 | `num_stages` | `"auto"` (default) tunes Triton pipeline depth; integer 1–5 fixes it |
-| `max_num_imprecise_acc` | FP8 accumulation limit, default 32; larger multiples of 32 explicitly trade numerical behavior against performance and require accuracy/training validation |
 | `out_dtype` | Optional `fp32`, `bf16`, or `fp16`; omit to follow the active AMP/input dtype |
+
+FP8 now uses native Triton accumulation (numerical recipe version 2). The old
+`max_num_imprecise_acc` setting is rejected with migration guidance. Exact FP8
+resume requires matching recipe metadata and Triton version; use the original
+environment to continue older runs, or load their model weights into a new run.
 
 For example, `[runtime.fp8.block_shapes]` with `weight = [32, 64]` applies
 blockwise weight scaling. Positive block dimensions, including `activation = [1, 32]`,

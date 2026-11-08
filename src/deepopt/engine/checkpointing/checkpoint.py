@@ -23,6 +23,7 @@ from deepopt.engine.checkpointing.strategy_state import snapshot_strategies, val
 from deepopt.memory.planning import loader_batch_size, plan_batch_size, apply_batch_size_plan
 from deepopt.module import TrainingModule
 from deepopt.optimizers import MultiOptimizer
+from deepopt.opt._recipe import fp8_recipe
 from deepopt.logger import init_logger
 from .identity import snapshot_identity, validate_identity
 
@@ -84,6 +85,7 @@ def _trainer_settings(trainer) -> dict:
         settings["ddp"] = trainer.runtime.core.options
     if trainer.runtime.fp8.enabled:
         settings["fp8"] = asdict(trainer.runtime.fp8)
+        settings["fp8_recipe"] = fp8_recipe(trainer.runtime.fp8.backend)
     if trainer.ema is not None:
         settings["ema"] = {"enabled": True, "decay": trainer.ema.decay}
     # Earlier checkpoints already used epoch scheduling. Keep that default's
@@ -398,6 +400,10 @@ def _requested_resume_batch_size(payload, trainer, requested, train_loader, *,
 def _validate_resume_state(payload, trainer, requested, *, generators, train_loader,
                            old_batch_size, requested_batch_size, saved_world):
     """Check compatibility before any state-loading hooks can mutate objects."""
+    if payload["trainer_settings"].get("fp8", {}).get("enabled", False):
+        if payload["trainer_settings"].get("fp8_recipe") != fp8_recipe(trainer.runtime.fp8.backend):
+            raise ValueError("FP8 numerical recipe or Triton version differs from checkpoint; "
+                             "resume with the original library/environment, or load model weights for a new run")
     if _resume_config_for_comparison(payload["config"]) != _resume_config_for_comparison(requested):
         raise ValueError("Resume configuration differs from checkpoint "
                          "(only epochs, batch size, checkpoint cadence, and diagnostic checks may change)")

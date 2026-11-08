@@ -7,6 +7,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor 
 
 from ..quantization.tensor import QuantizedTensor
+from ._cuda_launch import device_metadata
 from ._triton_autotune import (
     AUTOTUNE_KEY, AUTOTUNE_TILES, AUTOTUNE_STAGES, GROUP_SIZE_M_CHOICES, MAX_BLOCK_K, SPLIT_K_CHOICES,
     autotune_cache_key, prune_gemm_configs, split_k_limit, DescriptorKernel,
@@ -99,7 +100,6 @@ def _gemm_nt_kernel(
     PIPELINE_STAGES: tl.constexpr,
     NUM_STAGES: tl.constexpr, SPLIT_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    MAX_NUM_IMPRECISE_ACC: tl.constexpr,
     A_ROW_STRIDE: tl.constexpr, B_ROW_STRIDE: tl.constexpr,
 ):
 
@@ -121,11 +121,9 @@ def _gemm_nt_kernel(
         b_tile = b_desc.load([start_n, start_k])
 
         if TENSORWISE:
-            acc = tl.dot(a_tile, b_tile.T, acc, out_dtype=tl.float32,
-                         max_num_imprecise_acc=MAX_NUM_IMPRECISE_ACC)
+            acc = tl.dot(a_tile, b_tile.T, acc, out_dtype=tl.float32)
         elif NATIVE_FP8:
-            partial = tl.dot(a_tile, b_tile.T, out_dtype=tl.float32,
-                             max_num_imprecise_acc=MAX_NUM_IMPRECISE_ACC)
+            partial = tl.dot(a_tile, b_tile.T, out_dtype=tl.float32)
 
             a_scale_offset = (rows // A_BLOCK_ROWS) * A_SCALE_COLS + start_k // A_BLOCK_COLS
             b_scale_offset = (cols // B_BLOCK_ROWS) * B_SCALE_COLS + start_k // B_BLOCK_COLS
@@ -216,7 +214,6 @@ def gemm_nt(
     out_dtype: torch.dtype = torch.float32,
     bias: torch.Tensor | None = None,
     num_stages: int | str = "auto",
-    max_num_imprecise_acc: int = 32,
 ) -> torch.Tensor:
 
     """
@@ -231,16 +228,16 @@ def gemm_nt(
         raise ValueError("Operands must be on the same device")
     if a.data.device.type != "cuda" or torch.version.hip is not None:
         raise ValueError("This backend requires an Nvidia CUDA GPU")
-    capability = torch.cuda.get_device_capability(a.data.device)
-    if capability[0] < 9:
+    device_index = a.data.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    capability, num_sms = device_metadata(device_index)
+    if capability < 90:
         raise ValueError("This backend requires compute cabaility >= 9")
     if a.data.shape[1] != b.data.shape[1]:
         raise ValueError("Operands must have the same reduction dimension")
     if num_stages != "auto" and (type(num_stages) is not int or num_stages not in AUTOTUNE_STAGES):
         raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
-    if (type(max_num_imprecise_acc) is not int or not 32 <= max_num_imprecise_acc <= 2147483616
-            or max_num_imprecise_acc % 32):
-        raise ValueError("max_num_imprecise_acc must be a multiple of 32 up to 2147483616")
     
     output_types = {
         torch.float32 : tl.float32,
@@ -316,11 +313,10 @@ def gemm_nt(
             OUTPUT_DTYPE=output_types[out_dtype],
             OUTPUT_FORMAT=str(out_dtype),
             A_FP8_FORMAT=str(a.data.dtype), B_FP8_FORMAT=str(b.data.dtype),
-            DEVICE_INDEX=torch.cuda.current_device(), DEVICE_CAPABILITY=capability[0] * 10 + capability[1],
-            NUM_SMS=torch.cuda.get_device_properties(a.data.device).multi_processor_count,
+            DEVICE_INDEX=device_index, DEVICE_CAPABILITY=capability,
+            NUM_SMS=num_sms,
             OUTPUT_STRIDE=padded_n,
             PIPELINE_STAGES=0 if num_stages == "auto" else num_stages,
-            MAX_NUM_IMPRECISE_ACC=max_num_imprecise_acc,
             A_ROW_STRIDE=a_packed.stride(0), B_ROW_STRIDE=b_packed.stride(0),
         )
         # A dummy FP32 pointer keeps the implicit dtype key identical with and

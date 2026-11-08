@@ -14,11 +14,29 @@ from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
 from deepopt.opt.policy import fp8_plan
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from deepopt.opt.quantization.quantizer import _quantize_tensorwise_pair
+from deepopt.opt.quantization.quantizer import _quantize_tensorwise_transpose
 from deepopt.opt.quantization.tensor import QuantizedTensor
 from deepopt.opt.scaling_strategy.amax import AmaxScaling
 
 
 class FP8FusionPolicyTests(unittest.TestCase):
+    def test_transpose_only_quantization_keeps_scalar_recipe_and_skips_unused_allocation(self):
+        source = torch.randn(37, 65).T
+        for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            actual = _quantize_tensorwise_transpose(source, fp8_dtype=dtype)
+            expected = quantize_fp8(source, fp8_dtype=dtype).transpose()
+            torch.testing.assert_close(actual.data.float(), expected.data.float(), rtol=0, atol=0)
+            torch.testing.assert_close(actual.scale_inv, expected.scale_inv, rtol=0, atol=0)
+        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton_quantization": None}), \
+             patch.object(torch, "empty_strided", wraps=torch.empty_strided) as allocate:
+            source = torch.empty(129, 65, device="cuda")
+            transposed = _quantize_tensorwise_transpose(source, fp8_dtype=torch.float8_e4m3fn, check_finite=False)
+        requested = [call for call in allocate.call_args_list
+                     if torch.device(call.kwargs["device"]).type == "cuda"]
+        self.assertEqual(len(requested), 1)
+        self.assertEqual(transposed.data.shape, (65, 129))
+        self.assertEqual(transposed.data.stride(), (144, 1))
+
     def test_tensorwise_pair_has_one_scale_and_exactly_transposed_fp8_values(self):
         for fp8 in (torch.float8_e4m3fn, torch.float8_e5m2):
             x = torch.randn(37, 65)
