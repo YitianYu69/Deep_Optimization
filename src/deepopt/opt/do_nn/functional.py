@@ -115,8 +115,8 @@ def validate_fp8_plan(plan: dict) -> dict:
 
     num_stages = training.get("num_stages", "auto")
 
-    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4)):
-        raise ValueError("num_stages must be 'auto', 1, 2, 3, or 4")
+    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4, 5)):
+        raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
 
     out_dtype = training.get("out_dtype")
     if out_dtype is not None:

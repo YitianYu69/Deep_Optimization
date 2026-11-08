@@ -8,6 +8,7 @@ from deepopt.opt.backends._triton_autotune import (
     AUTOTUNE_KEY, AUTOTUNE_TILES, MAX_BLOCK_M, MAX_BLOCK_N, MAX_BLOCK_K,
     MAX_TUNING_CONFIGS, SPLIT_K_CHOICES, baseline_gemm_tile, prune_gemm_configs,
     autotune_cache_key, set_descriptor_block_shapes, split_k_enabled,
+    AUTOTUNE_STAGES, GROUP_SIZE_M_CHOICES, TUTORIAL_GEMM_CONFIGS, grouped_tile_coordinates,
 )
 
 
@@ -28,12 +29,45 @@ class TritonAutotunePolicyTests(unittest.TestCase):
     def setUp(self):
         self.configs = [
             SimpleNamespace(kwargs={"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk,
-                                    "NUM_STAGES": stages, "SPLIT_K": split},
+                                    "NUM_STAGES": stages, "SPLIT_K": split, "GROUP_SIZE_M": group},
                             num_warps=warps, num_stages=stages)
             for bm, bn, bk, warps in AUTOTUNE_TILES
-            for stages in (1, 2, 3, 4)
+            for stages in AUTOTUNE_STAGES
             for split in SPLIT_K_CHOICES
+            for group in GROUP_SIZE_M_CHOICES
         ]
+
+    def test_dense_search_measures_every_compatible_tutorial_seed(self):
+        for stages in (0, 3, 5):
+            selected = prune_gemm_configs(self.configs, arguments(
+                M=4096, N=4096, K=4096, PIPELINE_STAGES=stages))
+            signatures = {(tile(config), config.num_stages, config.kwargs["GROUP_SIZE_M"],
+                           config.kwargs["SPLIT_K"]) for config in selected}
+            for bm, bn, bk, warps, depth in TUTORIAL_GEMM_CONFIGS:
+                self.assertIn(((bm, bn, bk, warps), stages or depth, 8, 1), signatures)
+            self.assertLessEqual(len(selected), MAX_TUNING_CONFIGS)
+
+    def test_grouping_is_compared_without_duplicate_single_axis_launches(self):
+        selected = prune_gemm_configs(self.configs, arguments(PIPELINE_STAGES=0))
+        variants = {}
+        for config in selected:
+            key = tile(config), config.num_stages, config.kwargs["SPLIT_K"]
+            variants.setdefault(key, set()).add(config.kwargs["GROUP_SIZE_M"])
+        self.assertTrue(any(groups == {1, 8} for groups in variants.values()))
+        self.assertLessEqual(sum(groups == {1, 8} for groups in variants.values()), 8)
+        for shape in ((2048, 10), (10, 512), (1, 1)):
+            selected = prune_gemm_configs(self.configs, arguments(M=shape[0], N=shape[1], PIPELINE_STAGES=0))
+            self.assertEqual({config.kwargs["GROUP_SIZE_M"] for config in selected}, {1})
+
+    def test_grouped_coordinates_cover_tiles_once_including_partial_last_group(self):
+        for rows, cols, group in product((1, 3, 8, 9, 17), (1, 3, 9), GROUP_SIZE_M_CHOICES):
+            coordinates = [grouped_tile_coordinates(pid, rows, cols, group) for pid in range(rows * cols)]
+            self.assertEqual(set(coordinates), set(product(range(rows), range(cols))))
+            self.assertEqual(len(coordinates), len(set(coordinates)))
+        self.assertEqual([grouped_tile_coordinates(pid, 9, 3, 8) for pid in range(8)],
+                         [(row, 0) for row in range(8)])
+        self.assertEqual([grouped_tile_coordinates(pid, 9, 3, 8) for pid in range(24, 27)],
+                         [(8, col) for col in range(3)])
 
     def test_classifier_search_measures_narrow_tiles_and_original_baseline(self):
         for batch in (2048, 848, 1808):
@@ -78,8 +112,16 @@ class TritonAutotunePolicyTests(unittest.TestCase):
             self.assertIn((128, 128, 32, 8), [tile(config) for config in selected])
             self.assertEqual(args, original)
 
+    def test_tutorial_seeds_cannot_bypass_shape_or_scale_compatibility(self):
+        for width in (32, 64, 96):
+            selected = prune_gemm_configs(self.configs, arguments(
+                A_BLOCK_COLS=width, B_BLOCK_COLS=width, PIPELINE_STAGES=0))
+            self.assertTrue(all(width % config.kwargs["BLOCK_K"] == 0 for config in selected))
+        selected = prune_gemm_configs(self.configs, arguments(M=10, N=10, K=10, PIPELINE_STAGES=0))
+        self.assertFalse(any(max(tile(config)[:2]) == 256 for config in selected))
+
     def test_stage_constraint_and_named_keyword_merging_are_preserved(self):
-        for stages in (1, 2, 3, 4):
+        for stages in AUTOTUNE_STAGES:
             selected = prune_gemm_configs(self.configs, arguments(), PIPELINE_STAGES=stages)
             self.assertGreater(len(selected), 1)
             self.assertLessEqual(len(selected), MAX_TUNING_CONFIGS)
@@ -107,7 +149,7 @@ class TritonAutotunePolicyTests(unittest.TestCase):
             self.assertEqual({config.kwargs["BLOCK_K"] for config in mixed}, {32})
 
     def test_fallback_search_preserves_resource_limits_and_baseline(self):
-        for m, n, stages in product((10, 48, 128), (10, 48, 128), (1, 2, 3, 4)):
+        for m, n, stages in product((10, 48, 128), (10, 48, 128), AUTOTUNE_STAGES):
             selected = prune_gemm_configs(self.configs, arguments(
                 M=m, N=n, PIPELINE_STAGES=stages, NATIVE_FP8=False,
                 A_BLOCK_COLS=1, B_BLOCK_COLS=9,
@@ -171,7 +213,7 @@ class TritonAutotunePolicyTests(unittest.TestCase):
     def test_supported_layouts_and_shapes_have_bounded_compatible_searches(self):
         widths = (32, 64, 96, 128, 160, 224, 256, 288, 512)
         for a_width, b_width, stages, shape in product(
-            widths, widths, (1, 2, 3, 4), ((10, 512, 848), (512, 10, 512), (1024, 1024, 512)),
+            widths, widths, AUTOTUNE_STAGES, ((10, 512, 848), (512, 10, 512), (1024, 1024, 512)),
         ):
             m, n, k = shape
             selected = prune_gemm_configs(self.configs, arguments(
@@ -187,13 +229,13 @@ class TritonAutotunePolicyTests(unittest.TestCase):
                 self.assertEqual(b_width % config.kwargs["BLOCK_K"], 0)
 
     def test_invalid_stage_or_layout_never_silently_selects_a_config(self):
-        for updates in ({"PIPELINE_STAGES": 5}, {"A_BLOCK_COLS": 17, "NATIVE_FP8": True}):
+        for updates in ({"PIPELINE_STAGES": 6}, {"A_BLOCK_COLS": 17, "NATIVE_FP8": True}):
             with self.assertRaisesRegex(ValueError, "No Triton autotune configuration"):
                 prune_gemm_configs(self.configs, arguments(**updates))
 
     def test_auto_stages_and_warps_are_searched_with_historical_launch(self):
         selected = prune_gemm_configs(self.configs, arguments(PIPELINE_STAGES=0))
-        self.assertGreater(len({config.num_stages for config in selected}), 1)
+        self.assertEqual({config.num_stages for config in selected}, set(AUTOTUNE_STAGES))
         self.assertTrue({2, 4, 8}.issubset({config.num_warps for config in selected}))
         self.assertTrue(any(tile(config) == (128, 128, 64, 8) and config.num_stages == 3
                             and config.kwargs["SPLIT_K"] == 1 for config in selected))
@@ -201,7 +243,8 @@ class TritonAutotunePolicyTests(unittest.TestCase):
 
     def test_search_is_independent_of_candidate_order(self):
         def signatures(configs):
-            return [(tile(config), config.num_stages, config.kwargs["SPLIT_K"]) for config in configs]
+            return [(tile(config), config.num_stages, config.kwargs["SPLIT_K"],
+                     config.kwargs["GROUP_SIZE_M"]) for config in configs]
 
         for m, n, k in ((1024, 1024, 512), (10, 10, 512), (2048, 10, 512), (10, 512, 2048)):
             args = arguments(M=m, N=n, K=k, PIPELINE_STAGES=0)

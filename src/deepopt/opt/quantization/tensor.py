@@ -5,6 +5,7 @@ FP8 values and the metadata needed to reconstruct them
 from dataclasses import dataclass
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,13 @@ class QuantizedTensor:
         """
         Reconstruct an FP32 matrix for reference computations.
         """
+
+        if self.data.device.type == "cuda":
+            if isinstance(self.data, FakeTensor):
+                return torch.empty(self.data.shape, device=self.data.device, dtype=torch.float32)
+            from ..backends.triton_quantization import dequantize
+
+            return dequantize(self.data, self.scale_inv, self.block_shape)
 
         values = self.data.float()
 

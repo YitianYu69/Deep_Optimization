@@ -108,7 +108,7 @@ weight = [32, 64]
             {"backend": "unknown"}, {"trace_mode": "eager"}, {"unknown": True},
             {"activation_dtype": "float8_e4m3fn"}, {"weight_dtype": "fp32"},
             {"grad_dtype": None}, {"out_dtype": "float32"},
-            {"num_stages": True}, {"num_stages": 0}, {"num_stages": 5},
+            {"num_stages": True}, {"num_stages": 0}, {"num_stages": 6},
             {"num_stages": "AUTO"}, {"num_stages": None}, {"num_stages": 3.0},
             {"intercept_linear": 0}, {"intercept_linear": "false"},
             {"block_shapes": []}, {"block_shapes": {"input": [32, 32]}},

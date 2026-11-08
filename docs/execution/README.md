@@ -156,6 +156,15 @@ number. Reenter a saved `runtime.autocast()` context for each manual forward;
 the next scheduled mode is selected on entry. A manual `runtime.step()` also
 prepares the next mode when its forward/backward were performed externally.
 
+Fused CUDA quantization inherits these same flags. Checked kernels collect
+per-CTA finite-error flags and validate them synchronously before returning;
+unchecked kernels omit the flag computation, error-buffer allocation, and host
+read. Small/blockwise and staged tensorwise fusion use the same policy.
+Standalone CUDA `AmaxScaling.compute` uses the same fused reductions and
+mode-controlled flags without an input-conversion or finite-scan pass.
+Fused CUDA reconstruction introduces no new checks in any mode. CPU reference
+entry points preserve their value-validation behavior.
+
 Gradient normalization, clipping, and required sparse coalescing keep their
 mathematical behavior in all modes. Diagnostic-only gradient value lists and
 post-processing scans are omitted on unchecked updates. Classification label

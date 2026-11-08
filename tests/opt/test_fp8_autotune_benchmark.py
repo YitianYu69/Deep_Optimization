@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import io
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -23,6 +24,62 @@ spec.loader.exec_module(benchmark)
 
 
 class FP8AutotuneBenchmarkTests(unittest.TestCase):
+    def test_benchmark_cli_accepts_dense_shapes_stage_five_and_wider_scales(self):
+        command = ["benchmark", "--batches", "1024", "--input-features", "2048",
+                   "--output-features", "1024", "--scale-k", "128", "--num-stages", "5"]
+        with patch.object(sys, "argv", command), patch.object(benchmark, "_run", return_value={}) as run, \
+             patch("sys.stdout", new=io.StringIO()):
+            benchmark.main()
+        args = run.call_args.args[0]
+        self.assertEqual((args.batches, args.input_features, args.output_features, args.scale_k, args.num_stages),
+                         ([1024], 2048, 1024, 128, 5))
+
+    def test_benchmark_uses_requested_dimensions_for_both_scopes(self):
+        args = SimpleNamespace(batches=[3], input_features=7, output_features=5,
+                               scope="linear", num_stages=5)
+        plan = {"fp8_training": {"backend": "reference", "fp8_dtypes": {
+            role: torch.float8_e4m3fn for role in ("activation", "weight", "grad")}},
+            "block_shapes": dict.fromkeys(("activation", "weight", "grad"))}
+
+        def measure(operation, *unused):
+            operation()
+            return {}
+
+        with patch.object(benchmark, "_measure", new=measure), \
+             patch.object(benchmark, "_prepare_gemm_products", wraps=benchmark._prepare_gemm_products) as capture:
+            rows = benchmark._measure_batches(args, torch, "cpu", plan, do_linear, gemm_nt)
+            args.scope = "gemm"
+            # The GEMM benchmark dispatch normally selects Triton; use the
+            # reference oracle to exercise its operands without a CUDA device.
+            def reference(a, b, **kwargs):
+                return gemm_nt(a, b, **{**kwargs, "backend": "reference"})
+
+            rows += benchmark._measure_batches(args, torch, "cpu", plan, do_linear, reference)
+        x, weight, bias, grad, _ = capture.call_args.args
+        self.assertEqual([tuple(value.shape) for value in (x, weight, bias, grad)],
+                         [(3, 7), (5, 7), (5,), (3, 5)])
+        self.assertEqual([row["operation"] for row in rows],
+                         ["forward_backward", "forward", "input_gradient", "weight_gradient"])
+
+    def test_quantize_scope_measures_independent_transpose_views(self):
+        args = SimpleNamespace(batches=[3], input_features=7, output_features=5, scope="quantize")
+        plan = {"fp8_training": {"fp8_dtypes": dict.fromkeys(
+            ("activation", "weight", "grad"), torch.float8_e4m3fn)},
+            "block_shapes": {"activation": (1, 32), "weight": (32, 32), "grad": (1, 32)}}
+
+        def measure(operation, *unused):
+            self.assertIsNotNone(operation())
+            return {}
+
+        for scope in ("quantize", "scale", "dequantize"):
+            args.scope = scope
+            with self.subTest(scope=scope), patch.object(benchmark, "_measure", new=measure):
+                rows = benchmark._measure_batches(args, torch, "cpu", plan, do_linear, gemm_nt)
+            self.assertEqual([row["operation"] for row in rows],
+                             ["activation", "weight", "gradient", "activation_transposed", "gradient_transposed"])
+            self.assertEqual([row["shape"] for row in rows[-2:]], [[7, 3], [5, 3]])
+            self.assertEqual([row["stride"] for row in rows[-2:]], [[1, 7], [1, 5]])
+
     def test_capture_matches_actual_autograd_for_both_orientation_policies(self):
         for activation, grad_blocks in (((1, 32), (32, 32)), ((32, 32), (1, 32)), (None, None)):
             plan = {
@@ -97,7 +154,7 @@ class FP8AutotuneBenchmarkTests(unittest.TestCase):
 
     def test_auto_and_explicit_stages_round_trip_through_public_configuration(self):
         self.assertEqual(FP8Config().num_stages, "auto")
-        for stages in ("auto", 1, 2, 3, 4):
+        for stages in ("auto", 1, 2, 3, 4, 5):
             parsed = fp8_config_from_dict({"num_stages": stages})
             self.assertEqual(parsed.num_stages, stages)
             plan = {"fp8_training": {"num_stages": stages, "fp8_dtypes": {
