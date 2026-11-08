@@ -189,21 +189,28 @@ class _UpdateBatch:
         self.bytes = 0
         self.claimed = set()
         self._storages = set()
+        self.active = True
+        self._lock = RLock()
 
     def record(self, state, role, value):
-        if state not in self.states:
-            self.states.append(state)
-        state._pending_owner = self
-        self.claimed.add(state)
-        self.observations.append((state, role, value))
-        from ..backends._delayed_launch import storage_key
+        # Device-specific autograd workers can append for different projections
+        # concurrently; compaction must not race another append.
+        with self._lock:
+            if not self.active:
+                raise RuntimeError("Delayed-scaling boundary has already finished")
+            if state not in self.states:
+                self.states.append(state)
+            state._pending_owner = self
+            self.claimed.add(state)
+            self.observations.append((state, role, value))
+            from ..backends._delayed_launch import storage_key
 
-        storage = storage_key(value)
-        if storage not in self._storages:
-            self._storages.add(storage)
-            self.bytes += storage[2]
-        if self.bytes > 32 * 1024 * 1024 or len(self.observations) > max(512, len(self.states) * 6):
-            self.compact()
+            storage = storage_key(value)
+            if storage not in self._storages:
+                self._storages.add(storage)
+                self.bytes += storage[2]
+            if self.bytes > 32 * 1024 * 1024 or len(self.observations) > max(512, len(self.states) * 6):
+                self.compact()
 
     def reduced(self, states):
         groups = {(state, role): index for index, (state, role) in
@@ -293,6 +300,7 @@ class _UpdateBatch:
             self.release(aborted=not committed)
 
     def release(self, *, aborted=True):
+        self.active = False
         for state in self.claimed:
             if aborted:
                 # A cached weight from an abandoned window must be observed
@@ -336,6 +344,30 @@ def fp8_scaling_scope(*, states=()):
 
 def delayed_states(model):
     return tuple(module for module in model.modules() if isinstance(module, DelayedScalingState))
+
+
+def current_scaling_batch():
+    return _batch.get()
+
+
+@contextmanager
+def autograd_scaling_scope(batch):
+    """Rebind a still-open forward owner on an autograd worker thread.
+
+    Closed standalone/aborted forward scopes are never reopened. A backward
+    after such a scope uses its current boundary or ordinary standalone policy.
+    """
+    if batch is None or not batch.active:
+        yield
+        return
+    current = _batch.get()
+    if current is not None and current is not batch:
+        raise RuntimeError("Overlapping delayed-scaling boundaries cannot share a projection")
+    token = _batch.set(batch)
+    try:
+        yield
+    finally:
+        _batch.reset(token)
 
 
 def checkpoint_recomputing():
