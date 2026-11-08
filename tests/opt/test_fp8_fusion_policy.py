@@ -13,11 +13,50 @@ from deepopt.opt.do_nn.functional import do_linear
 from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
 from deepopt.opt.policy import fp8_plan
 from deepopt.opt.quantization.quantizer import quantize_fp8
+from deepopt.opt.quantization.quantizer import _quantize_tensorwise_pair
 from deepopt.opt.quantization.tensor import QuantizedTensor
 from deepopt.opt.scaling_strategy.amax import AmaxScaling
 
 
 class FP8FusionPolicyTests(unittest.TestCase):
+    def test_tensorwise_pair_has_one_scale_and_exactly_transposed_fp8_values(self):
+        for fp8 in (torch.float8_e4m3fn, torch.float8_e5m2):
+            x = torch.randn(37, 65)
+            normal, transposed = _quantize_tensorwise_pair(x, fp8_dtype=fp8)
+            expected = quantize_fp8(x, fp8_dtype=fp8)
+            torch.testing.assert_close(normal.data.float(), expected.data.float(), rtol=0, atol=0)
+            torch.testing.assert_close(transposed.data.float(), normal.data.T.float(), rtol=0, atol=0)
+            torch.testing.assert_close(transposed.scale_inv, normal.scale_inv, rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "tensorwise"):
+            _quantize_tensorwise_pair(x, block_shape=(1, 32))
+
+    def test_paired_weight_cache_is_distinct_and_invalidates_after_updates(self):
+        from deepopt.opt.quantization.cache import WeightCache
+
+        cache = WeightCache()
+        weight = nn.Parameter(torch.randn(37, 65))
+        ordinary = cache.quantize(weight, fp8_dtype=torch.float8_e4m3fn, block_shape=None, quantizer=quantize_fp8)
+        pair = cache.quantize(weight, fp8_dtype=torch.float8_e4m3fn, block_shape=None,
+                              quantizer=_quantize_tensorwise_pair, paired=True)
+        self.assertIsInstance(ordinary, QuantizedTensor)
+        self.assertIs(pair, cache.quantize(weight, fp8_dtype=torch.float8_e4m3fn, block_shape=None,
+                                           quantizer=_quantize_tensorwise_pair, paired=True))
+        with torch.no_grad():
+            weight.add_(1)
+        updated = cache.quantize(weight, fp8_dtype=torch.float8_e4m3fn, block_shape=None,
+                                 quantizer=_quantize_tensorwise_pair, paired=True)
+        self.assertIsNot(updated, pair)
+        self.assertEqual(len(cache._entries), 1)
+
+    def test_fake_cuda_pair_uses_tma_ready_strides_and_mode_checks(self):
+        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton_quantization": None}):
+            x = torch.empty(129, 65, device="cuda", dtype=torch.bfloat16)
+            normal, transposed = _quantize_tensorwise_pair(x, check_finite=False)
+            self.assertEqual(normal.data.stride(), (80, 1))
+            self.assertEqual(transposed.data.stride(), (144, 1))
+            self.assertEqual(normal.data.shape, (129, 65))
+            self.assertEqual(transposed.data.shape, (65, 129))
+            self.assertIs(normal.scale_inv, transposed.scale_inv)
     def test_fake_cuda_dequantization_avoids_fp32_copies_and_expanded_scales(self):
         with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton_quantization": None}):
             data = torch.empty(65, 37, device="cuda", dtype=torch.float8_e4m3fn).T

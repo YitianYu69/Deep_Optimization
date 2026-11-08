@@ -1,6 +1,7 @@
 """Autotuned Triton FP8 GEMM with TMA operand loads."""
 
 import torch
+import inspect
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor 
@@ -8,12 +9,14 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from ..quantization.tensor import QuantizedTensor
 from ._triton_autotune import (
     AUTOTUNE_KEY, AUTOTUNE_TILES, AUTOTUNE_STAGES, GROUP_SIZE_M_CHOICES, MAX_BLOCK_K, SPLIT_K_CHOICES,
-    autotune_cache_key, prune_gemm_configs, set_descriptor_block_shapes, split_k_enabled,
+    autotune_cache_key, prune_gemm_configs, split_k_limit, DescriptorKernel,
     grouped_tile_coordinates,
 )
 
 
 _grouped_tile_coordinates = triton.jit(grouped_tile_coordinates)
+_cache_options = ({"cache_results": True}
+                  if "cache_results" in inspect.signature(triton.autotune).parameters else {})
 
 
 def _benchmark_gemm(kernel_call, quantiles):
@@ -60,7 +63,7 @@ def _finish_gemm(args, exception=None):
     configs=[
         triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk,
                        "NUM_STAGES": stages, "SPLIT_K": split, "GROUP_SIZE_M": group},
-                      num_warps=warps, num_stages=stages, pre_hook=set_descriptor_block_shapes)
+                      num_warps=warps, num_stages=stages)
         for bm, bn, bk, warps in AUTOTUNE_TILES
         for stages in AUTOTUNE_STAGES
         for split in SPLIT_K_CHOICES
@@ -70,7 +73,9 @@ def _finish_gemm(args, exception=None):
     prune_configs_by={"early_config_prune": prune_gemm_configs},
     do_bench=_benchmark_gemm,
     post_hook=_finish_gemm,
+    **_cache_options,
 )
+@DescriptorKernel
 @triton.jit
 def _gemm_nt_kernel(
     a_desc, b_desc, c_desc,
@@ -93,6 +98,8 @@ def _gemm_nt_kernel(
     PIPELINE_STAGES: tl.constexpr,
     NUM_STAGES: tl.constexpr, SPLIT_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    MAX_NUM_IMPRECISE_ACC: tl.constexpr,
+    A_ROW_STRIDE: tl.constexpr, B_ROW_STRIDE: tl.constexpr,
 ):
 
     pid_m, pid_n = _grouped_tile_coordinates(
@@ -113,9 +120,11 @@ def _gemm_nt_kernel(
         b_tile = b_desc.load([start_n, start_k])
 
         if TENSORWISE:
-            acc = tl.dot(a_tile, b_tile.T, acc, out_dtype=tl.float32, max_num_imprecise_acc=32)
+            acc = tl.dot(a_tile, b_tile.T, acc, out_dtype=tl.float32,
+                         max_num_imprecise_acc=MAX_NUM_IMPRECISE_ACC)
         elif NATIVE_FP8:
-            partial = tl.dot(a_tile, b_tile.T, out_dtype=tl.float32, max_num_imprecise_acc=32)
+            partial = tl.dot(a_tile, b_tile.T, out_dtype=tl.float32,
+                             max_num_imprecise_acc=MAX_NUM_IMPRECISE_ACC)
 
             a_scale_offset = (rows // A_BLOCK_ROWS) * A_SCALE_COLS + start_k // A_BLOCK_COLS
             b_scale_offset = (cols // B_BLOCK_ROWS) * B_SCALE_COLS + start_k // B_BLOCK_COLS
@@ -163,6 +172,16 @@ def _gemm_nt_kernel(
 
 
 
+@triton.jit
+def _pack_rows(source_ptr, target_ptr, ROWS, COLS, PADDED_COLS, STRIDE_M, STRIDE_N,
+                BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    rows, cols = offsets // PADDED_COLS, offsets % PADDED_COLS
+    values = tl.load(source_ptr + rows * STRIDE_M + cols * STRIDE_N,
+                     mask=(rows < ROWS) & (cols < COLS), other=0.0)
+    tl.store(target_ptr + offsets, values, mask=offsets < ROWS * PADDED_COLS)
+
+
 def _pack_fp8_rows(data: torch.Tensor, block_k: int) -> torch.Tensor:
     """
     Make FP8 rows contiguous and pad K with zeros
@@ -171,14 +190,18 @@ def _pack_fp8_rows(data: torch.Tensor, block_k: int) -> torch.Tensor:
     rows, cols = data.shape
     padded_cols = triton.cdiv(cols, block_k) * block_k
 
-    if (cols == padded_cols and data.is_contiguous() and data.stride(1) == 1 and data.data_ptr() % 16 == 0):
+    if (data.stride(1) == 1 and data.stride(0) >= cols
+            and data.stride(0) % block_k == 0 and data.data_ptr() % 16 == 0):
         return data
     
-    packed = torch.zeros(
+    packed = torch.empty(
         (rows, padded_cols),
         device=data.device, dtype=data.dtype
     )
-    packed[:, :cols].copy_(data)
+    # One strided copy/padding kernel writes every byte; aligned copies need
+    # neither a preliminary zero-fill nor a separate torch copy launch.
+    _pack_rows[(triton.cdiv(rows * padded_cols, 1024),)](
+        data, packed, rows, cols, padded_cols, *data.stride(), BLOCK=1024)
     return packed
 
 
@@ -192,6 +215,7 @@ def gemm_nt(
     out_dtype: torch.dtype = torch.float32,
     bias: torch.Tensor | None = None,
     num_stages: int | str = "auto",
+    max_num_imprecise_acc: int = 32,
 ) -> torch.Tensor:
 
     """
@@ -213,6 +237,9 @@ def gemm_nt(
         raise ValueError("Operands must have the same reduction dimension")
     if num_stages != "auto" and (type(num_stages) is not int or num_stages not in AUTOTUNE_STAGES):
         raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
+    if (type(max_num_imprecise_acc) is not int or not 32 <= max_num_imprecise_acc <= 2147483616
+            or max_num_imprecise_acc % 32):
+        raise ValueError("max_num_imprecise_acc must be a multiple of 32 up to 2147483616")
     
     output_types = {
         torch.float32 : tl.float32,
@@ -291,6 +318,8 @@ def gemm_nt(
             NUM_SMS=torch.cuda.get_device_properties(a.data.device).multi_processor_count,
             OUTPUT_STRIDE=padded_n,
             PIPELINE_STAGES=0 if num_stages == "auto" else num_stages,
+            MAX_NUM_IMPRECISE_ACC=max_num_imprecise_acc,
+            A_ROW_STRIDE=a_packed.stride(0), B_ROW_STRIDE=b_packed.stride(0),
         )
         # A dummy FP32 pointer keeps the implicit dtype key identical with and
         # without scratch. Cached unsplit winners allocate no partial buffer;
@@ -299,9 +328,9 @@ def gemm_nt(
                       bias_arg, a_scale_inv, output_storage, m, n, k)
         named = {**dict(zip(_gemm_nt_kernel.arg_names, positional)), **launch_args}
         cached = _gemm_nt_kernel.cache.get(autotune_cache_key(named))
-        splits = cached.kwargs["SPLIT_K"] if cached is not None else max(SPLIT_K_CHOICES)
+        splits = cached.kwargs["SPLIT_K"] if cached is not None else split_k_limit(m, n, k)
         partials = (torch.empty((splits, m, padded_n), device=a.data.device, dtype=torch.float32)
-                    if splits > 1 and split_k_enabled(m, n, k) else a_scale_inv)
+                    if splits > 1 else a_scale_inv)
         _gemm_nt_kernel[grid](
             a_desc, b_desc, c_desc, a_scale_inv, b_scale_inv,
             bias_arg, partials, output_storage, m, n, k, **launch_args,

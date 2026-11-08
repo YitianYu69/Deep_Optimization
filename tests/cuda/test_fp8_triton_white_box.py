@@ -326,7 +326,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
             self.assertIs(_gemm_nt_kernel.best_config, selected)
             self.assertEqual(selected.num_stages, 2)
             self.assertEqual(selected.kwargs["BLOCK_K"], 32)
-            self.assertIsNotNone(selected.pre_hook)
+            self.assertIsNone(selected.pre_hook)
 
             if repetition == 0:
                 first_key, first_selected = key, selected

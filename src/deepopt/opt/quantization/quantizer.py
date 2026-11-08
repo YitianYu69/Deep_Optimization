@@ -71,3 +71,25 @@ def quantize_fp8(
         scale_inv=scaling.scale_inv,
         block_shape=scaling.block_shape
     )
+
+
+@torch.no_grad()
+def _quantize_tensorwise_pair(x, *, fp8_dtype=torch.float8_e4m3fn, block_shape=None, check_finite=None):
+    """Internal training layout pair; neither output changes the scaling recipe."""
+    if block_shape is not None:
+        raise ValueError("Paired quantization requires tensorwise scaling")
+    check_finite = finite_checks_enabled() if check_finite is None else check_finite
+    if x.device.type != "cuda":
+        normal = quantize_fp8(x, fp8_dtype=fp8_dtype, check_finite=check_finite)
+        return normal, normal.transpose()
+    AmaxScaling()._validate_input(x, fp8_dtype, check_finite)
+    if isinstance(x, FakeTensor):
+        m, n = x.shape
+        normal = torch.empty_strided((m, n), (((n + 15) // 16) * 16, 1), device=x.device, dtype=fp8_dtype)
+        transposed = torch.empty_strided((n, m), (((m + 15) // 16) * 16, 1), device=x.device, dtype=fp8_dtype)
+        inverse = torch.empty((1, 1), device=x.device, dtype=torch.float32)
+    else:
+        from ..backends.triton_quantization import quantize_tensorwise_pair
+
+        normal, inverse, transposed = quantize_tensorwise_pair(x, fp8_dtype, check_finite)
+    return QuantizedTensor(normal, inverse), QuantizedTensor(transposed, inverse)

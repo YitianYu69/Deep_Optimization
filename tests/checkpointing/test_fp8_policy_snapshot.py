@@ -48,7 +48,7 @@ class FP8PolicySnapshotTests(unittest.TestCase):
         variants = (
             {"enabled": False}, {"backend": "triton"}, {"grad_dtype": "e4m3fn"},
             {"block_shapes": {"activation": [1, 2]}}, {"num_stages": 2},
-            {"out_dtype": "bf16"}, {"trace_mode": "full"},
+            {"out_dtype": "bf16"}, {"trace_mode": "full"}, {"max_num_imprecise_acc": 128},
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "last.pt"
@@ -122,9 +122,12 @@ class FP8PolicySnapshotTests(unittest.TestCase):
         payload = _checkpoint_payload(trainer, {}, generators={}, history=[])
         payload["config"]["runtime"]["fp8"].pop("intercept_linear")
         payload["trainer_settings"]["fp8"].pop("intercept_linear")
+        payload["config"]["runtime"]["fp8"].pop("max_num_imprecise_acc")
+        payload["trainer_settings"]["fp8"].pop("max_num_imprecise_acc")
         restored = make_trainer()
         restore_checkpoint(payload, restored, payload["config"], generators={}, batch_size_mode="manual")
         self.assertTrue(restored.runtime.fp8.intercept_linear)
+        self.assertEqual(restored.runtime.fp8.max_num_imprecise_acc, 32)
         for name, value in trainer.model.state_dict().items():
             torch.testing.assert_close(restored.model.state_dict()[name], value, rtol=0, atol=0)
 

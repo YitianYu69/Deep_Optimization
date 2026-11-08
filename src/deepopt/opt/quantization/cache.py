@@ -24,7 +24,7 @@ class WeightCache:
         # Deep copies and whole-module checkpoints start with an empty cache.
         return type(self), (self.capacity,)
 
-    def quantize(self, weight, *, fp8_dtype, block_shape, quantizer):
+    def quantize(self, weight, *, fp8_dtype, block_shape, quantizer, paired=False):
         if weight.is_inference() or not torch.is_autocast_cache_enabled():
             self.clear()
             return quantizer(weight, fp8_dtype=fp8_dtype, block_shape=block_shape)
@@ -37,7 +37,7 @@ class WeightCache:
         stream = (torch.cuda.current_stream(weight.device).cuda_stream
                   if not fake and weight.device.type == "cuda" else None)
         key = (id(owner), version, address, tuple(weight.shape), tuple(weight.stride()),
-               weight.dtype, weight.device, fp8_dtype, block_shape, finite_checks_enabled(), stream)
+               weight.dtype, weight.device, fp8_dtype, block_shape, finite_checks_enabled(), stream, paired)
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None and entry[0]() is owner:
