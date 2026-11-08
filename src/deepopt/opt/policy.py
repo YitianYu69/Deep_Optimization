@@ -38,6 +38,7 @@ def fp8_plan(settings=_UNSET, *, config=None) -> dict:
                            for role in ("activation", "weight", "grad")},
             "backend": settings.backend,
             "num_stages": settings.num_stages,
+            "max_num_imprecise_acc": settings.max_num_imprecise_acc,
             "out_dtype": output_types[settings.out_dtype],
         },
         "block_shapes": dict(settings.block_shapes),

@@ -4,7 +4,7 @@ from torch.autograd.function import once_differentiable
 
 from ...backends import gemm_nt
 from ...quantization.tensor import QuantizedTensor
-from ...quantization.quantizer import quantize_fp8
+from ...quantization.quantizer import quantize_fp8, _quantize_tensorwise_pair
 from ..._execution import backward_finite_check_policy
 
 
@@ -25,23 +25,31 @@ class _DOLinearFunction(Function):
         block_shapes = plan["block_shapes"]
         backend = fp8_trainig_plan.get("backend", "reference")
         num_stages = fp8_trainig_plan.get("num_stages", "auto")
+        accumulation = fp8_trainig_plan.get("max_num_imprecise_acc", 32)
 
         x_matrix = x.reshape(-1, weight.shape[1])
-
-        qx = quantize_fp8(
-            x_matrix, fp8_dtype=fp8_dtypes["activation"],
-            block_shape=block_shapes["activation"]
-        )
-        if weight_cache is None:
-            qw = quantize_fp8(weight, fp8_dtype=fp8_dtypes["weight"], block_shape=block_shapes["weight"])
+        need_dx, need_dw = ctx.needs_input_grad[:2]
+        paired_layouts = backward_enabled and backend == "triton" and x.device.type == "cuda"
+        paired_x = paired_layouts and need_dw and block_shapes["activation"] is None and x_matrix.numel() > 4096
+        paired_w = paired_layouts and need_dx and block_shapes["weight"] is None and weight.numel() > 4096
+        if paired_x:
+            qx, qx_transposed = _quantize_tensorwise_pair(x_matrix, fp8_dtype=fp8_dtypes["activation"])
         else:
-            qw = weight_cache.quantize(weight, fp8_dtype=fp8_dtypes["weight"],
-                                       block_shape=block_shapes["weight"], quantizer=quantize_fp8)
+            qx = quantize_fp8(x_matrix, fp8_dtype=fp8_dtypes["activation"], block_shape=block_shapes["activation"])
+        weight_quantizer = _quantize_tensorwise_pair if paired_w else quantize_fp8
+        if weight_cache is None:
+            quantized_weight = weight_quantizer(weight, fp8_dtype=fp8_dtypes["weight"],
+                                                block_shape=block_shapes["weight"])
+        else:
+            quantized_weight = weight_cache.quantize(weight, fp8_dtype=fp8_dtypes["weight"],
+                                                     block_shape=block_shapes["weight"], quantizer=weight_quantizer,
+                                                     paired=paired_w)
+        qw, qw_transposed = quantized_weight if paired_w else (quantized_weight, None)
 
-        output = gemm_nt(qx, qw, backend=backend, bias=bias, out_dtype=out_dtype, num_stages=num_stages)
+        output = gemm_nt(qx, qw, backend=backend, bias=bias, out_dtype=out_dtype, num_stages=num_stages,
+                         max_num_imprecise_acc=accumulation)
         if not backward_enabled:
             return output.reshape(*x.shape[:-1], weight.shape[0])
-        need_dx, need_dw = ctx.needs_input_grad[:2]
 
         # Saved-activation compression belongs at this boundary: a future
         # codec must restore each operand with its scale and block metadata.
@@ -60,12 +68,14 @@ class _DOLinearFunction(Function):
                 x_matrix.T, fp8_dtype=fp8_dtypes["activation"],
                 block_shape=block_shapes["activation"]
             )
+        elif paired_x:
+            qx = qx_transposed
 
         ctx.save_for_backward(
             qx.data if need_dw else None,
             qx.scale_inv if need_dw else None,
-            qw.data if need_dx else None,
-            qw.scale_inv if need_dx else None
+            (qw_transposed.data if paired_w else qw.data) if need_dx else None,
+            (qw_transposed.scale_inv if paired_w else qw.scale_inv) if need_dx else None
         )
 
         ctx.input_shape = x.shape
@@ -77,7 +87,9 @@ class _DOLinearFunction(Function):
         ctx.block_shapes = dict(block_shapes)
         ctx.backend = backend
         ctx.num_stages = num_stages
-        ctx.save_qx_transpose = save_qx_transpose
+        ctx.max_num_imprecise_acc = accumulation
+        ctx.save_qx_transpose = save_qx_transpose or paired_x
+        ctx.weight_transposed = paired_w
         ctx.check_finite = backward_finite_check_policy()
 
         return output.reshape(*x.shape[:-1], weight.shape[0])
@@ -94,10 +106,14 @@ class _DOLinearFunction(Function):
         dw = None
         db = None
         if need_dx or need_dw:
-            qg = quantize_fp8(
-                grad_matrix, fp8_dtype=ctx.fp8_dtypes["grad"], block_shape=ctx.block_shapes["grad"],
-                check_finite=ctx.check_finite,
-            )
+            paired_g = (need_dw and ctx.backend == "triton" and grad_matrix.device.type == "cuda"
+                        and ctx.block_shapes["grad"] is None and grad_matrix.numel() > 4096)
+            if paired_g:
+                qg, qg_transposed = _quantize_tensorwise_pair(
+                    grad_matrix, fp8_dtype=ctx.fp8_dtypes["grad"], check_finite=ctx.check_finite)
+            else:
+                qg = quantize_fp8(grad_matrix, fp8_dtype=ctx.fp8_dtypes["grad"],
+                                  block_shape=ctx.block_shapes["grad"], check_finite=ctx.check_finite)
 
             if need_dx:
                 qw = QuantizedTensor(
@@ -107,10 +123,11 @@ class _DOLinearFunction(Function):
                 # Dense/sparse kernel selection belongs to backend dispatch;
                 # gradient orientation and dtype remain the autograd contract.
                 dx = gemm_nt(
-                    qg, qw.transpose(contiguous=False),
+                    qg, qw if ctx.weight_transposed else qw.transpose(contiguous=False),
                     backend=ctx.backend,
                     out_dtype=ctx.input_dtype,
                     num_stages=ctx.num_stages,
+                    max_num_imprecise_acc=ctx.max_num_imprecise_acc,
                 ).reshape(ctx.input_shape)
             
             if need_dw:
@@ -130,13 +147,16 @@ class _DOLinearFunction(Function):
                         block_shape=ctx.block_shapes["grad"],
                         check_finite=ctx.check_finite,
                     )
+                elif paired_g:
+                    qg = qg_transposed
 
                 dw = gemm_nt(
-                    qg if needs_qg_special_transpose else qg.transpose(contiguous=False),
+                    qg if needs_qg_special_transpose or paired_g else qg.transpose(contiguous=False),
                     qx if ctx.save_qx_transpose else qx.transpose(contiguous=False),
                     backend=ctx.backend,
                     out_dtype=ctx.weight_dtype,
                     num_stages=ctx.num_stages,
+                    max_num_imprecise_acc=ctx.max_num_imprecise_acc,
                 )
         
         if need_db:

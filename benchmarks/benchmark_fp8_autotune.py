@@ -46,12 +46,14 @@ def _record_autotune_trials():
         named = {name: value for name, value in all_args.items() if name in kernel.arg_names}
         key = (tuple(named[name] for name in kernel.keys if name in named)
                + tuple(str(value.dtype) for value in named.values() if hasattr(value, "dtype")))
+        started = perf_counter()
         timings = original(*args, config=config, **kwargs)
         samples = timings if isinstance(timings, (list, tuple)) else [timings]
         trials.setdefault(key, []).append({
             **_config_record(config),
             "quantiles_ms": [float(value) if isfinite(value) else None for value in samples],
             "status": "ok" if all(isfinite(value) for value in samples) else "unavailable",
+            "compile_and_benchmark_seconds": perf_counter() - started,
         })
         return timings
 
@@ -140,6 +142,19 @@ def _measure(operation, torch, device, args):
     }
 
 
+def _benchmark_plan(args, torch):
+    formats = {"e4m3fn": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
+    training = {"backend": "triton", "num_stages": args.num_stages, "out_dtype": torch.bfloat16,
+                "fp8_dtypes": {role: formats[getattr(args, role + "_format", default)]
+                               for role, default in (("activation", "e4m3fn"), ("weight", "e4m3fn"), ("grad", "e5m2"))}}
+    if args.max_num_imprecise_acc != 32:
+        training["max_num_imprecise_acc"] = args.max_num_imprecise_acc
+    blocks = (dict.fromkeys(("activation", "weight", "grad")) if args.scaling == "tensorwise" else
+              {"activation": (1, args.scale_k), "weight": (args.scale_k, args.scale_k),
+               "grad": (args.scale_k, args.scale_k)})
+    return {"fp8_training": training, "block_shapes": blocks}
+
+
 def _worker(args):
     # Keep --help and orchestration usable without importing torch or Triton.
     import torch
@@ -157,58 +172,114 @@ def _worker(args):
     from deepopt.opt.backends import gemm_nt
     from deepopt.opt.do_nn.functional import do_linear
     # Load the tuner before measuring so the recorder sees the very first key.
-    from deepopt.opt.backends import triton_fp8  # noqa: F401
+    if args.implementation == "fp8":
+        from deepopt.opt.backends import triton_fp8  # noqa: F401
 
     torch.manual_seed(42)
     # Initialize the CUDA context before timing any projection.
     torch.empty(1, device=device)
     torch.cuda.synchronize(device)
-    plan = {
-        "fp8_training": {
-            "backend": "triton",
-            "fp8_dtypes": {
-                "activation": torch.float8_e4m3fn,
-                "weight": torch.float8_e4m3fn,
-                "grad": torch.float8_e5m2,
-            },
-            "num_stages": args.num_stages,
-            "out_dtype": torch.bfloat16,
-        },
-        "block_shapes": {"activation": (1, args.scale_k), "weight": (args.scale_k, args.scale_k),
-                         "grad": (args.scale_k, args.scale_k)},
-    }
+    plan = _benchmark_plan(args, torch)
     # Keep strict comparisons compatible with snapshots predating check_finite.
-    check_scope = (nullcontext() if args.check_finite else
+    # A persistent disabled AMP context around BF16 measurements would keep
+    # native weight-cast caches alive across forwards, unlike a training step.
+    check_scope = (nullcontext() if args.check_finite or args.implementation == "bf16" else
                    deepopt.autocast("cuda", enabled=False, fp8=None, check_finite=False))
     with check_scope, _record_autotune_trials() as trials:
         rows = _measure_batches(args, torch, device, plan, do_linear, gemm_nt)
     return {
         "source": str(args.source[0]),
         "scope": args.scope,
+        "implementation": args.implementation,
+        "scaling": args.scaling,
+        "fp8_policy": {"block_shapes": plan["block_shapes"], "max_num_imprecise_acc": args.max_num_imprecise_acc,
+                       "formats": {role: str(dtype) for role, dtype in plan["fp8_training"]["fp8_dtypes"].items()}},
         "environment": {"torch": str(torch.__version__), "cuda": torch.version.cuda,
                         "deepopt_source": str(Path(deepopt.__file__).resolve()),
                         "gpu": torch.cuda.get_device_name(device),
                         "capability": torch.cuda.get_device_capability(device)},
         "timings": rows,
         "autotune_selections": _autotune_diagnostics(trials),
+        "tuning_result_cache_enabled": bool(getattr(
+            getattr(sys.modules.get("deepopt.opt.backends.triton_fp8"), "_gemm_nt_kernel", None),
+            "cache_results", False)),
     }
+
+
+def _projection_cases(args):
+    if getattr(args, "preset", "classifier") == "vit":
+        return [(name, batch if name == "head" else batch * args.tokens_per_sample, inputs, outputs)
+                for batch in args.batches
+                for name, inputs, outputs in (("qkv", 768, 2304), ("attention", 768, 768),
+                                              ("fc1", 768, 3072), ("fc2", 3072, 768),
+                                              ("head", 768, args.output_features))]
+    return [("classifier", batch, args.input_features, args.output_features) for batch in args.batches]
+
+
+def _dense_products(x, weight, bias, grad):
+    import torch
+
+    return [("forward", x, weight.to(torch.bfloat16), bias.to(torch.bfloat16), torch.bfloat16),
+            ("input_gradient", grad, weight.T.to(torch.bfloat16), None, torch.bfloat16),
+            ("weight_gradient", grad.T, x.T, None, torch.float32)]
+
+
+def _error_metrics(actual, expected, torch):
+    actual, expected = actual.detach().float(), expected.detach().float()
+    error = actual - expected
+    values = {"relative_l2": (error.norm() / expected.norm().clamp_min(1e-30)).item(),
+              "max_abs": error.abs().max().item(), "rmse": error.square().mean().sqrt().item()}
+    return {**{name: value if isfinite(value) else None for name, value in values.items()},
+            "finite": bool(torch.isfinite(actual).all().item())}
+
+
+def _reference_product(name, x, weight, bias, grad, torch):
+    # Accuracy is computed after timing; IEEE FP32 references must not silently
+    # use a process-wide TF32 setting intended for performance measurements.
+    cuda = x.device.type == "cuda"
+    previous = torch.backends.cuda.matmul.allow_tf32 if cuda else None
+    try:
+        if cuda:
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if name == "forward":
+            return x.detach().float() @ weight.detach().float().T + bias.detach().float()
+        if name == "input_gradient":
+            return grad.float() @ weight.detach().float()
+        return grad.float().T @ x.detach().float()
+    finally:
+        if cuda:
+            torch.backends.cuda.matmul.allow_tf32 = previous
 
 
 def _measure_batches(args, torch, device, plan, do_linear, gemm_nt):
     rows = []
-    for batch in args.batches:
-        x = torch.randn(batch, args.input_features, device=device, dtype=torch.bfloat16, requires_grad=True)
+    dense = getattr(args, "implementation", "fp8") == "bf16"
+    for projection_name, batch, inputs, outputs in _projection_cases(args):
+        x = torch.randn(batch, inputs, device=device, dtype=torch.bfloat16, requires_grad=True)
         # Keep FP32 master parameters, as with ordinary BF16 autocast training.
-        weight = torch.randn(args.output_features, args.input_features, device=device, requires_grad=True)
-        bias = torch.randn(args.output_features, device=device, requires_grad=True)
-        grad = torch.randn(batch, args.output_features, device=device, dtype=torch.bfloat16) / batch
+        weight = torch.randn(outputs, inputs, device=device, requires_grad=True)
+        bias = torch.randn(outputs, device=device, requires_grad=True)
+        grad = torch.randn(batch, outputs, device=device, dtype=torch.bfloat16) / batch
         if args.scope == "linear":
             def projection():
                 x.grad = weight.grad = bias.grad = None
-                do_linear(x, weight, bias, plan=plan).backward(grad)
+                if dense:
+                    with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
+                        output = torch.nn.functional.linear(x, weight, bias)
+                else:
+                    output = do_linear(x, weight, bias, plan=plan)
+                output.backward(grad)
+                return output.detach()
 
-            rows.append({"batch": batch, "operation": "forward_backward",
-                         **_measure(projection, torch, device, args)})
+            row = {"projection": projection_name, "batch": batch, "operation": "forward_backward",
+                   **_measure(projection, torch, device, args)}
+            if getattr(args, "accuracy", False):
+                actual = projection()
+                row["errors_vs_fp32"] = {
+                    name: _error_metrics(value, _reference_product(name, x, weight, bias, grad, torch), torch)
+                    for name, value in (("forward", actual), ("input_gradient", x.grad),
+                                        ("weight_gradient", weight.grad))}
+            rows.append(row)
         elif args.scope in ("quantize", "scale", "dequantize"):
             from deepopt.opt.quantization.quantizer import quantize_fp8
             from deepopt.opt.scaling_strategy.amax import AmaxScaling
@@ -233,17 +304,28 @@ def _measure_batches(args, torch, device, plan, do_linear, gemm_nt):
                     operation = quantize().dequantize
                 else:
                     operation = quantize
-                rows.append({"batch": batch, "operation": name, "shape": list(value.shape),
+                rows.append({"projection": projection_name, "batch": batch, "operation": name, "shape": list(value.shape),
                              "stride": list(value.stride()), **_measure(operation, torch, device, args)})
         else:
-            products = _prepare_gemm_products(x, weight, bias, grad, plan)
+            products = _dense_products(x, weight, bias, grad) if dense else _prepare_gemm_products(x, weight, bias, grad, plan)
             for name, left, right, product_bias, output_dtype in products:
                 def product():
+                    if dense:
+                        return torch.nn.functional.linear(left, right, product_bias).to(output_dtype)
+                    options = ({"max_num_imprecise_acc": args.max_num_imprecise_acc}
+                               if getattr(args, "max_num_imprecise_acc", 32) != 32 else {})
                     return gemm_nt(left, right, backend="triton", bias=product_bias,
-                                   out_dtype=output_dtype, num_stages=args.num_stages)
+                                   out_dtype=output_dtype, num_stages=args.num_stages, **options)
 
-                rows.append({"batch": batch, "operation": name,
-                             **_measure(product, torch, device, args)})
+                row = {"projection": projection_name, "batch": batch, "operation": name,
+                       "M_N_K": [left.shape[0] if dense else left.data.shape[0],
+                                 right.shape[0] if dense else right.data.shape[0],
+                                 left.shape[1] if dense else left.data.shape[1]],
+                       **_measure(product, torch, device, args)}
+                if getattr(args, "accuracy", False):
+                    row["errors_vs_fp32"] = _error_metrics(
+                        product(), _reference_product(name, x, weight, bias, grad, torch), torch)
+                rows.append(row)
     return rows
 
 
@@ -251,13 +333,22 @@ def _run(args):
     results = []
     scopes = ("linear", "gemm") if args.scope == "both" else (args.scope,)
     for source in args.source:
-        for scope in scopes:
+        for implementation, scope in ((impl, scope) for impl in
+                                       (("fp8", "bf16") if args.implementation == "both" else (args.implementation,))
+                                       for scope in scopes):
             print(f"Measuring {source} ({scope}) in a fresh process...", file=sys.stderr, flush=True)
             command = [sys.executable, str(Path(__file__).resolve()), "--_worker",
                        "--source", str(source), "--scope", scope, "--device", args.device,
                        "--warmups", str(args.warmups), "--iterations", str(args.iterations),
                        "--repeats", str(args.repeats), "--batches", *map(str, args.batches)]
             command.extend(["--num-stages", str(args.num_stages)])
+            command.extend(["--implementation", implementation, "--scaling", args.scaling,
+                            "--preset", args.preset, "--tokens-per-sample", str(args.tokens_per_sample),
+                            "--max-num-imprecise-acc", str(args.max_num_imprecise_acc)])
+            for role in ("activation", "weight", "grad"):
+                command.extend(["--" + role + "-format", getattr(args, role + "_format")])
+            if not args.accuracy:
+                command.append("--no-accuracy")
             command.extend(["--input-features", str(args.input_features),
                             "--output-features", str(args.output_features), "--scale-k", str(args.scale_k)])
             if not args.check_finite:
@@ -300,6 +391,9 @@ def _run(args):
             "Autotune selections are inspected after timing; null means the source exposes no compatible tuner cache.",
             "Candidate quantiles are search-time median/p20/p80 device milliseconds, including split-K reduction when used.",
             "GEMM operands are captured from each source's actual autograd path before timing.",
+            "Accuracy compares forward/dX/dW with IEEE FP32 after timing; changing accumulation requires training-quality validation.",
+            "ViT preset uses separate qkv/attention/fc1/fc2/head projections; it does not measure a whole ViT model.",
+            "Candidate wall times include compilation and benchmarking; native tuning-result persistence is reported separately.",
         ],
         "results": results,
     }
@@ -311,11 +405,19 @@ def main():
                         help="Directory containing deepopt; repeat to compare snapshots. Defaults to this checkout's src.")
     parser.add_argument("--scope", choices=("both", "linear", "gemm", "quantize", "scale", "dequantize"), default="both")
     parser.add_argument("--check-finite", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--accuracy", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--implementation", choices=("fp8", "bf16", "both"), default="fp8")
+    parser.add_argument("--scaling", choices=("blockwise", "tensorwise"), default="blockwise")
+    parser.add_argument("--preset", choices=("classifier", "vit"), default="classifier")
+    parser.add_argument("--tokens-per-sample", type=int)
+    parser.add_argument("--max-num-imprecise-acc", type=int, default=32)
+    for role, default in (("activation", "e4m3fn"), ("weight", "e4m3fn"), ("grad", "e5m2")):
+        parser.add_argument("--" + role + "-format", choices=("e4m3fn", "e5m2"), default=default)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-stages", choices=("auto", "1", "2", "3", "4", "5"), default="auto",
                         help="Tune pipeline stages by default; use an integer to compare older source snapshots.")
-    parser.add_argument("--batches", nargs="+", type=int, default=[2048, 848, 1808],
-                        help="Batch sizes; defaults include CIFAR-10 training and validation tails.")
+    parser.add_argument("--batches", nargs="+", type=int,
+                        help="Sample batches; defaults are 2048/848/1808 for classifier or 512 for ViT.")
     parser.add_argument("--input-features", type=int, default=512)
     parser.add_argument("--output-features", type=int, default=10)
     parser.add_argument("--scale-k", type=int, choices=(32, 64, 128, 256, 512, 1024), default=32,
@@ -326,6 +428,14 @@ def main():
     parser.add_argument("--reuse-cache", action="store_true", help="Reuse the normal Triton disk cache.")
     parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.batches = args.batches or ([512] if args.preset == "vit" else [2048, 848, 1808])
+    args.tokens_per_sample = args.tokens_per_sample if args.tokens_per_sample is not None else (197 if args.preset == "vit" else 1)
+    if args.implementation != "fp8" and args.scope not in ("both", "linear", "gemm"):
+        parser.error("BF16 comparison supports linear and gemm scopes")
+    if not 32 <= args.max_num_imprecise_acc <= 2147483616 or args.max_num_imprecise_acc % 32:
+        parser.error("--max-num-imprecise-acc must be a multiple of 32 up to 2147483616")
+    if args.tokens_per_sample < 1:
+        parser.error("--tokens-per-sample must be positive")
     args.num_stages = args.num_stages if args.num_stages == "auto" else int(args.num_stages)
     args.source = [source.resolve() for source in (args.source or [Path(__file__).resolve().parents[1] / "src"])]
     if any(not (source / "deepopt").is_dir() for source in args.source):
@@ -334,7 +444,7 @@ def main():
             or args.iterations < 1 or args.repeats < 1 or args.warmups < 0):
         parser.error("Dimensions, iterations, and repeats must be positive; warmups must be nonnegative.")
     if args._worker:
-        if len(args.source) != 1 or args.scope == "both":
+        if len(args.source) != 1 or args.scope == "both" or args.implementation == "both":
             parser.error("A worker needs one source and one scope.")
         print(_RESULT_PREFIX + json.dumps(_worker(args)))
     else:

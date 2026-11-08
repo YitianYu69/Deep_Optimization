@@ -9,6 +9,7 @@ from deepopt.opt.backends._triton_autotune import (
     MAX_TUNING_CONFIGS, SPLIT_K_CHOICES, baseline_gemm_tile, prune_gemm_configs,
     autotune_cache_key, set_descriptor_block_shapes, split_k_enabled,
     AUTOTUNE_STAGES, GROUP_SIZE_M_CHOICES, TUTORIAL_GEMM_CONFIGS, grouped_tile_coordinates,
+    DescriptorKernel, split_k_limit, MAX_SPLIT_K_SCRATCH_BYTES,
 )
 
 
@@ -36,6 +37,40 @@ class TritonAutotunePolicyTests(unittest.TestCase):
             for split in SPLIT_K_CHOICES
             for group in GROUP_SIZE_M_CHOICES
         ]
+
+    def test_vit_weight_gradients_measure_split_k_for_long_token_reductions(self):
+        for m, n in ((768, 768), (2304, 768), (3072, 768), (768, 3072)):
+            selected = prune_gemm_configs(self.configs, arguments(
+                M=m, N=n, K=100864, TENSORWISE=True, A_BLOCK_COLS=100864, B_BLOCK_COLS=100864))
+            self.assertTrue(any(config.kwargs["SPLIT_K"] > 1 for config in selected), (m, n))
+            self.assertTrue(any(config.kwargs["SPLIT_K"] == 1 for config in selected))
+            self.assertLessEqual(len(selected), MAX_TUNING_CONFIGS)
+            stride = ((n + 7) // 8) * 8
+            self.assertLessEqual(split_k_limit(m, n, 100864) * m * stride * 4, MAX_SPLIT_K_SCRATCH_BYTES)
+
+    def test_split_scratch_limit_rejects_oversized_outputs(self):
+        self.assertEqual(split_k_limit(3072, 768, 100864), 4)
+        self.assertEqual(split_k_limit(8192, 8192, 100864), 1)
+
+    def test_descriptor_adapter_prepares_bench_cached_and_warmup_launches(self):
+        descriptors = [SimpleNamespace(block_shape=None) for _ in range(3)]
+        calls = []
+
+        class Jit:
+            arg_names = ("a_desc", "b_desc", "c_desc")
+
+            def run(self, *args, **kwargs):
+                calls.append([descriptor.block_shape for descriptor in args])
+
+            warmup = run
+
+        kernel = DescriptorKernel(Jit())
+        kernel.run(*descriptors, BLOCK_M=32, BLOCK_N=64, BLOCK_K=128)
+        kernel.run(*descriptors, BLOCK_M=128, BLOCK_N=32, BLOCK_K=64)
+        kernel.warmup(*descriptors, BLOCK_M=16, BLOCK_N=32, BLOCK_K=32)
+        self.assertEqual(calls, [[[32, 128], [64, 128], [32, 64]],
+                                 [[128, 64], [32, 64], [128, 32]],
+                                 [[16, 32], [32, 32], [16, 32]]])
 
     def test_dense_search_measures_every_compatible_tutorial_seed(self):
         for stages in (0, 3, 5):

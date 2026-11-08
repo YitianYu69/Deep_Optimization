@@ -24,6 +24,43 @@ spec.loader.exec_module(benchmark)
 
 
 class FP8AutotuneBenchmarkTests(unittest.TestCase):
+    def test_nonfinite_accuracy_results_are_json_safe(self):
+        result = benchmark._error_metrics(torch.tensor([float("nan")]), torch.ones(1), torch)
+        self.assertFalse(result["finite"])
+        self.assertIsNone(result["relative_l2"])
+        json.dumps(result, allow_nan=False)
+
+    def test_tensorwise_benchmark_has_no_block_scaling_and_records_explicit_precision(self):
+        args = SimpleNamespace(scaling="tensorwise", scale_k=32, num_stages="auto",
+                               max_num_imprecise_acc=128, grad_format="e4m3fn")
+        plan = benchmark._benchmark_plan(args, torch)
+        self.assertEqual(plan["block_shapes"], dict.fromkeys(("activation", "weight", "grad")))
+        self.assertEqual(plan["fp8_training"]["max_num_imprecise_acc"], 128)
+        self.assertEqual(plan["fp8_training"]["fp8_dtypes"]["grad"], torch.float8_e4m3fn)
+
+    def test_vit_preset_matches_real_forward_and_weight_gradient_shapes(self):
+        args = SimpleNamespace(preset="vit", batches=[512], tokens_per_sample=197, output_features=10)
+        self.assertEqual(benchmark._projection_cases(args),
+                         [("qkv", 100864, 768, 2304), ("attention", 100864, 768, 768),
+                          ("fc1", 100864, 768, 3072), ("fc2", 100864, 3072, 768),
+                          ("head", 512, 768, 10)])
+
+    def test_bf16_component_and_autograd_comparisons_report_numerical_errors(self):
+        args = SimpleNamespace(batches=[3], input_features=7, output_features=5,
+                               implementation="bf16", accuracy=True, scope="linear")
+
+        def measure(operation, *unused):
+            operation()
+            return {}
+
+        with patch.object(benchmark, "_measure", new=measure):
+            rows = benchmark._measure_batches(args, torch, "cpu", {}, do_linear, gemm_nt)
+            self.assertEqual(set(rows[0]["errors_vs_fp32"]), {"forward", "input_gradient", "weight_gradient"})
+            args.scope = "gemm"
+            rows = benchmark._measure_batches(args, torch, "cpu", {}, do_linear, gemm_nt)
+        self.assertEqual([row["M_N_K"] for row in rows], [[3, 5, 7], [3, 7, 5], [5, 7, 3]])
+        self.assertTrue(all(row["errors_vs_fp32"]["finite"] for row in rows))
+
     def test_benchmark_cli_accepts_dense_shapes_stage_five_and_wider_scales(self):
         command = ["benchmark", "--batches", "1024", "--input-features", "2048",
                    "--output-features", "1024", "--scale-k", "128", "--num-stages", "5"]

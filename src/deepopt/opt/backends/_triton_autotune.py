@@ -23,6 +23,7 @@ MAX_TILE_FAMILIES = 12
 AUTOTUNE_STAGES = (1, 2, 3, 4, 5)
 GROUP_SIZE_M_CHOICES = (1, 8)
 SPLIT_K_CHOICES = (1, 2, 4, 8)
+MAX_SPLIT_K_SCRATCH_BYTES = 64 * 1024 * 1024
 # CUDA seeds from Triton's matrix-multiplication tutorial (M, N, K, warps, stages).
 # Reserve these measured choices instead of letting a cost estimate remove them.
 # https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
@@ -58,6 +59,8 @@ AUTOTUNE_KEY = (
     "A_BLOCK_ROWS", "A_BLOCK_COLS", "B_BLOCK_ROWS", "B_BLOCK_COLS",
     "A_SCALE_COLS", "B_SCALE_COLS", "TENSORWISE", "NATIVE_FP8", "HAS_BIAS",
     "PIPELINE_STAGES", "DEVICE_INDEX", "DEVICE_CAPABILITY", "NUM_SMS",
+    "MAX_NUM_IMPRECISE_ACC",
+    "A_ROW_STRIDE", "B_ROW_STRIDE",
 )
 
 
@@ -67,9 +70,41 @@ def autotune_cache_key(named_args):
             + tuple(str(value.dtype) for value in named_args.values() if hasattr(value, "dtype")))
 
 
+def split_k_limit(m, n, k):
+    """Bound FP32 scratch while admitting long, dense weight-gradient products."""
+    skinny = min(m, n) <= 32 and k >= 512 and m * n <= 262144
+    if not skinny and k < 4096:
+        return 1
+    # Eight-element alignment bounds either FP32 or 16-bit output row strides.
+    stride = ((n + 7) // 8) * 8
+    return max((split for split in SPLIT_K_CHOICES
+                if split == 1 or split * m * stride * 4 <= MAX_SPLIT_K_SCRATCH_BYTES), default=1)
+
+
 def split_k_enabled(m, n, k):
-    """Limit partial-buffer allocation and search to skinny, long reductions."""
-    return min(m, n) <= 32 and k >= 512 and m * n <= 262144
+    return split_k_limit(m, n, k) > 1
+
+
+class DescriptorKernel:
+    """Set descriptor tiles for every launch without serializing config hooks.
+
+    Triton's disk-result cache cannot serialize Config.pre_hook. This adapter
+    wraps the JIT function, including benchmark, cached and warmup launches.
+    """
+
+    def __init__(self, fn):
+        self.fn, self.arg_names = fn, fn.arg_names
+
+    def _prepare(self, args, kwargs):
+        set_descriptor_block_shapes({**dict(zip(self.arg_names, args)), **kwargs})
+
+    def run(self, *args, **kwargs):
+        self._prepare(args, kwargs)
+        return self.fn.run(*args, **kwargs)
+
+    def warmup(self, *args, **kwargs):
+        self._prepare(args, kwargs)
+        return self.fn.warmup(*args, **kwargs)
 
 
 def grouped_tile_coordinates(pid, num_m, num_n, group_m):
@@ -139,8 +174,10 @@ def prune_gemm_configs(configs, named_args, **kwargs):
             continue
         if split > 1:
             ctas = ceil(m / bm) * ceil(n / bn)
-            if (not split_k_enabled(m, n, k) or ceil(k / bk) < split * 2
-                    or ctas >= sms or ctas * split > sms * 4):
+            long_reduction = k >= 4096
+            if (split > split_k_limit(m, n, k) or ceil(k / bk) < split * 2
+                    or ctas >= sms * (2 if long_reduction else 1)
+                    or ctas * split > sms * (8 if long_reduction else 4)):
                 continue
         families[bm, bn, bk, split].append(config)
         compatible[signature(config)] = config

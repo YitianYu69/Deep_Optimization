@@ -73,6 +73,7 @@ def validate_fp8_plan(plan: dict) -> dict:
         "fp8_dtypes",
         "backend",
         "num_stages",
+        "max_num_imprecise_acc",
         "out_dtype"
     }
 
@@ -119,6 +120,9 @@ def validate_fp8_plan(plan: dict) -> dict:
         raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
 
     out_dtype = training.get("out_dtype")
+    accumulation = training.get("max_num_imprecise_acc", 32)
+    if type(accumulation) is not int or not 32 <= accumulation <= 2147483616 or accumulation % 32:
+        raise ValueError("max_num_imprecise_acc must be a multiple of 32 up to 2147483616")
     if out_dtype is not None:
         if (not isinstance(out_dtype, torch.dtype) or out_dtype not in _FLOAT_DTYPES):
             raise ValueError(
@@ -130,6 +134,7 @@ def validate_fp8_plan(plan: dict) -> dict:
             "fp8_dtypes": dict(fp8_dtypes),
             "backend": backend,
             "num_stages": num_stages,
+            "max_num_imprecise_acc": accumulation,
             "out_dtype": out_dtype,
         },
         "block_shapes": dict(block_shapes),

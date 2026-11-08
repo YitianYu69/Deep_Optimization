@@ -102,6 +102,11 @@ two-dimensional shapes; roles without inherited settings use tensorwise scaling.
 Partial overrides preserve unspecified inherited roles. `num_stages`
 defaults to `"auto"` (search stages 1–5); an integer from 1–5 pins the depth.
 `out_dtype=None` uses the active AMP/input dtype.
+`max_num_imprecise_acc=32` preserves the existing FP8 accumulation policy.
+Larger multiples of 32 can change accuracy and performance; they are explicit
+choices, not automatic tuning dimensions. Validate forward/gradient error and
+training quality on the target GPU before changing this setting. The reference
+backend accepts the policy but continues using its FP32 emulation.
 
 Automatic preparation runs before DDP wrapping. Configured experiments also
 prepare before compilation and optimizer creation. Direct constructors preserve
@@ -227,10 +232,20 @@ the Triton backend packs those views directly into its required aligned layout.
 `QuantizedTensor.transpose()` keeps its contiguous-result default; the optional
 `contiguous=False` avoids an intermediate materialization.
 
+For native CUDA tensorwise training operands larger than 4096 values, conversion
+can emit both FP8 orientations with 16-byte-aligned row strides. Both layouts
+share the same scalar scale and exactly transposed quantized values. Forward
+keeps only the orientation needed by backward; weight caches can retain a pair
+for forward and input gradients. This avoids subsequent whole-matrix transpose
+packing. Rowwise scaling still quantizes each orientation independently, and
+inference does not create unused backward layouts. The size threshold is a
+heuristic, not a measured hardware optimum.
+
 Prepared adapters reuse quantized weights while the owning parameter's PyTorch
 version, identity, storage/layout, dtype/device, FP8 format, scale blocks, finite
-check policy, and CUDA stream match. The bounded cache holds at most four layouts
-per adapter. Optimizer updates, `load_state_dict`, parameter replacement, and
+check policy, requested single/paired layout, and CUDA stream match. The bounded
+per-adapter cache holds at most four entries; a paired entry contains two FP8
+layouts. Optimizer updates, `load_state_dict`, parameter replacement, and
 device/dtype changes invalidate reuse. DDP initialization clears rank-local
 caches after its initial parameter broadcast. Caches are absent from `state_dict` and
 are empty after a module copy or whole-module pickle; they add resident FP8
@@ -773,11 +788,13 @@ output axis has a single tile, the equivalent grouped variant is omitted.
 The final partial M group and split-K planes use the same coordinate mapping.
 These CUDA/TMA choices do not introduce a HIP backend.
 
-Split-K factors 2, 4, and 8 compete with unsplit launches for products with an
-output axis at most 32, K at least 512, and at most 262144 output elements.
-Pruning accounts for the GPU's SM count and requires at least two reduction tiles
-per split. Partial products use bounded FP32 scratch storage (at most eight
-padded output planes); a separate reduction adds bias once and converts to the
+Split-K factors 2, 4, and 8 compete with unsplit launches for skinny products
+(an output axis at most 32, K at least 512, and at most 262144 output elements)
+and dense products with K at least 4096. This admits ViT weight gradients such
+as a 768x768 output reducing across 100864 tokens. The number of split planes
+is capped by a 64 MiB FP32 scratch bound, including aligned row strides.
+Pruning accounts for SM count, output-grid occupancy, and at least two reduction
+tiles per split. A separate reduction adds bias once and converts to the
 requested output dtype. Both kernels are included in candidate timing. Each
 launch overwrites its partials, so cached launches need no clearing or atomics.
 Cached unsplit winners allocate no partial buffer; cached split winners allocate
@@ -798,15 +815,27 @@ Packing uses only the stride alignment required by TMA. Logical descriptor
 bounds handle partial tiles through zero-filled loads and discarded stores
 outside the matrix. Buffers therefore do not require padding to the largest
 tile in the candidate set, including on calls that reuse a cached winner.
+Already aligned row-strided FP8 views are reused directly. Other layouts use
+one copy/padding kernel that overwrites every destination byte; fully overwritten
+buffers do not incur a preliminary zero fill.
 
 Autotuning compiles and benchmarks candidates on the first call for each new
-shape, operand/output format, scale layout, bias policy, pipeline stage policy,
-or CUDA device. Forward, input-gradient, and weight-gradient products have
+shape, operand/output format, scale layout, prepared row strides, bias policy,
+pipeline/accumulation policy, or CUDA device. Forward, input-gradient, and weight-gradient products have
 different shapes; incomplete training and validation batches introduce more
 shapes. These searches add first-use latency, especially in short runs with
 small projections. Matching calls reuse the in-process winner. Set
 `TRITON_PRINT_AUTOTUNING=1` to inspect selected configurations. A bounded search
 does not guarantee the fastest possible kernel; measure on the target GPU.
+
+On Triton runtimes supporting `cache_results`, tuning timings and winners also
+persist in the native Triton cache. A launch adapter sets descriptor block shapes
+for benchmarks, cached calls and warmups, so normal configurations contain no
+`Config.pre_hook` that would disable Triton 3.9 result serialization. See the
+[native cache implementation](https://github.com/triton-lang/triton/blob/v3.9.0/python/triton/runtime/autotuner.py).
+The cache is invalidated by the kernel, target, environment, tuning key and
+pruned configurations. A new key still pays compilation and search costs;
+compiled-kernel caching alone is not tuning-result persistence.
 
 Compare source snapshots on the target GPU with the
 [classifier benchmark](../../benchmarks/benchmark_fp8_autotune.py):
@@ -824,6 +853,10 @@ python benchmarks/benchmark_fp8_autotune.py --scope scale --no-check-finite
 python benchmarks/benchmark_fp8_autotune.py --scope dequantize
 # Larger scale groups use chunked fusion rather than the unfused fallback.
 python benchmarks/benchmark_fp8_autotune.py --scope quantize --batches 1024 --input-features 1024 --output-features 1024 --scale-k 256 --no-check-finite
+# Actual ViT-B projection dimensions: 512 samples x 197 tokens, tensorwise.
+python benchmarks/benchmark_fp8_autotune.py --preset vit --scaling tensorwise --grad-format e4m3fn --implementation both --num-stages 3 --no-check-finite --iterations 10
+# Compare an explicit accumulation limit; check reported errors and training quality.
+python benchmarks/benchmark_fp8_autotune.py --preset vit --scaling tensorwise --grad-format e4m3fn --num-stages 3 --max-num-imprecise-acc 128 --no-check-finite --iterations 10 --reuse-cache
 ```
 
 By default it uses generated tensors for a `512 -> 10` CIFAR-10 classifier,
@@ -831,6 +864,23 @@ with batch sizes 2048, 848 (training tail), and 1808 (validation tail).
 `--input-features`, `--output-features`, and `--batches` select other projection
 shapes; `--scale-k` selects a power-of-two scale width from 32 through 1024 (default 32).
 The report records group sizes, stages, and split factors for winners and trials.
+`--scaling tensorwise` makes all operand block shapes `None`; the default
+`blockwise` recipe is unchanged. Independent `--activation-format`, `--weight-format`,
+and `--grad-format` select the actual operand formats (historical benchmark
+defaults are E4M3FN/E4M3FN/E5M2). `--implementation both` runs FP8 and BF16 in
+separate fresh processes. The ViT preset measures qkv, attention projection,
+fc1, fc2 and head projections, including their forward/dX/dW products; body
+rows equal `--batches` times `--tokens-per-sample` (default 197). It is not a
+whole-model or epoch benchmark. Defaults are 512 samples for ViT; classifier
+defaults remain 2048/848/1808.
+
+Accuracy reporting compares outputs and gradients with IEEE FP32 after timing
+and includes relative L2, maximum absolute, RMS and finite-value results.
+Use `--no-accuracy` only when those extra comparisons are unwanted. Candidate
+records also include wall time for compilation plus benchmarking, and the worker
+reports whether native tuning-result caching is enabled. These measurements
+separate cold searches from warmed execution; they do not attribute data loading
+or other epoch costs to autotuning.
 `--scope quantize`, `--scope scale`, and `--scope dequantize` report each operation's
 allocation/latency, operand shapes, and strides independently of GEMM.
 Dequantization prepares FP8 inputs outside the timed region. Finite checks are enabled by default;

@@ -62,8 +62,10 @@ def _partial_amax(x_ptr, partials_ptr, errors_ptr, M, N, STRIDE_M, STRIDE_N,
     scale_block = tl.program_id(0) // CHUNKS
     chunk = tl.program_id(0) % CHUNKS
     offsets = chunk * BLOCK + tl.arange(0, BLOCK)
+
     rows = (scale_block // NUM_COL_BLOCKS) * BLOCK_ROWS + offsets // BLOCK_COLS
     cols = (scale_block % NUM_COL_BLOCKS) * BLOCK_COLS + offsets % BLOCK_COLS
+
     if CONTIGUOUS and TENSORWISE:
         addresses = offsets
     elif CONTIGUOUS:
@@ -75,6 +77,7 @@ def _partial_amax(x_ptr, partials_ptr, errors_ptr, M, N, STRIDE_M, STRIDE_N,
     else:
         mask = (rows < M) & (cols < N) & (offsets < BLOCK_ROWS * BLOCK_COLS)
     values = tl.load(x_ptr + addresses, mask=mask, other=0.0).to(tl.float32)
+
     tl.store(partials_ptr + scale_block * CHUNKS + chunk, tl.max(tl.abs(values), axis=0))
     if CHECK_FINITE:
         bad = tl.max((~(tl.abs(values) < float("inf"))).to(tl.int32), axis=0)
@@ -235,3 +238,36 @@ def dequantize(values, inverse, block_shape):
             BLOCK_ROWS=bm, BLOCK_COLS=bn, TENSORWISE=block_shape is None,
             CONTIGUOUS=values.is_contiguous(), BLOCK=1024)
         return output
+
+
+@triton.jit
+def _cast_tensorwise_pair(x_ptr, normal_ptr, transpose_ptr, scale_ptr, M, N,
+                          STRIDE_M, STRIDE_N, PADDED_M: tl.constexpr, PADDED_N: tl.constexpr,
+                          N_TILES: tl.constexpr, FP8_MAX: tl.constexpr, BLOCK: tl.constexpr):
+    rows = (tl.program_id(0) // N_TILES) * BLOCK + tl.arange(0, BLOCK)
+    cols = (tl.program_id(0) % N_TILES) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(x_ptr + rows[:, None] * STRIDE_M + cols[None, :] * STRIDE_N,
+                     mask=(rows[:, None] < M) & (cols[None, :] < N), other=0.0).to(tl.float32)
+    scale = tl.load(scale_ptr)
+    values = tl.minimum(tl.maximum(values * scale, -FP8_MAX), FP8_MAX)
+    converted = values.to(normal_ptr.dtype.element_ty, fp_downcast_rounding="rtne")
+    tl.store(normal_ptr + rows[:, None] * PADDED_N + cols[None, :], converted,
+             mask=(rows[:, None] < M) & (cols[None, :] < PADDED_N))
+    tl.store(transpose_ptr + cols[:, None] * PADDED_M + rows[None, :], converted.T,
+             mask=(cols[:, None] < N) & (rows[None, :] < PADDED_M))
+
+
+def quantize_tensorwise_pair(x, fp8_dtype, check_finite):
+    """Emit both TMA-ready orientations without a later FP8 transpose/pack."""
+    with torch.cuda.device(x.device):
+        maximum = torch.finfo(fp8_dtype).max
+        scale, inverse = _run_scaling(x, maximum, None, check_finite)
+        m, n = x.shape
+        padded_m, padded_n = triton.cdiv(m, 16) * 16, triton.cdiv(n, 16) * 16
+        normal = torch.empty((m, padded_n), device=x.device, dtype=fp8_dtype)
+        transposed = torch.empty((n, padded_m), device=x.device, dtype=fp8_dtype)
+        tiles_n = triton.cdiv(n, 32)
+        _cast_tensorwise_pair[(triton.cdiv(m, 32) * tiles_n,)](
+            x, normal, transposed, scale, m, n, *x.stride(), PADDED_M=padded_m, PADDED_N=padded_n,
+            N_TILES=tiles_n, FP8_MAX=maximum, BLOCK=32, num_warps=4)
+        return normal[:, :n], inverse, transposed[:, :m]
