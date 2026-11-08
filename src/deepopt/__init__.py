@@ -7,12 +7,14 @@ __all__ = ["Trainer", "TrainingRuntime", "TrainingModule", "MultiOptimizer", "Fi
            "LossResult", "LossReport", "Checkpoint", "EveryNSteps",
            "initialize_distributed", "shutdown_distributed", "is_main_process", "DistributedContext", "TrainingCore", "DDPCore",
            "DiagnosticPolicy", "ExecutionMode", "CUDAGraphCore", "cuda_graph_core", "ScheduleController",
-           "autocast", "FP8Config", "ConfigError", "ExperimentConfig", "TrainingConfig", "RuntimeConfig", "CompileConfig",
+           "autocast", "FP8Config", "DelayedScalingConfig", "fp8_scaling_scope", "fp8_checkpoint", "ConfigError", "ExperimentConfig", "TrainingConfig", "RuntimeConfig", "CompileConfig",
            "load_config", "get_config", "reset_config", "config_from_dict", "load_preset", "list_presets",
            "load_config_template", "write_config_template"]
 
 _MODULES = {"Trainer": ".engine", "TrainingRuntime": ".engine",
             "autocast": ".opt._autocast", "FP8Config": ".config",
+            "DelayedScalingConfig": ".config", "fp8_scaling_scope": ".opt.scaling_strategy.delayed",
+            "fp8_checkpoint": ".opt.scaling_strategy.delayed",
             "ConfigError": ".config", "ExperimentConfig": ".config", "TrainingConfig": ".config",
             "RuntimeConfig": ".config", "CompileConfig": ".config",
             "load_config": ".config", "config_from_dict": ".config",

@@ -1,0 +1,132 @@
+"""Real CUDA coverage for fused delayed conversion and bias preprocessing."""
+
+from copy import deepcopy
+import unittest
+from unittest.mock import patch
+
+import torch
+from torch import nn
+
+from deepopt import FP8Config, DelayedScalingConfig, TrainingRuntime, DiagnosticPolicy, fp8_scaling_scope
+from deepopt.opt.policy import prepare_fp8_model
+from deepopt.opt.scaling_strategy.delayed import DelayedScalingState
+from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
+
+
+def state(device, dtype):
+    return DelayedScalingState({"history_length": 3},
+                                dict.fromkeys(("activation", "weight", "grad"), dtype), device=device)
+
+
+@unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
+class DelayedScalingCUDATests(unittest.TestCase):
+    def test_flat_chunk_reduction_preserves_nonfinite_and_activity_flags(self):
+        from deepopt.opt.backends.triton_delayed import reduce_observations
+        from deepopt.opt.backends._delayed_launch import MetadataCache
+
+        observations = [(0, torch.tensor([2.], device="cuda")),
+                        (0, torch.full((25001,), 7., device="cuda")),
+                        (1, torch.tensor([float("nan")], device="cuda")),
+                        (2, torch.tensor([float("inf")], device="cuda"))]
+        cache = MetadataCache()
+        for _ in range(2):
+            result = reduce_observations(observations, 4, torch.device("cuda", torch.cuda.current_device()), cache)
+            expected = torch.tensor([[7., 0., 0., 0.], [1., 1., 1., 0.], [0., 2., 1., 0.]], device="cuda")
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        self.assertEqual(cache.hits, 1)
+
+    def test_warmed_converter_allocates_only_selected_tile_scratch(self):
+        from deepopt.opt.backends import triton_delayed
+        from deepopt.opt.backends._delayed_launch import conversion_cache_key
+
+        source = torch.randn(129, 257, device="cuda")
+        scale = torch.ones(1, device="cuda")
+        options = dict(normal=True, transposed=True, bias=True, observe=True, check_finite=False)
+        triton_delayed.convert(source, scale, torch.float8_e4m3fn, **options)
+        key = conversion_cache_key(source, scale, torch.float8_e4m3fn, **options)
+        selected = triton_delayed._convert.cache[key]
+        _, _, _, observations, _ = triton_delayed.convert(source, scale, torch.float8_e4m3fn, **options)
+        bm, bn = (selected.kwargs[name] for name in ("BM", "BN"))
+        expected = ((129 + bm - 1) // bm) * ((257 + bn - 1) // bn) * 4
+        self.assertEqual(observations.untyped_storage().nbytes(), expected)
+
+    def test_conversion_payload_scale_snapshot_padding_and_bias_match_cpu(self):
+        for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            actual, expected = state("cuda", dtype), state("cpu", dtype)
+            for normal, transpose in ((True, True), (True, False), (False, True)):
+                source = torch.randn(65, 129).T
+                a, at, bias = actual.quantize(source.cuda(), "grad", normal=normal, transposed=transpose, bias=True)
+                b, bt, expected_bias = expected.quantize(source, "grad", normal=normal, transposed=transpose, bias=True)
+                for value, oracle in ((a, b), (at, bt)):
+                    if value is None:
+                        self.assertIsNone(oracle)
+                        continue
+                    torch.testing.assert_close(value.data.float().cpu(), oracle.data.float(), rtol=0, atol=0)
+                    torch.testing.assert_close(value.scale_inv.cpu(), oracle.scale_inv, rtol=1e-6, atol=0)
+                    rows, cols = value.data.shape
+                    stride = value.data.stride(0)
+                    padded = value.data.as_strided((rows, stride), (stride, 1))
+                    self.assertTrue(torch.all(padded[:, cols:].float() == 0))
+                torch.testing.assert_close(bias.cpu(), expected_bias, rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(actual.scales.cpu(), expected.scales)
+                torch.testing.assert_close(actual.history.cpu(), expected.history)
+
+    def test_ordered_bias_reduction_covers_many_row_tiles(self):
+        actual = state("cuda", torch.float8_e4m3fn)
+        value = torch.randn(17001, 65, device="cuda", dtype=torch.bfloat16)
+        _, _, bias = actual.quantize(value, "grad", normal=False, transposed=True, bias=True)
+        torch.testing.assert_close(bias, value.float().sum(0), rtol=2e-5, atol=.001)
+
+    def test_multiple_streams_keep_snapshots_and_live_outputs_owned(self):
+        actual = state("cuda", torch.float8_e4m3fn)
+        first, second = torch.cuda.Stream(), torch.cuda.Stream()
+        with fp8_scaling_scope():
+            with torch.cuda.stream(first):
+                a, _, _ = actual.quantize(torch.ones(65, 129, device="cuda"), "activation")
+            with torch.cuda.stream(second):
+                b, _, _ = actual.quantize(torch.full((65, 129), 8., device="cuda"), "activation")
+        torch.cuda.synchronize()
+        self.assertNotEqual(a.data.data_ptr(), b.data.data_ptr())
+        torch.testing.assert_close(a.data.float(), torch.ones_like(a.data, dtype=torch.float32))
+        torch.testing.assert_close(b.data.float(), torch.full_like(b.data, 8., dtype=torch.float32))
+        torch.testing.assert_close(a.scale_inv, torch.ones_like(a.scale_inv))
+        self.assertEqual(actual.updates.cpu().tolist(), [1, 0, 0])
+
+    def test_execution_mode_cadences_cover_delayed_forward_and_fused_backward(self):
+        from deepopt.opt.backends import triton_delayed
+        from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
+        from deepopt.opt.backends import gemm_nt
+
+        model = nn.Linear(65, 97, device="cuda")
+        options = FP8Config(enabled=True, backend="triton", scaling_recipe="delayed", intercept_linear=False,
+                            delayed_scaling=DelayedScalingConfig(history_length=3))
+        runtime = TrainingRuntime(model, torch.optim.SGD(model.parameters(), lr=.001), fp8=options,
+                                  diagnostics=DiagnosticPolicy(loss_finite_every=2, gradient_finite_every=3))
+        original = triton_delayed.convert
+        records, phase = [], None
+
+        def convert(*args, **kwargs):
+            records.append((runtime.mode_controller.completed_updates + 1, phase, kwargs["check_finite"]))
+            return original(*args, **kwargs)
+
+        def oracle(a, b, **kwargs):
+            return gemm_nt(a, b, **{**kwargs, "backend": "reference"})
+
+        with patch.object(triton_delayed, "convert", new=convert), patch.object(linear_autograd_func, "gemm_nt", new=oracle):
+            for update in range(6):
+                phase = "forward"
+                loss = runtime.compute(torch.randn(129, 65, device="cuda", requires_grad=update % 2 == 0),
+                                       lambda x: runtime.model(x).square().mean())
+                phase = "backward"
+                runtime.backward(loss)
+                runtime.step()
+        for update, phase, checked in records:
+            self.assertEqual(checked, update % (2 if phase == "forward" else 3) == 0)
+
+    def test_dtype_move_keeps_exact_fp32_metadata(self):
+        model = nn.Linear(65, 97, device="cuda")
+        model, _ = prepare_fp8_model(model, FP8Config(enabled=True, backend="triton", scaling_recipe="delayed"))
+        model.fp8_scaling.scales.fill_(1.1234567)
+        before = deepcopy(model.fp8_scaling.scales)
+        model.bfloat16()
+        torch.testing.assert_close(model.fp8_scaling.scales, before, rtol=0, atol=0)

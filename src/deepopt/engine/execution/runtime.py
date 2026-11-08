@@ -1,7 +1,7 @@
 """Optional execution helpers shared by automatic and user-owned loops."""
 
 import torch
-from contextlib import ContextDecorator, contextmanager
+from contextlib import ContextDecorator, contextmanager, nullcontext
 from contextvars import ContextVar
 from deepopt.distributed import _process as distributed_ops
 from deepopt.distributed.ddp import DDPCore
@@ -236,6 +236,9 @@ class TrainingRuntime:
                                "cuda_graph_core.capture_model before constructing the runtime")
 
     def _mark_failed(self) -> None:
+        from deepopt.opt.scaling_strategy.delayed import finish_runtime_scaling
+
+        finish_runtime_scaling(self, commit=False)
         self._failed = True
         self._forward_pending = self._pending_gradients = False
         parameters = self._stepper.parameters() if self._stepper is not None else self.model.parameters()
@@ -275,7 +278,12 @@ class TrainingRuntime:
         self._require_eager()
         if self.model.training and torch.is_grad_enabled():
             self._prepare_mode()
-        with self.diagnostic_scope("deepopt.compute"), self._precision.autocast() as context:
+        scaling = nullcontext()
+        if self.fp8.enabled and self.fp8.scaling_recipe == "delayed":
+            from deepopt.opt.scaling_strategy.delayed import runtime_scaling_scope
+
+            scaling = runtime_scaling_scope(self)
+        with scaling, self.diagnostic_scope("deepopt.compute"), self._precision.autocast() as context:
             yield context
 
     def compute(self, batch: Any, step: Callable[[Any], Result]) -> Result:
@@ -318,7 +326,13 @@ class TrainingRuntime:
             self._prepare_mode()
             with self.diagnostic_scope("deepopt.backward", phase="backward"):
                 self._observe("loss", loss, name="backward loss")
-                self.core.backward(loss, **kwargs)
+                if self.fp8.enabled and self.fp8.scaling_recipe == "delayed":
+                    from deepopt.opt.scaling_strategy.delayed import runtime_scaling_scope
+
+                    with runtime_scaling_scope(self):
+                        self.core.backward(loss, **kwargs)
+                else:
+                    self.core.backward(loss, **kwargs)
             self._forward_pending = bool(kwargs.get("retain_graph", False))
             self._pending_gradients = True
         except BaseException:
@@ -329,6 +343,10 @@ class TrainingRuntime:
         self._require_eager()
         if self.optimizer is None:
             raise RuntimeError("zero_grad requires an optimizer")
+        if getattr(self, "_delayed_window", None) is not None:
+            from deepopt.opt.scaling_strategy.delayed import finish_runtime_scaling
+
+            finish_runtime_scaling(self, commit=False)
         self.optimizer.zero_grad(set_to_none=True)
         self._forward_pending = self._pending_gradients = False
 
@@ -373,6 +391,10 @@ class TrainingRuntime:
             divisor = self.core.gradient_divisor(float(divisor), normalize=normalize, reduction=distributed_reduction)
             with self.diagnostic_scope("deepopt.step", phase="backward"):
                 self._stepper.step(divisor)
+            if getattr(self, "_delayed_window", None) is not None:
+                from deepopt.opt.scaling_strategy.delayed import finish_runtime_scaling
+
+                finish_runtime_scaling(self, commit=True)
             self._forward_pending = self._pending_gradients = False
             self.mode_controller.completed_updates += 1
         except BaseException:

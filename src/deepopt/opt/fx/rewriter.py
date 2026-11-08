@@ -46,8 +46,21 @@ def rewrite_graph(
                 kwargs["x"] = kwargs.pop("input")
             
             kwargs["plan"] = plan
+            if plan["fp8_training"].get("scaling_recipe", "current") == "delayed":
+                from ..do_nn.functional_module import DOFunctionalLinear
 
-            node.target = do_linear
+                parameter = next(graph_module.parameters(), None)
+                device = parameter.device if parameter is not None else "cpu"
+                name = f"_deepopt_fp8_call_{node.name}"
+                if hasattr(graph_module, name):
+                    raise ValueError(f"Reserved FP8 call-site name already exists: {name}")
+                adapter = DOFunctionalLinear(plan, device)
+                adapter.train(graph_module.training)
+                graph_module.add_submodule(name, adapter)
+                kwargs.pop("plan")
+                node.op, node.target = "call_module", name
+            else:
+                node.target = do_linear
             node.kwargs = kwargs
 
     graph_module.recompile()

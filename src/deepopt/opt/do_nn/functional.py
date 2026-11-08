@@ -1,9 +1,12 @@
 import torch
+from contextlib import nullcontext
 from torch.nn import functional as F
 
 from .._autocast import _get_fp8_plan, _suspend_fp8_interception
 from ..scaling_strategy.amax import AmaxScaling
 from .AOTAutograd_Func.linear_autograd_func import _DOLinearFunction
+from deepopt.config import delayed_scaling_config_from_dict
+from dataclasses import asdict
 
 _FLOAT_DTYPES = (
     torch.float32,
@@ -43,7 +46,12 @@ class _FrozenPlan(dict):
 
 
 class _ValidatedFP8Plan(_FrozenPlan):
-    pass
+    def __init__(self, values):
+        super().__init__(values)
+        training = self["fp8_training"]
+        self.delayed_signature = (tuple(training["fp8_dtypes"][role] for role in _OPERANDS),
+                                  tuple(training["delayed_scaling"][name] for name in
+                                        ("history_length", "amax_algorithm", "margin", "reduce_amax")))
 
 
 def _prepare_fp8_plan(plan):
@@ -73,7 +81,7 @@ def validate_fp8_plan(plan: dict) -> dict:
         "fp8_dtypes",
         "backend",
         "num_stages",
-        "out_dtype"
+        "out_dtype", "scaling_recipe", "delayed_scaling"
     }
 
     if "fp8_dtypes" not in training:
@@ -121,6 +129,12 @@ def validate_fp8_plan(plan: dict) -> dict:
         raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
 
     out_dtype = training.get("out_dtype")
+    recipe = training.get("scaling_recipe", "current")
+    if recipe not in ("current", "delayed"):
+        raise ValueError("scaling_recipe must be current or delayed")
+    delayed = delayed_scaling_config_from_dict(training.get("delayed_scaling", {}))
+    if recipe == "delayed" and any(shape is not None for shape in block_shapes.values()):
+        raise ValueError("Delayed scaling requires tensorwise block_shapes")
     if out_dtype is not None:
         if (not isinstance(out_dtype, torch.dtype) or out_dtype not in _FLOAT_DTYPES):
             raise ValueError(
@@ -133,6 +147,8 @@ def validate_fp8_plan(plan: dict) -> dict:
             "backend": backend,
             "num_stages": num_stages,
             "out_dtype": out_dtype,
+            "scaling_recipe": recipe,
+            "delayed_scaling": asdict(delayed),
         },
         "block_shapes": dict(block_shapes),
     }
@@ -144,7 +160,7 @@ def validate_fp8_plan(plan: dict) -> dict:
 def do_linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
     *,
-    plan: dict, _weight_cache=None,
+    plan: dict, _weight_cache=None, _scaling_state=None, _state_training=True,
 ) -> torch.Tensor:
     """Run FP8 projection/autograd eagerly inside an otherwise compiled model.
 
@@ -155,10 +171,11 @@ def do_linear(
     """
 
     with _suspend_fp8_interception():
-        return _do_linear(x, weight, bias, plan=plan, weight_cache=_weight_cache)
+        return _do_linear(x, weight, bias, plan=plan, weight_cache=_weight_cache,
+                          scaling_state=_scaling_state, state_training=_state_training)
 
 
-def _do_linear(x, weight, bias, *, plan, weight_cache):
+def _do_linear(x, weight, bias, *, plan, weight_cache, scaling_state=None, state_training=True):
     active_plan = _get_fp8_plan(x.device.type) if isinstance(x, torch.Tensor) else None
     if active_plan is False:
         return F.linear(x, weight, bias)
@@ -210,9 +227,22 @@ def _do_linear(x, weight, bias, *, plan, weight_cache):
         else:
             out_dtype = x.dtype
     
-    return _DOLinearFunction.apply(
-        x, weight, bias,
-        checked_plan, out_dtype,
-        torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors.values()),
-        weight_cache,
-    )
+    if training["scaling_recipe"] == "delayed":
+        if scaling_state is None:
+            raise ValueError("Delayed scaling requires a prepared adapter or registered FX call site; bare F.linear is stateless")
+        if scaling_state.recipe_signature != checked_plan.delayed_signature:
+            raise ValueError("Delayed-scaling state does not match the active recipe; prepare a matching adapter")
+    else:
+        scaling_state = None
+    scope = nullcontext()
+    if scaling_state is not None:
+        from ..scaling_strategy.delayed import fp8_scaling_scope
+
+        scope = fp8_scaling_scope()
+    with scope:
+        return _DOLinearFunction.apply(
+            x, weight, bias,
+            checked_plan, out_dtype,
+            torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors.values()),
+            weight_cache, scaling_state, state_training and torch.is_grad_enabled(),
+        )

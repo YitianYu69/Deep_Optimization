@@ -43,6 +43,7 @@ class DOHFConv1D(CachedWeightModule):
             raise ValueError("Conv1D nf must match the weight's output dimension")
 
         self.plan = _prepare_fp8_plan(plan)
+        self.configure_delayed_scaling(self.plan, weight.device)
 
         self.nx = weight.shape[0]
         self.nf = original.nf
@@ -73,6 +74,7 @@ class DOHFConv1D(CachedWeightModule):
         return do_linear(
             x, self.weight.transpose(0, 1), self.bias,
             plan=self.plan, _weight_cache=self._fp8_weight_cache,
+            _scaling_state=self.fp8_scaling, _state_training=self.training,
         )
 
     def extra_repr(self) -> str:

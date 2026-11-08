@@ -72,9 +72,20 @@ class DDPCore:
             self.model, self.fp8, self.transformation_report = prepare_execution_model(
                 model, self._config_snapshot, self.fp8)
         model = self.model
+        self._delayed_states = ()
+        if self.fp8.enabled and self.fp8.scaling_recipe == "delayed":
+            from deepopt.opt.scaling_strategy.delayed import delayed_states
+
+            self._delayed_states = delayed_states(model)
         if any(parameter.requires_grad for parameter in model.parameters()):
+            owner = _StepModule(model)
+            if self._delayed_states:
+                ignored = {f"model.{name}.{buffer}".replace("model..", "model.")
+                           for name, module in model.named_modules() if module in self._delayed_states
+                           for buffer in module._buffers}
+                owner._ddp_params_and_buffers_to_ignore = ignored
             self.wrapper = DistributedDataParallel(
-                _StepModule(model), device_ids=[self.device.index] if self.device.type == "cuda" else None,
+                owner, device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 **self.options)
         if self.fp8.enabled:
             from deepopt.opt.do_nn._cached_weights import CachedWeightModule
@@ -84,6 +95,13 @@ class DDPCore:
             for module in model.modules():
                 if isinstance(module, CachedWeightModule):
                     module.clear_fp8_cache()
+            if self._delayed_states and self.fp8.delayed_scaling.reduce_amax:
+                # Initial numerical state follows the same rank-zero ownership
+                # as parameters; per-forward DDP buffer broadcasts exclude it.
+                for state in self._delayed_states:
+                    state.ordered()
+                    for buffer in state.buffers():
+                        torch.distributed.broadcast(buffer, src=0)
         if not self.validation_sync_buffers:
             self.options["validation_sync_buffers"] = False
         self._config_snapshot.setdefault("runtime", {})["fp8"] = asdict(self.fp8)
@@ -99,7 +117,11 @@ class DDPCore:
     def compute(self, batch, step):
         with self._fp8_scope.enter():
             if self.wrapper is not None and self.model.training and torch.is_grad_enabled():
-                result = self.wrapper(batch, step)
+                from deepopt.opt.scaling_strategy.delayed import fp8_scaling_scope
+
+                scope = fp8_scaling_scope(states=self._delayed_states) if self._delayed_states else nullcontext()
+                with scope:
+                    result = self.wrapper(batch, step)
                 self.forward_pending = True
                 return result
             # Validation can have unequal or empty shards: no per-forward collective.
@@ -168,7 +190,10 @@ class DDPCore:
     def sync_buffers(self):
         if not self.validation_sync_buffers:
             return
+        ignored = {id(buffer) for module in self._delayed_states for buffer in module.buffers()}
         for buffer in self.model.buffers():
+            if id(buffer) in ignored:
+                continue
             torch.distributed.broadcast(buffer, src=0)
 
     def check_errors(self, operation):

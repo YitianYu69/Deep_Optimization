@@ -19,6 +19,8 @@ class _DOLinearFunction(Function):
         out_dtype: torch.dtype,
         backward_enabled: bool,
         weight_cache,
+        scaling_state=None,
+        state_training=True,
     ):
         fp8_trainig_plan = plan["fp8_training"]
         fp8_dtypes = fp8_trainig_plan["fp8_dtypes"]
@@ -28,21 +30,34 @@ class _DOLinearFunction(Function):
 
         x_matrix = x.reshape(-1, weight.shape[1])
         need_dx, need_dw = ctx.needs_input_grad[:2]
-        paired_layouts = backward_enabled and backend == "triton" and x.device.type == "cuda"
-        paired_x = paired_layouts and need_dw and block_shapes["activation"] is None and x_matrix.numel() > 4096
-        paired_w = paired_layouts and need_dx and block_shapes["weight"] is None and weight.numel() > 4096
-        if paired_x:
+        delayed = scaling_state is not None
+        paired_layouts = backward_enabled and (delayed or (backend == "triton" and x.device.type == "cuda"))
+        paired_x = paired_layouts and need_dw and block_shapes["activation"] is None and (delayed or x_matrix.numel() > 4096)
+        paired_w = paired_layouts and need_dx and block_shapes["weight"] is None and (delayed or weight.numel() > 4096)
+        if delayed:
+            qx, qx_transposed, _ = scaling_state.quantize(x_matrix, "activation", transposed=paired_x, training=state_training)
+        elif paired_x:
             qx, qx_transposed = _quantize_tensorwise_pair(x_matrix, fp8_dtype=fp8_dtypes["activation"])
         else:
             qx = quantize_fp8(x_matrix, fp8_dtype=fp8_dtypes["activation"], block_shape=block_shapes["activation"])
         weight_quantizer = _quantize_tensorwise_pair if paired_w else quantize_fp8
+        if delayed:
+            def weight_quantizer(value, **kwargs):
+                normal, transposed, _ = scaling_state.quantize(value, "weight", transposed=paired_w, training=state_training)
+                return (normal, transposed) if paired_w else normal
+
+            from ...scaling_strategy.delayed import checkpoint_recomputing
+
+            if checkpoint_recomputing():
+                weight_cache = None
         if weight_cache is None:
             quantized_weight = weight_quantizer(weight, fp8_dtype=fp8_dtypes["weight"],
                                                 block_shape=block_shapes["weight"])
         else:
             quantized_weight = weight_cache.quantize(weight, fp8_dtype=fp8_dtypes["weight"],
                                                      block_shape=block_shapes["weight"], quantizer=weight_quantizer,
-                                                     paired=paired_w)
+                                                     paired=paired_w,
+                                                     recipe=(scaling_state.cache_token, state_training) if delayed else None)
         qw, qw_transposed = quantized_weight if paired_w else (quantized_weight, None)
 
         output = gemm_nt(qx, qw, backend=backend, bias=bias, out_dtype=out_dtype, num_stages=num_stages)
@@ -88,6 +103,7 @@ class _DOLinearFunction(Function):
         ctx.save_qx_transpose = save_qx_transpose or paired_x
         ctx.weight_transposed = paired_w
         ctx.check_finite = backward_finite_check_policy()
+        ctx.scaling_state, ctx.state_training = scaling_state, state_training
 
         return output.reshape(*x.shape[:-1], weight.shape[0])
 
@@ -103,9 +119,14 @@ class _DOLinearFunction(Function):
         dw = None
         db = None
         if need_dx or need_dw:
-            paired_g = (need_dw and ctx.backend == "triton" and grad_matrix.device.type == "cuda"
+            delayed = ctx.scaling_state is not None
+            paired_g = delayed and need_dw or (need_dw and ctx.backend == "triton" and grad_matrix.device.type == "cuda"
                         and ctx.block_shapes["grad"] is None and grad_matrix.numel() > 4096)
-            if paired_g and need_dx:
+            if delayed:
+                qg, qg_transposed, db = ctx.scaling_state.quantize(
+                    grad_matrix, "grad", normal=need_dx, transposed=need_dw, bias=need_db,
+                    training=ctx.state_training, check_finite=ctx.check_finite)
+            elif paired_g and need_dx:
                 qg, qg_transposed = _quantize_tensorwise_pair(
                     grad_matrix, fp8_dtype=ctx.fp8_dtypes["grad"], check_finite=ctx.check_finite)
             elif paired_g:
@@ -157,7 +178,9 @@ class _DOLinearFunction(Function):
                     num_stages=ctx.num_stages,
                 )
         
-        if need_db:
+        if need_db and db is None:
             db = grad_matrix.sum(dim=0, dtype=torch.float32).to(dtype=ctx.bias_dtype)
+        elif need_db:
+            db = db.to(dtype=ctx.bias_dtype)
         
-        return dx, dw, db, None, None, None, None
+        return dx, dw, db, None, None, None, None, None, None

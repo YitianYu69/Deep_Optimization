@@ -78,6 +78,10 @@ class CapturedCallable:
             raise ValueError("Autograd capture cannot run under inference_mode; use autograd=False")
         model = function if isinstance(function, nn.Module) else None
         modules = tuple(model.modules()) if model is not None else ()
+        from deepopt.opt.scaling_strategy.delayed import DelayedScalingState
+
+        if any(isinstance(module, DelayedScalingState) for module in modules):
+            raise ValueError("Delayed scaling requires eager preprocessing; full training CUDA capture is unsupported")
         if any(isinstance(m, nn.parallel.DistributedDataParallel) for m in modules):
             raise ValueError("Capture the model before constructing DDPCore or DistributedDataParallel")
         if any(getattr(m.forward, "_deepopt_cuda_capture", False) for m in modules):

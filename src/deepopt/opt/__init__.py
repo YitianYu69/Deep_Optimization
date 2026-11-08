@@ -8,11 +8,15 @@ __all__ = [
     "default_registry",
     "autocast",
     "FP8Config",
+    "DelayedScalingConfig", "fp8_scaling_scope", "fp8_checkpoint",
 ]
 
 _EXPORTS = {
     "autocast": "._autocast",
     "FP8Config": "..config",
+    "DelayedScalingConfig": "..config",
+    "fp8_scaling_scope": ".scaling_strategy.delayed",
+    "fp8_checkpoint": ".scaling_strategy.delayed",
     "transform_model": ".transform",
     "TransformReport": ".transform",
     "TransformationTraceError": ".transform",
