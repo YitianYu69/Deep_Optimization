@@ -53,9 +53,10 @@ MAX_BLOCK_N = max(tile[1] for tile in AUTOTUNE_TILES)
 MAX_BLOCK_K = max(tile[2] for tile in AUTOTUNE_TILES)
 
 # Descriptors have no .dtype; their FP8 formats must be explicit cache keys.
+# Persist format labels, not tl.dtype objects, because Triton JSON-encodes keys.
 # PIPELINE_STAGES=0 means automatic; NUM_STAGES is the candidate's loop depth.
 AUTOTUNE_KEY = (
-    "M", "N", "K", "A_FP8_FORMAT", "B_FP8_FORMAT", "OUTPUT_DTYPE",
+    "M", "N", "K", "A_FP8_FORMAT", "B_FP8_FORMAT", "OUTPUT_FORMAT",
     "A_BLOCK_ROWS", "A_BLOCK_COLS", "B_BLOCK_ROWS", "B_BLOCK_COLS",
     "A_SCALE_COLS", "B_SCALE_COLS", "TENSORWISE", "NATIVE_FP8", "HAS_BIAS",
     "PIPELINE_STAGES", "DEVICE_INDEX", "DEVICE_CAPABILITY", "NUM_SMS",

@@ -276,16 +276,13 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
                     torch.testing.assert_close(actual.scale_inv.cpu(), expected.scale_inv, rtol=1e-5, atol=1e-7)
 
     def _cache_entry(self, kernel, a, b, out_dtype, stages, has_bias):
-        import triton.language as tl
-
         m, k = a.data.shape
         n = b.data.shape[0]
         capability = torch.cuda.get_device_capability(a.data.device)
         expected = {
             "M": m, "N": n, "K": k,
             "A_FP8_FORMAT": str(a.data.dtype), "B_FP8_FORMAT": str(b.data.dtype),
-            "OUTPUT_DTYPE": {torch.float32: tl.float32, torch.float16: tl.float16,
-                             torch.bfloat16: tl.bfloat16}[out_dtype],
+            "OUTPUT_FORMAT": str(out_dtype),
             "A_BLOCK_ROWS": a.block_shape[0], "A_BLOCK_COLS": a.block_shape[1],
             "B_BLOCK_ROWS": b.block_shape[0], "B_BLOCK_COLS": b.block_shape[1],
             "A_SCALE_COLS": a.scale_inv.shape[1], "B_SCALE_COLS": b.scale_inv.shape[1],
