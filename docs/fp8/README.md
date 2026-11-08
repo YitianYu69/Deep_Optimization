@@ -1165,6 +1165,11 @@ operator. For macOS or CUDA, use the corresponding matching pair from the
 The CPU CI job installs both wheels from the CPU index and executes real NMS
 before running the test groups.
 
+CPU CI also installs Triton and checks language attributes referenced inside
+the kernel bodies, which Python imports and compileall do not resolve. This
+check needs no GPU and catches missing APIs before a CUDA launch. It does not
+replace compilation and numerical validation on real hardware.
+
 The tiny randomly initialized real architectures are torchvision ViT, timm ViT,
 HF GPT-2, and HF Llama. Black-box tests compare outputs/gradients against dense or
 independently quantized references, perform optimizer updates, and verify exact
