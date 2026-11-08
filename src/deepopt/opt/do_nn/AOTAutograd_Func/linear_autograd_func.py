@@ -46,8 +46,9 @@ class _DOLinearFunction(Function):
                 normal, transposed, _ = scaling_state.quantize(value, "weight", transposed=paired_w, training=state_training)
                 return (normal, transposed) if paired_w else normal
 
-            from ...scaling_strategy.delayed import checkpoint_recomputing
+            from ...scaling_strategy.delayed import checkpoint_recomputing, current_scaling_batch
 
+            ctx.scaling_batch = current_scaling_batch()
             if checkpoint_recomputing():
                 weight_cache = None
         if weight_cache is None:
@@ -110,6 +111,17 @@ class _DOLinearFunction(Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
+        if ctx.scaling_state is None:
+            return _DOLinearFunction._backward(ctx, grad_output)
+        from ...scaling_strategy.delayed import autograd_scaling_scope
+
+        # CUDA autograd workers do not inherit Python ContextVars. Restore the
+        # forward's owner before reading saved tensors (which may recompute).
+        with autograd_scaling_scope(ctx.scaling_batch):
+            return _DOLinearFunction._backward(ctx, grad_output)
+
+    @staticmethod
+    def _backward(ctx, grad_output):
         need_dx, need_dw, need_db = ctx.needs_input_grad[:3]
         x_data, x_scale_inv, w_data, w_scale_inv = ctx.saved_tensors
 

@@ -74,6 +74,10 @@ its FP8 outputs, scratch and two-scalar scale/inverse-scale snapshot. Backward
 saves the immutable inverse scale used for its operands, never a mutable scale
 buffer. Streams sharing an owner are ordered; overlapping independent update
 boundaries cannot mutate the same projection concurrently.
+Autograd saves the forward boundary's identity and restores it on backward
+worker threads, including before activation-checkpoint recomputation. This
+does not rely on Python context variables propagating to CUDA workers. A
+finished or aborted forward boundary is never reopened by a later backward.
 
 ## Conversion, backward and recomputation
 

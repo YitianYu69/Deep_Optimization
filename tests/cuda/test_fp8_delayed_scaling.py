@@ -7,9 +7,9 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from deepopt import FP8Config, DelayedScalingConfig, TrainingRuntime, DiagnosticPolicy, fp8_scaling_scope
+from deepopt import FP8Config, DelayedScalingConfig, TrainingRuntime, DiagnosticPolicy, fp8_scaling_scope, fp8_checkpoint
 from deepopt.opt.policy import prepare_fp8_model
-from deepopt.opt.scaling_strategy.delayed import DelayedScalingState
+from deepopt.opt.scaling_strategy.delayed import DelayedScalingState, delayed_states
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 
 
@@ -20,6 +20,36 @@ def state(device, dtype):
 
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
 class DelayedScalingCUDATests(unittest.TestCase):
+    def test_real_autograd_workers_keep_one_window_across_accumulation_and_checkpointing(self):
+        options = FP8Config(enabled=True, backend="triton", scaling_recipe="delayed", intercept_linear=False,
+                            delayed_scaling=DelayedScalingConfig(history_length=3))
+        for mode in ("max_speed", "balanced", "analyze"):
+            for checkpointed in (False, True):
+                with self.subTest(mode=mode, checkpointed=checkpointed):
+                    model = nn.Sequential(nn.Linear(65, 97), nn.GELU(), nn.Linear(97, 33)).cuda()
+                    runtime = TrainingRuntime(model, torch.optim.SGD(model.parameters(), lr=.001), fp8=options,
+                                              precision="bf16", execution_mode=mode)
+                    states = delayed_states(runtime.model)
+
+                    def compute(x):
+                        value = fp8_checkpoint(runtime.model, x) if checkpointed else runtime.model(x)
+                        return value.float().square().mean()
+
+                    for update in range(2):
+                        scales = [state.scales.clone() for state in states]
+                        for _ in range(2):
+                            loss = runtime.compute(torch.randn(2, 17, 65, device="cuda", requires_grad=True), compute)
+                            runtime.backward(loss)
+                            for state, original in zip(states, scales):
+                                self.assertEqual(state.updates.cpu().tolist(), [update] * 3)
+                                torch.testing.assert_close(state.scales, original, rtol=0, atol=0)
+                        runtime.step()
+                        for state in states:
+                            self.assertEqual(state.updates.cpu().tolist(), [update + 1] * 3)
+                        for parameter in runtime.model.parameters():
+                            self.assertTrue(torch.isfinite(parameter).all())
+                        runtime.zero_grad()
+
     def test_unchecked_nonfinite_conversion_preserves_payload_and_previous_scale(self):
         for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             for nonfinite in (float("nan"), float("inf"), -float("inf")):
