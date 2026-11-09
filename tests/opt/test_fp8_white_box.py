@@ -127,7 +127,7 @@ class FP8AutogradWhiteBoxTests(unittest.TestCase):
                     self.assertNotEqual(tensor.data_ptr(), weight.data_ptr())
                 result.sum().backward()
 
-    def test_backward_dispatch_uses_transposed_quantized_operands_and_original_dtypes(self):
+    def test_backward_dispatch_uses_transposed_operands_and_forward_precision_for_dw(self):
         plan = _plan((2, 3))
         x = torch.randn(5, 7, dtype=torch.bfloat16, requires_grad=True)
         weight = torch.randn(4, 7, requires_grad=True)
@@ -142,7 +142,7 @@ class FP8AutogradWhiteBoxTests(unittest.TestCase):
         self.assertEqual(dw.args[1].block_shape, (3, 2))
         self.assertEqual(dx.args[0].data.dtype, torch.float8_e5m2)
         self.assertEqual(dx.kwargs["out_dtype"], torch.bfloat16)
-        self.assertEqual(dw.kwargs["out_dtype"], torch.float32)
+        self.assertEqual(dw.kwargs["out_dtype"], torch.bfloat16)
         self.assertNotIn("bias", dx.kwargs)
         self.assertNotIn("bias", dw.kwargs)
 
@@ -155,6 +155,39 @@ class FP8AutogradWhiteBoxTests(unittest.TestCase):
         dispatch.assert_not_called()
         quantizer.assert_not_called()
         torch.testing.assert_close(bias.grad, torch.full((4,), 5.))
+
+    def test_bf16_dw_rounds_before_fp32_accumulation_and_optimizer_updates(self):
+        from deepopt import FP8Config, fp8_scaling_scope
+        from deepopt.opt.policy import prepare_fp8_model
+
+        for recipe, input_grad in product(("current", "delayed"), (False, True)):
+            with self.subTest(recipe=recipe, input_grad=input_grad):
+                original = nn.Linear(7, 4)
+                optimizer = torch.optim.SGD(original.parameters(), lr=.125)
+                model, _ = prepare_fp8_model(original, FP8Config(enabled=True, scaling_recipe=recipe))
+                before = original.weight.detach().clone()
+                expected = torch.zeros_like(original.weight)
+                with fp8_scaling_scope():
+                    for _ in range(2):
+                        x = torch.randn(13, 7, requires_grad=input_grad)
+                        with torch.autocast("cpu", dtype=torch.bfloat16):
+                            output = model(x)
+                        self.assertEqual(output.dtype, torch.bfloat16)
+                        with patch.object(linear_autograd_func, "gemm_nt", wraps=gemm_nt) as dispatch:
+                            output.backward(torch.randn_like(output))
+                        dw = dispatch.call_args_list[-1]
+                        self.assertEqual(dw.kwargs["out_dtype"], torch.bfloat16)
+                        unrounded = gemm_nt(*dw.args, backend="reference", out_dtype=torch.float32)
+                        rounded = unrounded.to(torch.bfloat16).float()
+                        self.assertFalse(torch.equal(unrounded, rounded))
+                        expected.add_(rounded)
+                        self.assertIs(model.weight, original.weight)
+                        self.assertEqual(original.weight.grad.dtype, torch.float32)
+                        torch.testing.assert_close(original.weight.grad, expected, rtol=0, atol=0)
+                        if input_grad:
+                            self.assertEqual(x.grad.dtype, torch.float32)
+                optimizer.step()
+                torch.testing.assert_close(original.weight, before.add(expected, alpha=-.125), rtol=0, atol=0)
 
     def test_rowwise_backward_operands_keep_native_fp8_reduction_grids(self):
         for gradient_block in ((1, 32), (32, 32)):

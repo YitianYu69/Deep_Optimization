@@ -94,7 +94,9 @@ class _DOLinearFunction(Function):
 
         ctx.input_shape = x.shape
         ctx.input_dtype = x.dtype
-        ctx.weight_dtype = weight.dtype
+        # Match the projection's compute precision. Autograd promotes dW when
+        # accumulating into an FP32 master parameter's gradient.
+        ctx.weight_grad_dtype = out_dtype
         ctx.bias_dtype = bias.dtype if bias is not None else None
         ctx.out_features = weight.shape[0]
         ctx.fp8_dtypes = dict(fp8_dtypes)
@@ -187,7 +189,7 @@ class _DOLinearFunction(Function):
                     qg if needs_qg_special_transpose or paired_g else qg.transpose(contiguous=False),
                     qx if ctx.save_qx_transpose else qx.transpose(contiguous=False),
                     backend=ctx.backward_backend,
-                    out_dtype=ctx.weight_dtype,
+                    out_dtype=ctx.weight_grad_dtype,
                     num_stages=ctx.num_stages,
                 )
         

@@ -32,13 +32,14 @@ class NativeBackwardTests(unittest.TestCase):
             self.assertEqual(fp8_config_from_dict(asdict(value)), value)
             self.assertEqual(fp8_plan(value)["fp8_training"]["backward_backend"], backend)
             recipe = fp8_recipe("triton", value)
-            self.assertEqual(recipe["version"], 4)
+            self.assertEqual(recipe["version"], 5)
+            self.assertEqual(recipe["weight_gradient_output"], "forward-dtype")
             self.assertEqual(recipe["backward_backend"], backend)
             self.assertIn("torch_version", recipe)
             self.assertEqual(recipe["backward_fallback"], "triton-unsupported-layout")
         self.assertNotEqual(fp8_recipe("triton", FP8Config(backend="triton", backward_backend="native_fast")),
                             fp8_recipe("triton", FP8Config(backend="triton", backward_backend="native_precise")))
-        self.assertEqual(fp8_recipe("reference", FP8Config())["version"], 2)
+        self.assertEqual(fp8_recipe("reference", FP8Config())["version"], 5)
         for options in ({"backward_backend": "unknown"}, {"backward_backend": "native_fast"},
                         {"backend": "triton", "backward_backend": "native_precise", "block_shapes": {"grad": [1, 32]}}):
             with self.subTest(options=options), self.assertRaises(ConfigError):
@@ -105,14 +106,17 @@ class NativeBackwardTests(unittest.TestCase):
 
                         return oracle(a, b, out_dtype=kwargs["out_dtype"], bias=kwargs.get("bias"))
 
-                    with patch.object(linear_autograd_func, "gemm_nt", new=gemm):
-                        # Exercise the autograd boundary with actual CPU tensor
-                        # math. The public native backend still rejects CPU.
-                        value = linear_autograd_func._DOLinearFunction.apply(
-                            torch.randn(16, 32, requires_grad=True), model.weight, model.bias,
-                            model.plan, torch.float32, True, None, model.fp8_scaling, True)
-                        value.sum().backward()
-                    self.assertEqual(records, [("triton", torch.float32), (backend, torch.float32), (backend, torch.float32)])
+                    for out_dtype in (torch.float32, torch.bfloat16, torch.float16):
+                        records.clear()
+                        with patch.object(linear_autograd_func, "gemm_nt", new=gemm):
+                            # Real CPU autograd with an oracle GEMM; the public
+                            # native executor still requires NVIDIA CUDA.
+                            value = linear_autograd_func._DOLinearFunction.apply(
+                                torch.randn(16, 32, requires_grad=True), model.weight, model.bias,
+                                model.plan, out_dtype, True, None, model.fp8_scaling, True)
+                            value.sum().backward()
+                        self.assertEqual(records, [("triton", out_dtype), (backend, torch.float32), (backend, out_dtype)])
+                        self.assertEqual(weight.grad.dtype, torch.float32)
                     self.assertIs(model.weight, weight)
                     self.assertEqual(weight.dtype, torch.float32)
 

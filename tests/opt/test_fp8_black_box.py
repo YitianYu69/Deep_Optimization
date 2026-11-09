@@ -138,6 +138,8 @@ class FP8LinearBlackBoxTests(unittest.TestCase):
     def test_output_dtype_and_original_gradient_dtypes(self):
         for input_dtype, weight_dtype, bias_dtype, output_dtype in (
             (torch.float32, torch.bfloat16, torch.float16, torch.float32),
+            (torch.float32, torch.float32, torch.float32, torch.bfloat16),
+            (torch.float32, torch.float32, torch.float32, torch.float16),
             (torch.bfloat16, torch.float32, torch.float32, torch.bfloat16),
             (torch.float16, torch.float32, torch.bfloat16, torch.float16),
         ):
@@ -155,7 +157,7 @@ class FP8LinearBlackBoxTests(unittest.TestCase):
                 self.assertEqual(output.dtype, output_dtype)
                 torch.testing.assert_close(output, (qx @ qw.T + bias.float()).to(output_dtype))
                 torch.testing.assert_close(x.grad, (qg @ qw).to(input_dtype))
-                torch.testing.assert_close(weight.grad, (qg.T @ qx).to(weight_dtype))
+                torch.testing.assert_close(weight.grad, (qg.T @ qx).to(output_dtype).to(weight_dtype))
                 torch.testing.assert_close(bias.grad, grad.float().sum(0).to(bias_dtype))
 
     def test_autocast_controls_output_but_keeps_float32_accumulation(self):

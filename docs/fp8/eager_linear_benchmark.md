@@ -76,9 +76,12 @@ added to GPU time; Python cProfile does not cover all autograd worker threads.
 
 ## Reading the two math policies
 
-`amp` measures the normal BF16 AMP behavior of each library. DeepOpt can produce
-FP32 internal gradients where TorchAO produces BF16 before converting external
-parameter gradients to FP32. These differences are exposed in `gemm_calls`.
+`amp` measures the normal BF16 AMP behavior of each library. With numerical
+recipe version 5, DeepOpt emits BF16 dW directly from the GEMM and autograd
+accumulates it into the original FP32 parameters' gradients. dX retains the
+original input dtype, which can still be FP32 where TorchAO uses BF16 internally.
+Older DeepOpt builds emitted FP32 dW for FP32 parameters. Actual installed-build
+dtypes are exposed in `gemm_calls`; the benchmark does not override that policy.
 
 `matched-fp32` disables AMP inside each **FP8** projection, supplies FP32 inputs,
 uses FP32 internal GEMM outputs, and applies the same external FP32 bias addition
@@ -111,7 +114,9 @@ python benchmarks/benchmark_fp8_linear_compare.py \
 
 `native_precise` instead requests `torch._scaled_mm(use_fast_accum=False)`.
 Both options keep forward on Triton, preserve the prepared FP8 operands and
-inverse scales, and retain the original dX/dW output dtypes and FP32 parameters.
+inverse scales, and use the same dX/dW output policy and FP32 parameters as the
+inherited backend. dX uses the original input dtype; dW follows the forward GEMM
+output dtype. BF16 AMP therefore requests BF16 dW on both Triton and native.
 They change accumulation and rounding; matching output dtypes does not establish
 numerical equivalence or convergence. Version 2 reports record requested and
 actual backends, fallback reasons, accumulation flags, numerical recipe identity,
