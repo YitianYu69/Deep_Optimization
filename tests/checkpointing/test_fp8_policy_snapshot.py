@@ -35,7 +35,7 @@ class FP8PolicySnapshotTests(unittest.TestCase):
         policy = FP8Config(enabled=True, intercept_linear=False, exclude_modules=("0",))
         original = make_trainer(policy)
         payload = _checkpoint_payload(original, {}, generators={}, history=[])
-        self.assertEqual(payload["trainer_settings"]["fp8_recipe"]["version"], 4)
+        self.assertEqual(payload["trainer_settings"]["fp8_recipe"]["version"], 5)
         restored = make_trainer(policy)
         restore_checkpoint(payload, restored, payload["config"], generators={}, batch_size_mode="manual")
         conflicting = make_trainer(replace(policy, exclude_modules=()))
@@ -158,8 +158,11 @@ class FP8PolicySnapshotTests(unittest.TestCase):
         trainer = make_trainer()
         original = _checkpoint_payload(trainer, {}, generators={}, history=[])
         self.assertEqual(original["trainer_settings"]["fp8_recipe"],
-                         {"version": 2, "accumulation": "reference-fp32", "triton_version": None})
-        for recipe in (None, {"version": 1}, {"version": 2, "accumulation": "triton-native", "triton_version": "old"}):
+                         {"version": 5, "accumulation": "reference-fp32", "triton_version": None,
+                          "weight_gradient_output": "forward-dtype"})
+        old_output_policy = {**original["trainer_settings"]["fp8_recipe"], "weight_gradient_output": "parameter-dtype"}
+        for recipe in (None, {"version": 1}, {"version": 2, "accumulation": "triton-native", "triton_version": "old"},
+                       {**original["trainer_settings"]["fp8_recipe"], "version": 4}, old_output_policy):
             payload = deepcopy(original)
             if recipe is None:
                 payload["trainer_settings"].pop("fp8_recipe")

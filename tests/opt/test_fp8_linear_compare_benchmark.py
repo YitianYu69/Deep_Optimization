@@ -48,7 +48,7 @@ class ComparisonContractTests(unittest.TestCase):
         with capture.enter():
             session.step(update=False)
         self.assertEqual({record["actual_backend"] for record, _ in capture.gemms}, {"reference"})
-        self.assertEqual(benchmark.library_state(session)["numerical_recipe"]["version"], 2)
+        self.assertEqual(benchmark.library_state(session)["numerical_recipe"]["version"], 5)
 
     def test_defaults_are_eager_real_updates_all_implementations_and_both_math_policies(self):
         options = args()
@@ -252,6 +252,19 @@ class CPUAutogradIntegrationTests(unittest.TestCase):
         self.assertEqual(output.dtype, torch.bfloat16)
         self.assertTrue(all(record["output"]["dtype"] == "torch.float32" for record, _ in capture.gemms))
         self.assertIs(session.projection.weight, session.source.weight)
+
+    def test_amp_mode_records_bf16_dw_before_fp32_parameter_accumulation(self):
+        for implementation in ("deepopt-current", "deepopt-delayed"):
+            with self.subTest(implementation=implementation):
+                session = benchmark.Session(args("--device", "cpu"), implementation, "amp", case(), torch,
+                                            deepopt_backend="reference")
+                capture = benchmark.Capture(session)
+                with capture.enter():
+                    session.step(update=False)
+                dtypes = {record["role"]: record["output"]["dtype"] for record, _ in capture.gemms}
+                self.assertEqual(dtypes, {"forward": "torch.bfloat16", "input_gradient": "torch.float32",
+                                          "weight_gradient": "torch.bfloat16"})
+                self.assertEqual(session.source.weight.grad.dtype, torch.float32)
 
     def test_diagnostic_patches_restore_after_failure_and_current_gradients_are_unchanged(self):
         from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func

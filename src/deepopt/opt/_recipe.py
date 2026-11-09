@@ -4,7 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 import sys
 
 
-FP8_RECIPE_VERSION = 2
+FP8_RECIPE_VERSION = 5
 
 
 def fp8_recipe(backend, settings=None):
@@ -16,13 +16,14 @@ def fp8_recipe(backend, settings=None):
             triton_version = getattr(sys.modules.get("triton"), "__version__", None)
     result = {"version": FP8_RECIPE_VERSION,
             "accumulation": "triton-native" if backend == "triton" else "reference-fp32",
-            "triton_version": triton_version}
+            "triton_version": triton_version,
+            "weight_gradient_output": "forward-dtype"}
     if settings is not None and settings.scaling_recipe == "delayed":
         from dataclasses import asdict
 
-        result.update(version=3, scaling="delayed", delayed_scaling=asdict(settings.delayed_scaling))
+        result.update(scaling="delayed", delayed_scaling=asdict(settings.delayed_scaling))
     if settings is not None and (settings.backward_backend != "inherit" or settings.exclude_modules):
-        result.update(version=4, backward_backend=settings.backward_backend,
+        result.update(backward_backend=settings.backward_backend,
                       exclude_modules=list(settings.exclude_modules))
         if settings.backward_backend != "inherit":
             import torch

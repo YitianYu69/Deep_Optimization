@@ -102,6 +102,12 @@ two-dimensional shapes; roles without inherited settings use tensorwise scaling.
 Partial overrides preserve unspecified inherited roles. `num_stages`
 defaults to `"auto"` (search stages 1–5); an integer from 1–5 pins the depth.
 `out_dtype=None` uses the active AMP/input dtype.
+The weight-gradient GEMM uses that same output dtype: BF16 projections emit BF16
+dW directly, FP16 projections emit FP16 dW, and explicit FP32 projections retain
+FP32 dW. Input-gradient GEMMs retain the original input dtype. Autograd converts
+the returned gradients to each parameter's dtype for accumulation, so FP32 master
+weights and their `.grad` storage remain FP32. `grad_dtype` selects the FP8
+incoming-gradient operand format, independently of the GEMM output dtype.
 `backward_backend="inherit"` keeps backward on that same backend. Tensorwise
 Triton recipes can explicitly select `native_fast` or `native_precise` for dX/dW;
 forward retains its configured backend. Automatic preparation accepts qualified
@@ -118,9 +124,10 @@ The reference backend retains its FP32 emulation. Remove the obsolete setting
 from configuration and execution plans when starting a new run; it now raises
 a migration error instead of being silently ignored.
 
-Unchanged current-scaling policies use numerical recipe version 2; unchanged
-delayed policies use version 3. Native backward or projection exclusions use
-version 4, recording the selected executor/accumulation and excluded patterns.
+Numerical recipe version 5 records `weight_gradient_output="forward-dtype"`
+for current and delayed scaling on both backends. Versions 2–4 used the parameter
+dtype for dW. Native backward or projection exclusions also record the selected
+executor/accumulation and excluded patterns.
 Native backward also records PyTorch/CUDA versions; Triton recipes record the
 Triton version. Exact resume rejects missing or changed recipes before loading
 training state. Continue older FP8
@@ -761,9 +768,9 @@ this FP8 path can be captured.
 
 For opt-in native backward GEMM, warmed eager launch planning, and projection
 exclusions, see the [eager Linear optimization controls](eager_linear_benchmark.md#native-backward-and-selective-preparation).
-These controls retain the existing forward backend and scaling default. Native
-backward and projection exclusions are recorded in numerical recipe version 4;
-unchanged current/delayed policies retain recipe versions 2/3.
+These controls retain the existing forward backend and scaling default. Numerical
+recipe version 5 records the dW output policy together with any native backward
+executor and projection exclusions.
 
 Use a CUDA-enabled PyTorch installation and compatible Triton exposing
 `triton.tools.tensor_descriptor.TensorDescriptor`. The TMA kernel requires an

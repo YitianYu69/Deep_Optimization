@@ -8,6 +8,7 @@ from torch import nn
 
 from deepopt import FP8Config, TrainingRuntime
 from deepopt.opt.backends import gemm_nt
+from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 
@@ -62,7 +63,7 @@ class NativeBackwardCUDATests(unittest.TestCase):
 
     def test_native_backward_keeps_original_fp32_optimizer_parameters_in_all_execution_modes(self):
         for recipe in ("current", "delayed"):
-            for backend in ("native_fast", "native_precise"):
+            for backend in ("inherit", "native_fast", "native_precise"):
                 for mode in ("max_speed", "balanced", "analyze"):
                     with self.subTest(recipe=recipe, backend=backend, mode=mode):
                         model = nn.Linear(64, 64, device="cuda")
@@ -71,9 +72,15 @@ class NativeBackwardCUDATests(unittest.TestCase):
                         options = FP8Config(enabled=True, backend="triton", backward_backend=backend,
                                             scaling_recipe=recipe, intercept_linear=False)
                         runtime = TrainingRuntime(model, optimizer, fp8=options, precision="bf16", execution_mode=mode)
-                        loss = runtime.compute(torch.randn(80, 64, device="cuda", requires_grad=True),
-                                               lambda x: runtime.model(x).float().square().mean())
-                        runtime.backward(loss)
+                        with patch.object(linear_autograd_func, "gemm_nt", wraps=gemm_nt) as dispatch:
+                            loss = runtime.compute(torch.randn(80, 64, device="cuda", requires_grad=True),
+                                                   lambda x: runtime.model(x).float().square().mean())
+                            runtime.backward(loss)
+                        backward = "triton" if backend == "inherit" else backend
+                        self.assertEqual([(call.kwargs["backend"], call.kwargs["out_dtype"])
+                                          for call in dispatch.call_args_list],
+                                         [("triton", torch.bfloat16), (backward, torch.float32),
+                                          (backward, torch.bfloat16)])
                         runtime.step()
                         self.assertEqual(tuple(runtime.model.parameters()), parameters)
                         for parameter in parameters:
