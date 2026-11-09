@@ -37,6 +37,7 @@ model, loader, and optimizer already exist unless the snippet constructs them.
 | Train across CPU/GPU ranks with separate regular and DDP cores | [Distributed training](distributed/README.md) |
 | Capture models/functions or CUDA code blocks and replay with training/DDP | [CUDA Graphs](cuda/README.md) |
 | Transform projections for FP8 training, preserve model methods, and validate real models | [FP8 and model transformation](fp8/README.md) |
+| Compare eager FP8 Linear, select native backward GEMM, or exclude projections | [Eager Linear benchmarks and controls](fp8/eager_linear_benchmark.md) |
 | Use validation, best-metric selection, progress bars, callbacks, or graceful stopping | [Training APIs](training/README.md) |
 | Control backward and optimizer order, or wrap a model without using the trainer | [Training APIs](training/README.md) |
 | Reuse a `Task`, `TrainingModule`, or custom batch/device-transfer method | [Training APIs](training/README.md) |
@@ -78,7 +79,7 @@ models and datasets belong to recipes.
 | DDP | Gloo with multiple local processes | CUDA/NCCL uses one device per rank |
 | Model compilation | `aot_eager` example; Inductor needs a compiler toolchain | Performance depends on backend and workload |
 | CUDA Graphs | `--help` and CPU white-box checks only | CUDA device and capture-compatible operations |
-| FP8 projections | Reference quantization/emulation | Actual Triton kernels need NVIDIA CC >= 9 and compatible Triton |
+| FP8 projections | Reference quantization/emulation | Triton forward and optional native scaled-GEMM backward require NVIDIA CC >= 9 and compatible libraries |
 | Worker recovery | Built-in deterministic item replay | Stateful worker recovery uses the optional `workers` extra |
 | Real-model validation | Tiny random ViTs/GPT-2/Llama with `model-tests` extra | No pretrained downloads; CUDA validation remains separate |
 

@@ -1,5 +1,8 @@
 # Delayed FP8 Linear scaling
 
+For eager comparisons with PyTorch BF16 and TorchAO FP8, use the
+[standalone Linear diagnostic benchmark](eager_linear_benchmark.md).
+
 Current-tensor scaling remains the default. Delayed scaling is an explicit
 tensorwise recipe with registered numerical state, intended for comparison with
 standalone Transformer Engine Linear. Its CUDA kernels and parity target require
@@ -104,9 +107,13 @@ capture is actually requested, or during an unsupported raw capture.
 
 ## Persistence and distributed execution
 
-Delayed recipe identity is version 3 and includes history length, algorithm,
-margin, synchronization policy and native Triton version. Current scaling keeps
-version 2. Model state dictionaries persist numerical buffers and recipe metadata;
+The default delayed recipe identity is version 3 and includes history length,
+algorithm, margin, synchronization policy and native Triton version. Unchanged
+current scaling keeps version 2. Selecting native backward or projection
+exclusions uses version 4 and additionally records that policy; native backward
+records PyTorch/CUDA versions and its deterministic Triton fallback rule.
+See [native backward and selective preparation](eager_linear_benchmark.md#native-backward-and-selective-preparation).
+Model state dictionaries persist numerical buffers and recipe metadata;
 disposable FP8 caches, stream objects and workspaces are excluded. Loading or
 moving an adapter invalidates cache generations. FP32 numerical buffers retain
 their exact dtype when model parameters move to BF16/FP16.

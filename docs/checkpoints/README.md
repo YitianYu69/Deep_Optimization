@@ -248,8 +248,13 @@ Automatic FP8 settings from `Trainer(..., fp8=...)` or `TrainingRuntime(...,
 fp8=...)` are recorded in trainer compatibility metadata. Configured runs also
 save `[runtime.fp8]` in the experiment configuration. Reconstruct with the same
 enabled settings before restoring; changed formats, scaling, backend, or tracing
-policy are rejected. Master parameters and optimizer state remain ordinary
-floating-point checkpoint tensors; temporary FP8 operands are not stored.
+policy are rejected. This includes backward executor/accumulation choices and
+projection exclusion patterns. Original parameters and optimizer state remain
+ordinary floating-point checkpoint tensors; temporary FP8 operands are not stored.
+Delayed numerical scales/histories are registered buffers and are persisted.
+Current/delayed defaults retain recipe versions 2/3; native backward or exclusions
+use version 4. Native backward records PyTorch/CUDA versions alongside the Triton
+recipe metadata. See [FP8 recipe and selection details](../fp8/eager_linear_benchmark.md#native-backward-and-selective-preparation).
 Older checkpoints without FP8 metadata remain compatible when automatic FP8 is
 disabled.
 

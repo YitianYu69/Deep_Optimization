@@ -8,9 +8,10 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..quantization.tensor import QuantizedTensor
 from ._cuda_launch import device_metadata
+from ._gemm_launch import gemm_launch_plan, selected_config, launch_selected
 from ._triton_autotune import (
-    AUTOTUNE_KEY, AUTOTUNE_TILES, AUTOTUNE_STAGES, GROUP_SIZE_M_CHOICES, MAX_BLOCK_K, SPLIT_K_CHOICES,
-    autotune_cache_key, prune_gemm_configs, split_k_limit, DescriptorKernel,
+    AUTOTUNE_KEY, AUTOTUNE_TILES, AUTOTUNE_STAGES, GROUP_SIZE_M_CHOICES, SPLIT_K_CHOICES,
+    prune_gemm_configs, split_k_limit, DescriptorKernel,
     grouped_tile_coordinates,
 )
 
@@ -258,17 +259,6 @@ def gemm_nt(
         if bias.dtype not in output_types:
             raise TypeError("Bias must be FP32, BF16, or FP16")
 
-    native_fp8 = all(operand.block_shape is None or operand.block_shape[1] % 32 == 0
-                     for operand in (a, b))
-    # Scalar scales cover the full logical K for every candidate. This metadata
-    # must not constrain BLOCK_K when physical row padding is smaller than a tile.
-    scale_k = triton.cdiv(k, MAX_BLOCK_K) * MAX_BLOCK_K
-
-    # Represent tensorwise scaling as a single logical scale block when the other operands is blockwise
-    a_block_rows, a_block_cols = a.block_shape or (m, scale_k)
-    b_block_rows, b_block_cols = b.block_shape or (n, scale_k)
-
-    tensorwise = a.block_shape is None and b.block_shape is None
     with torch.cuda.device(a.data.device):
         # TMA needs 16-byte row strides, not whole-tile storage. Logical
         # descriptor bounds zero-fill edge loads and discard edge stores.
@@ -281,60 +271,48 @@ def gemm_nt(
         a_scale_inv = a.scale_inv.contiguous()
         b_scale_inv = b.scale_inv.contiguous()
 
-        a_desc = TensorDescriptor.from_tensor(
-            a_packed[:, :k], [64, 32]
-        )
-        b_desc = TensorDescriptor.from_tensor(
-            b_packed[:, :k], [64, 32]
-        )
-
-        output_alignment = 4 if out_dtype == torch.float32 else 8
-        padded_n = triton.cdiv(n, output_alignment) * output_alignment
+        plan = gemm_launch_plan(m, n, k, a.block_shape, b.block_shape,
+                                str(a.data.dtype), str(b.data.dtype), str(out_dtype), device_index,
+                                capability, num_sms, a_packed.stride(0), b_packed.stride(0), num_stages,
+                                str(bias.dtype) if bias is not None else None)
+        padded_n = plan.output_stride
+        cached = selected_config(_gemm_nt_kernel, plan.cache_key)
+        bm, bn, bk = ((cached.kwargs[name] for name in ("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+                      if cached is not None else (64, 64, 32))
+        # Fresh descriptors bind this call's storage; cached layouts retain no
+        # tensors. Explicit logical shapes avoid creating operand slice views.
+        a_desc = TensorDescriptor(a_packed, [m, k], list(a_packed.stride()), [bm, bk])
+        b_desc = TensorDescriptor(b_packed, [n, k], list(b_packed.stride()), [bn, bk])
 
         output_storage = torch.empty(
             (m, padded_n), dtype=out_dtype, device=a.data.device
         )
         output = output_storage[:, :n]
-        c_desc = TensorDescriptor.from_tensor(
-            output, [64, 64]
-        )
+        c_desc = TensorDescriptor(output_storage, [m, n], list(output_storage.stride()), [bm, bn])
 
         bias_arg = output_storage if bias is None else bias.contiguous()
         def grid(meta):
             return (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]), meta["SPLIT_K"])
 
-        launch_args = dict(
-            A_BLOCK_ROWS=a_block_rows, A_BLOCK_COLS=a_block_cols,
-            B_BLOCK_ROWS=b_block_rows, B_BLOCK_COLS=b_block_cols,
-            A_SCALE_COLS=a_scale_inv.shape[1], B_SCALE_COLS=b_scale_inv.shape[1],
-            TENSORWISE=tensorwise,
-            NATIVE_FP8=native_fp8,
-            HAS_BIAS=bias is not None,
-            OUTPUT_DTYPE=output_types[out_dtype],
-            OUTPUT_FORMAT=str(out_dtype),
-            A_FP8_FORMAT=str(a.data.dtype), B_FP8_FORMAT=str(b.data.dtype),
-            DEVICE_INDEX=device_index, DEVICE_CAPABILITY=capability,
-            NUM_SMS=num_sms,
-            OUTPUT_STRIDE=padded_n,
-            PIPELINE_STAGES=0 if num_stages == "auto" else num_stages,
-            A_ROW_STRIDE=a_packed.stride(0), B_ROW_STRIDE=b_packed.stride(0),
-        )
+        launch_args = {**plan.arguments, "OUTPUT_DTYPE": output_types[out_dtype]}
         # A dummy FP32 pointer keeps the implicit dtype key identical with and
         # without scratch. Cached unsplit winners allocate no partial buffer;
         # cached split winners need only their chosen number of planes.
-        positional = (a_desc, b_desc, c_desc, a_scale_inv, b_scale_inv,
-                      bias_arg, a_scale_inv, output_storage, m, n, k)
-        named = {**dict(zip(_gemm_nt_kernel.arg_names, positional)), **launch_args}
-        cached = _gemm_nt_kernel.cache.get(autotune_cache_key(named))
         splits = cached.kwargs["SPLIT_K"] if cached is not None else split_k_limit(m, n, k)
         partials = (torch.empty((splits, m, padded_n), device=a.data.device, dtype=torch.float32)
                     if splits > 1 else a_scale_inv)
-        _gemm_nt_kernel[grid](
-            a_desc, b_desc, c_desc, a_scale_inv, b_scale_inv,
-            bias_arg, partials, output_storage, m, n, k, **launch_args,
-        )
-        if _gemm_nt_kernel.best_config.kwargs["SPLIT_K"] > 1:
-            _finish_gemm({**launch_args, **_gemm_nt_kernel.best_config.kwargs,
+        positional = (a_desc, b_desc, c_desc, a_scale_inv, b_scale_inv,
+                      bias_arg, partials, output_storage, m, n, k)
+        if cached is None:
+            _gemm_nt_kernel[grid](*positional, **launch_args)
+            cached = selected_config(_gemm_nt_kernel, plan.cache_key)
+            if cached is None:
+                raise RuntimeError("Triton winner is missing from the per-key autotune cache")
+        else:
+            launch_selected(_gemm_nt_kernel, cached, positional, launch_args, grid(cached.kwargs))
+        _gemm_nt_kernel.cache[plan.cache_key] = cached
+        if cached.kwargs["SPLIT_K"] > 1:
+            _finish_gemm({**launch_args, **cached.kwargs,
                           "partials_ptr": partials, "output_ptr": output_storage,
                           "bias_ptr": bias_arg, "M": m, "N": n})
     

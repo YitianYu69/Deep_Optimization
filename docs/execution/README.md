@@ -17,6 +17,11 @@ FP8 is a separate opt-in computation policy through
 [`[runtime.fp8]`](../runs/README.md#configure-fp8) or `Trainer(..., fp8=...)`.
 It can be combined with AMP precision; changing diagnostic modes does not change
 FP8 formats or scaling.
+Native backward GEMM and projection exclusions are separate
+[FP8 configuration choices](../fp8/eager_linear_benchmark.md#native-backward-and-selective-preparation).
+Execution modes preserve the selected executor and numerical recipe; their
+finite-check cadences also cover native-backward preprocessing. Excluded
+projections follow normal AMP execution.
 
 Mode coverage includes prepared/native FP8 projections, direct quantization and
 scaling calls, default loss/report validators, custom backward and gradient

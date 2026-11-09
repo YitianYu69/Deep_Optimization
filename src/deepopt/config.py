@@ -66,6 +66,8 @@ class FP8Config:
     intercept_linear: bool = True
     scaling_recipe: str = "current"
     delayed_scaling: DelayedScalingConfig = field(default_factory=DelayedScalingConfig)
+    backward_backend: str = "inherit"
+    exclude_modules: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -448,7 +450,7 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     _require_keys(raw, set(), "runtime.fp8", {
         "enabled", "backend", "trace_mode", "activation_dtype", "weight_dtype",
         "grad_dtype", "block_shapes", "num_stages", "out_dtype", "intercept_linear",
-        "scaling_recipe", "delayed_scaling",
+        "scaling_recipe", "delayed_scaling", "backward_backend", "exclude_modules",
     })
     raw = _copy_tables(raw)
     enabled = raw.get("enabled", False)
@@ -492,11 +494,23 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     delayed = delayed_scaling_config_from_dict(raw.get("delayed_scaling", {}))
     if recipe == "delayed" and any(block is not None for block in block_shapes.values()):
         raise ConfigError("Delayed FP8 scaling currently requires tensorwise block_shapes")
+    backward_backend = raw.get("backward_backend", "inherit")
+    if backward_backend not in ("inherit", "native_fast", "native_precise"):
+        raise ConfigError("runtime.fp8.backward_backend must be inherit, native_fast, or native_precise")
+    if backward_backend != "inherit" and (backend != "triton" or any(block is not None for block in block_shapes.values())):
+        raise ConfigError("Native FP8 backward requires backend=triton and tensorwise block_shapes")
+    exclusions = raw.get("exclude_modules", ())
+    if (not isinstance(exclusions, (list, tuple))
+            or any(not isinstance(pattern, str) or not pattern.strip() for pattern in exclusions)):
+        raise ConfigError("runtime.fp8.exclude_modules must contain nonempty module-name glob patterns")
+    if exclusions and intercept_linear:
+        raise ConfigError("FP8 module exclusions require intercept_linear=false so excluded projections remain dense")
     return FP8Config(enabled=enabled, backend=backend, trace_mode=trace_mode,
                      intercept_linear=intercept_linear,
                      activation_dtype=dtypes["activation"], weight_dtype=dtypes["weight"],
                      grad_dtype=dtypes["grad"], block_shapes=block_shapes,
-                     num_stages=stages, out_dtype=out_dtype, scaling_recipe=recipe, delayed_scaling=delayed)
+                     num_stages=stages, out_dtype=out_dtype, scaling_recipe=recipe, delayed_scaling=delayed,
+                     backward_backend=backward_backend, exclude_modules=tuple(exclusions))
 
 
 def normalize_config(value: ExperimentConfig | Mapping[str, Any]) -> ExperimentConfig:

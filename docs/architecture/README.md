@@ -68,7 +68,7 @@ src/deepopt/
 ├── opt/                # FX model transformation and optimized operations
 │   ├── fx/             # Tracing, conversion registry, matching and rewriting
 │   ├── do_nn/          # DO modules and first-order projection autograd
-│   └── backends/       # Reference FP8 execution and Triton CUDA GEMM
+│   └── backends/       # Reference, Triton CUDA GEMM, and optional native backward
 ├── scheduling/         # Pure curves, coefficient lifecycle and native LR factory
 ├── optimizer_factory.py # PyTorch/custom optimizer construction
 ├── optim.py            # Reserved optimizer algorithms; lazy legacy factory aliases
@@ -250,7 +250,10 @@ serve a different purpose and do not replace measured workload validation.
   before constructing either training core; runtime/trainer state and DDP
   collectives remain eager. See [CUDA Graph APIs and tests](../cuda/README.md).
 - `opt/` owns FX transformation, DO operations, FP8 saved-state autograd, and
-  reference/Triton GEMM execution. Training/DDP cores stay independent of these
+  reference/Triton GEMM execution plus opt-in native scaled-GEMM backward.
+  Pointer-free launch plans cache layout decisions while each call binds fresh
+  descriptors; preparation owns projection exclusions and alias handling.
+  Training/DDP cores stay independent of these
   operation implementations. See [FP8 and future compression/sparse boundaries](../fp8/README.md).
 - Ordinary loaders are the default for epoch saving. Built-in index-skip
   sampler/loader utilities do not claim state recovery. The resumable loader

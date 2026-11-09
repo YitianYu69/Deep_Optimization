@@ -333,11 +333,20 @@ python -m deepopt evaluate --checkpoint runs/fp8/best.pt --device cpu
 | `block_shapes` | Optional table with `activation`, `weight`, and `grad` two-integer arrays; omitted roles use tensorwise scaling |
 | `num_stages` | `"auto"` (default) tunes Triton pipeline depth; integer 1–5 fixes it |
 | `out_dtype` | Optional `fp32`, `bf16`, or `fp16`; omit to follow the active AMP/input dtype |
+| `scaling_recipe` | `current` (default) or `delayed`; delayed requires tensorwise scaling and prepared adapters |
+| `delayed_scaling` | Table with `history_length=1024`, `amax_algorithm="max"` (`max` or `most_recent`), `margin=0`, and `reduce_amax=true` |
+| `backward_backend` | `inherit` (default), `native_fast`, or `native_precise`; native choices require `backend="triton"` and tensorwise scaling |
+| `exclude_modules` | Module-name glob array, default `[]`; applies to subtrees and aliases and requires `intercept_linear=false` |
 
-FP8 now uses native Triton accumulation (numerical recipe version 2). The old
-`max_num_imprecise_acc` setting is rejected with migration guidance. Exact FP8
-resume requires matching recipe metadata and Triton version; use the original
+Inherited Triton execution uses native accumulation. Unchanged current/delayed
+policies use numerical recipe versions 2/3; native backward or projection
+exclusions use version 4. The old `max_num_imprecise_acc` setting is rejected with
+migration guidance. Exact FP8 resume requires matching numerical policy and
+library metadata, including PyTorch/CUDA versions for native backward; use the original
 environment to continue older runs, or load their model weights into a new run.
+See the [native backward and projection-selection controls](../fp8/eager_linear_benchmark.md#native-backward-and-selective-preparation)
+for a full-model configuration and reproducible AMP comparisons. These choices
+remain opt-in; dense exclusions follow the surrounding precision policy.
 
 For example, `[runtime.fp8.block_shapes]` with `weight = [32, 64]` applies
 blockwise weight scaling. Positive block dimensions, including `activation = [1, 32]`,

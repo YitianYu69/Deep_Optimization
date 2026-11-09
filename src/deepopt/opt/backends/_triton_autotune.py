@@ -96,7 +96,11 @@ class DescriptorKernel:
         self.fn, self.arg_names = fn, fn.arg_names
 
     def _prepare(self, args, kwargs):
-        set_descriptor_block_shapes({**dict(zip(self.arg_names, args)), **kwargs})
+        if len(args) >= 3:
+            bm, bn, bk = (kwargs[name] for name in ("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+            args[0].block_shape, args[1].block_shape, args[2].block_shape = [bm, bk], [bn, bk], [bm, bn]
+        else:
+            set_descriptor_block_shapes({**dict(zip(self.arg_names, args)), **kwargs})
 
     def run(self, *args, **kwargs):
         self._prepare(args, kwargs)

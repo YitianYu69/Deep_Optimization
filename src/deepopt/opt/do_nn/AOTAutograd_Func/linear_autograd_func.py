@@ -100,6 +100,7 @@ class _DOLinearFunction(Function):
         ctx.fp8_dtypes = dict(fp8_dtypes)
         ctx.block_shapes = dict(block_shapes)
         ctx.backend = backend
+        ctx.backward_backend = backend if fp8_trainig_plan["backward_backend"] == "inherit" else fp8_trainig_plan["backward_backend"]
         ctx.num_stages = num_stages
         ctx.save_qx_transpose = save_qx_transpose or paired_x
         ctx.weight_transposed = paired_w
@@ -157,7 +158,7 @@ class _DOLinearFunction(Function):
                 # gradient orientation and dtype remain the autograd contract.
                 dx = gemm_nt(
                     qg, qw if ctx.weight_transposed else qw.transpose(contiguous=False),
-                    backend=ctx.backend,
+                    backend=ctx.backward_backend,
                     out_dtype=ctx.input_dtype,
                     num_stages=ctx.num_stages,
                 ).reshape(ctx.input_shape)
@@ -185,7 +186,7 @@ class _DOLinearFunction(Function):
                 dw = gemm_nt(
                     qg if needs_qg_special_transpose or paired_g else qg.transpose(contiguous=False),
                     qx if ctx.save_qx_transpose else qx.transpose(contiguous=False),
-                    backend=ctx.backend,
+                    backend=ctx.backward_backend,
                     out_dtype=ctx.weight_dtype,
                     num_stages=ctx.num_stages,
                 )

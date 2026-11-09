@@ -310,8 +310,10 @@ computations. Ordinary optimizer state, accumulation, clipping, and scheduling
 remain owned by the APIs in this guide. Start with
 [FP8 training and model transformation](../fp8/README.md) and the
 [FP8 example](../../examples/optimization/fp8_training.py). The CPU reference
-backend checks FP8 quantization behavior; actual FP8 GEMM uses the CUDA Triton
-backend on supported NVIDIA hardware.
+backend checks FP8 quantization behavior. CUDA forward uses Triton on supported
+NVIDIA hardware; tensorwise recipes can opt into native scaled GEMM for dX/dW.
+See [native backward and projection selection](../fp8/eager_linear_benchmark.md#native-backward-and-selective-preparation)
+for explicit accumulation policies, dense exclusions and benchmark controls.
 
 Related: [metrics](../metrics/README.md), [observers](../observers/README.md),
 [checkpoints](../checkpoints/README.md), and [architecture](../architecture/README.md).

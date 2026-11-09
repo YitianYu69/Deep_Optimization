@@ -18,6 +18,7 @@ class DOMultiheadAttention(CachedWeightModule):
             raise NotImplementedError("add_zero_attn is not supported yet")
         
         self.plan = _prepare_fp8_plan(plan)
+        self._fp8_out_projection = True
         self._projection_scaling = nn.ModuleDict()
         if self.plan["fp8_training"]["scaling_recipe"] == "delayed":
             from ..scaling_strategy.delayed import DelayedScalingState
@@ -254,11 +255,14 @@ class DOMultiheadAttention(CachedWeightModule):
                 weights = None
             
         attended = attended.transpose(1, 2).reshape(batch_size, target_length, self.embed_dim)
-        output = do_linear(
-            attended, self.out_proj.weight, self.out_proj.bias,
-            plan=self.plan, _weight_cache=self._fp8_weight_cache,
-            _scaling_state=self._projection_scaling["out"] if self._projection_scaling else None, _state_training=self.training,
-        )
+        if self._fp8_out_projection:
+            output = do_linear(
+                attended, self.out_proj.weight, self.out_proj.bias,
+                plan=self.plan, _weight_cache=self._fp8_weight_cache,
+                _scaling_state=self._projection_scaling["out"] if self._projection_scaling else None, _state_training=self.training,
+            )
+        else:
+            output = F.linear(attended, self.out_proj.weight, self.out_proj.bias)
 
         if weights is not None and average_attn_weights:
             weights = weights.mean(dim=1)

@@ -14,7 +14,8 @@ def rewrite_graph(
     matches: list[fx.Node], 
     registry: ConversionRegistry,
     *, plan: dict,
-    replacements: dict[int, nn.Module] | None = None
+    replacements: dict[int, nn.Module] | None = None,
+    excluded_ids=(),
 ) -> fx.GraphModule:
 
     if replacements is None:
@@ -26,9 +27,8 @@ def rewrite_graph(
             module_id = id(original)
 
             if module_id not in replacements:
-                rule = registry.lookup(original)
-                replacements[module_id] = rule.converter(
-                    original, plan=plan
+                replacements[module_id] = registry.convert(
+                    original, plan=plan, excluded_ids=excluded_ids
                 )
     
     for parent in list(graph_module.modules()):

@@ -81,7 +81,7 @@ def validate_fp8_plan(plan: dict) -> dict:
         "fp8_dtypes",
         "backend",
         "num_stages",
-        "out_dtype", "scaling_recipe", "delayed_scaling"
+        "out_dtype", "scaling_recipe", "delayed_scaling", "backward_backend"
     }
 
     if "fp8_dtypes" not in training:
@@ -135,6 +135,11 @@ def validate_fp8_plan(plan: dict) -> dict:
     delayed = delayed_scaling_config_from_dict(training.get("delayed_scaling", {}))
     if recipe == "delayed" and any(shape is not None for shape in block_shapes.values()):
         raise ValueError("Delayed scaling requires tensorwise block_shapes")
+    backward_backend = training.get("backward_backend", "inherit")
+    if backward_backend not in ("inherit", "native_fast", "native_precise"):
+        raise ValueError("backward_backend must be inherit, native_fast, or native_precise")
+    if backward_backend != "inherit" and (backend != "triton" or any(shape is not None for shape in block_shapes.values())):
+        raise ValueError("Native FP8 backward requires backend=triton and tensorwise block_shapes")
     if out_dtype is not None:
         if (not isinstance(out_dtype, torch.dtype) or out_dtype not in _FLOAT_DTYPES):
             raise ValueError(
@@ -149,6 +154,7 @@ def validate_fp8_plan(plan: dict) -> dict:
             "out_dtype": out_dtype,
             "scaling_recipe": recipe,
             "delayed_scaling": asdict(delayed),
+            "backward_backend": backward_backend,
         },
         "block_shapes": dict(block_shapes),
     }

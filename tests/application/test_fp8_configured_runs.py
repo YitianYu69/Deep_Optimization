@@ -68,7 +68,9 @@ class ConfiguredFP8RunTests(unittest.TestCase):
         self.assertEqual(resumed["state"]["optimizer_steps"], 4)
         self.assertEqual(len((partial / "metrics.jsonl").read_text().splitlines()), 2)
         snapshot = json.loads((partial / "config.json").read_text())
-        self.assertEqual(snapshot["runtime"]["fp8"], expected_policy)
+        # JSON represents tuple-valued policy fields (including exclusions) as
+        # lists; checkpoint metadata above retains the typed policy containers.
+        self.assertEqual(snapshot["runtime"]["fp8"], json.loads(json.dumps(expected_policy)))
 
         best = read_checkpoint(partial / "best.pt")
         result = evaluate(partial / "best.pt", device="cpu")

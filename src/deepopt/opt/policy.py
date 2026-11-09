@@ -41,6 +41,7 @@ def fp8_plan(settings=_UNSET, *, config=None) -> dict:
             "out_dtype": output_types[settings.out_dtype],
             "scaling_recipe": settings.scaling_recipe,
             "delayed_scaling": asdict(settings.delayed_scaling),
+            "backward_backend": settings.backward_backend,
         },
         "block_shapes": dict(settings.block_shapes),
     })
@@ -90,21 +91,23 @@ def prepare_fp8_model(model, settings=_UNSET, *, config=None):
             raise ValueError("Prepare FP8 before CUDA Graph capture; supply an eager model")
 
     from .fx.registry import default_registry
-    from .transform import TransformReport, transform_model
+    from .transform import TransformReport, transform_model, excluded_module_ids
 
     registry = default_registry()
     plan = fp8_plan(settings)
-    root_rule = registry.lookup(model) if settings.trace_mode == "modules" else None
+    excluded_ids, excluded_names = excluded_module_ids(model, settings.exclude_modules)
+    root_rule = registry.lookup(model) if settings.trace_mode == "modules" and id(model) not in excluded_ids else None
     if root_rule is not None:
-        prepared = root_rule.converter(model, plan=plan)
+        prepared = registry.convert(model, plan=plan, excluded_ids=excluded_ids)
         report = TransformReport(
             trace_mode="modules",
             original_type=f"{type(model).__module__}.{type(model).__qualname__}",
             converted_modules=("<root>",), function_calls=(),
+            excluded_modules=excluded_names,
         )
     else:
         prepared, report = transform_model(model, plan=plan, trace_mode=settings.trace_mode,
-                                           inplace=True, registry=registry)
+                                           inplace=True, registry=registry, exclude_modules=settings.exclude_modules)
     prepared._deepopt_fp8_config = settings
     prepared._deepopt_fp8_report = report
     return prepared, report

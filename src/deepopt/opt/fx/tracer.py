@@ -28,8 +28,9 @@ def _is_hf_conv1d(module: nn.Module) -> bool:
 
 
 class DOTracer(fx.Tracer):
-    def __init__(self, *, extra_leaf_types: tuple[type[nn.Module], ...] = ()) -> None:
+    def __init__(self, *, extra_leaf_types: tuple[type[nn.Module], ...] = (), excluded_ids=()) -> None:
         super().__init__()
+        self._excluded_ids = frozenset(excluded_ids)
 
         if not isinstance(extra_leaf_types, tuple):
             raise TypeError("extra_leaf_types must be a tuple")
@@ -46,6 +47,8 @@ class DOTracer(fx.Tracer):
         )
 
     def is_leaf_module(self, module: nn.Module, module_qualified_name: str) -> bool:
+        if id(module) in self._excluded_ids:
+            return True
         if isinstance(module, self._projection_leaf_types):
             return True
         

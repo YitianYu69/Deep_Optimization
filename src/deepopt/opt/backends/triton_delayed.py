@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 from ._delayed_launch import CONVERSION_KEYS, conversion_cache_key, scratch_tile, observation_rows
+from ._gemm_launch import selected_config, launch_selected
 
 
 _cache = {"cache_results": True} if "cache_results" in inspect.signature(triton.autotune).parameters else {}
@@ -83,11 +84,18 @@ def convert(x, scale, dtype, *, normal, transposed, bias, observe, check_finite)
         amax = torch.empty(triton.cdiv(m, bm) * triton.cdiv(n, bn), device=x.device, dtype=torch.float32) if observe else snapshot
         db = torch.empty((triton.cdiv(m, bm), n), device=x.device, dtype=torch.float32) if bias else snapshot
         errors = torch.zeros((), device=x.device, dtype=torch.int32) if check_finite else snapshot
-        _convert[lambda meta: (triton.cdiv(m, meta["BM"]), triton.cdiv(n, meta["BN"]))](
-            x, scale, dummy, transpose if transposed else dummy, snapshot, amax, db, errors, m, n, *x.stride(),
-            PAD_M=pm, PAD_N=pn, NORMAL=normal, TRANSPOSE=transposed, BIAS=bias,
-            OBSERVE=observe, CHECK=check_finite, DEVICE=x.device.index, MAXIMUM=torch.finfo(dtype).max)
-        selected = _convert.configs[0] if len(_convert.configs) == 1 else _convert.cache[key]
+        args = (x, scale, dummy, transpose if transposed else dummy, snapshot, amax, db, errors, m, n, *x.stride())
+        kwargs = dict(PAD_M=pm, PAD_N=pn, NORMAL=normal, TRANSPOSE=transposed, BIAS=bias,
+                      OBSERVE=observe, CHECK=check_finite, DEVICE=x.device.index, MAXIMUM=torch.finfo(dtype).max)
+        selected = selected_config(_convert, key)
+        if selected is None:
+            _convert[lambda meta: (triton.cdiv(m, meta["BM"]), triton.cdiv(n, meta["BN"]))](*args, **kwargs)
+            selected = selected_config(_convert, key)
+            if selected is None:
+                raise RuntimeError("Triton converter winner is missing from its per-key autotune cache")
+        else:
+            launch_selected(_convert, selected, args, kwargs,
+                             (triton.cdiv(m, selected.kwargs["BM"]), triton.cdiv(n, selected.kwargs["BN"])))
         bm, bn = (selected.kwargs[name] for name in ("BM", "BN"))
         if check_finite and errors.item():
             raise ValueError("Delayed scaling requires finite inputs")

@@ -29,5 +29,10 @@ def gemm_nt(
         from .triton_fp8 import gemm_nt as implementation
 
         return implementation(a, b, out_dtype=out_dtype, bias=bias, num_stages=num_stages)
+    if backend in ("native_fast", "native_precise"):
+        from .native_fp8 import gemm_nt as implementation
+
+        return implementation(a, b, out_dtype=out_dtype, bias=bias, num_stages=num_stages,
+                              use_fast_accum=backend == "native_fast")
     
-    raise ValueError("backend must be 'reference' or 'triton'")
+    raise ValueError("backend must be reference, triton, native_fast, or native_precise")
