@@ -31,6 +31,32 @@ def make_trainer(policy=True):
 
 
 class FP8PolicySnapshotTests(unittest.TestCase):
+    def test_projection_exclusion_round_trip_and_changed_selection_rejected(self):
+        policy = FP8Config(enabled=True, intercept_linear=False, exclude_modules=("0",))
+        original = make_trainer(policy)
+        payload = _checkpoint_payload(original, {}, generators={}, history=[])
+        self.assertEqual(payload["trainer_settings"]["fp8_recipe"]["version"], 4)
+        restored = make_trainer(policy)
+        restore_checkpoint(payload, restored, payload["config"], generators={}, batch_size_mode="manual")
+        conflicting = make_trainer(replace(policy, exclude_modules=()))
+        with torch.no_grad():
+            conflicting.model[0].weight.fill_(123)
+        with self.assertRaisesRegex(ValueError, "FP8|settings"):
+            restore_checkpoint(payload, conflicting, payload["config"], generators={}, batch_size_mode="manual")
+        self.assertTrue(torch.all(conflicting.model[0].weight == 123))
+
+    def test_native_accumulation_policy_changes_reject_before_parameter_loading(self):
+        policy = FP8Config(enabled=True, backend="triton", backward_backend="native_fast")
+        original = make_trainer(policy)
+        payload = _checkpoint_payload(original, {}, generators={}, history=[])
+        self.assertEqual(payload["trainer_settings"]["fp8_recipe"]["backward_accumulation"], "native-fast")
+        conflicting = make_trainer(replace(policy, backward_backend="native_precise"))
+        with torch.no_grad():
+            conflicting.model[0].weight.fill_(123)
+        with self.assertRaisesRegex(ValueError, "FP8|settings"):
+            restore_checkpoint(payload, conflicting, payload["config"], generators={}, batch_size_mode="manual")
+        self.assertTrue(torch.all(conflicting.model[0].weight == 123))
+
     def setUp(self):
         reset_config()
         self.addCleanup(reset_config)

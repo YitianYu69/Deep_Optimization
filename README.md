@@ -102,6 +102,9 @@ The reference backend emulates FP8 on CPU/CUDA; actual Triton FP8 GEMM requires
 NVIDIA compute capability 9.0+ and compatible Triton. Inspect the transformation
 report for partial conversion and use `trainer.model` after setup. See the
 [FP8 guide](docs/fp8/README.md) for formats, scaling, automatic tuning, and model methods.
+Optional [native backward GEMM and projection exclusions](docs/fp8/eager_linear_benchmark.md#native-backward-and-selective-preparation)
+preserve original parameter ownership. Both are explicit configuration choices;
+the existing FP8 defaults remain unchanged.
 
 ## Guides and development
 

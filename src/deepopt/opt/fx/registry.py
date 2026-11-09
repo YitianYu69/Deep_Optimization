@@ -59,6 +59,14 @@ class ConversionRegistry:
     def lookup(self, module: nn.Module) -> ModuleConversion | None:
         return self._rules.get(type(module), None)
 
+    def convert(self, module, *, plan, excluded_ids=()):
+        replacement = self.lookup(module).converter(module, plan=plan)
+        if isinstance(replacement, DOMultiheadAttention) and id(module.out_proj) in excluded_ids:
+            replacement._fp8_out_projection = False
+            if "out" in replacement._projection_scaling:
+                del replacement._projection_scaling["out"]
+        return replacement
+
     def is_converted(self, module: nn.Module) -> bool:
         module_type = type(module)
         return any(

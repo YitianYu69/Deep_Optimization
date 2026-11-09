@@ -92,6 +92,8 @@ weight_dtype = "e4m3fn"             # e4m3fn or e5m2.
 grad_dtype = "e4m3fn"               # e4m3fn or e5m2; each operand chooses independently.
 num_stages = "auto"                # Tune Triton stages; an integer 1–5 pins the depth.
 scaling_recipe = "current"         # delayed requires prepared adapters and tensorwise block_shapes.
+backward_backend = "inherit"       # inherit, native_fast, native_precise; native requires triton + tensorwise.
+exclude_modules = []               # Qualified-name globs; nonempty exclusions require intercept_linear=false.
 # out_dtype = "fp32"               # fp32, bf16, fp16; omit to follow active AMP/input dtype.
 
 [runtime.fp8.delayed_scaling]

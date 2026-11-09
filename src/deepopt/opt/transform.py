@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from fnmatch import fnmatchcase
 
 from torch import fx, nn
 
@@ -20,10 +21,22 @@ class TransformReport:
     function_calls: tuple[str, ...]
     untraced_modules: tuple[str, ...] = ()
     fallback_reason: str | None = None
+    excluded_modules: tuple[str, ...] = ()
 
 
 class TransformationTraceError(RuntimeError):
     """The model could not be traced with the requested strategy"""
+
+
+def excluded_module_ids(model, patterns):
+    """Exclude subtrees and every alias of their modules; exclusions win."""
+    if not isinstance(patterns, (list, tuple)) or any(not isinstance(p, str) or not p.strip() for p in patterns):
+        raise ValueError("exclude_modules must contain nonempty module-name glob patterns")
+    named = tuple(model.named_modules(remove_duplicate=False))
+    excluded = {id(child) for name, module in named
+                if any(fnmatchcase(name or "<root>", pattern) for pattern in patterns)
+                for child in module.modules()}
+    return frozenset(excluded), tuple(name or "<root>" for name, module in named if id(module) in excluded)
 
 
 
@@ -31,10 +44,11 @@ def _trace_full(
     model: nn.Module, 
     registry: ConversionRegistry, 
     *, 
-    concrete_args: dict[str, object] | None = None
+    concrete_args: dict[str, object] | None = None,
+    excluded_ids=(),
 ) -> fx.GraphModule:
 
-    tracer = DOTracer(extra_leaf_types=registry.leaf_types)
+    tracer = DOTracer(extra_leaf_types=registry.leaf_types, excluded_ids=excluded_ids)
 
     try:
         graph = tracer.trace(model, concrete_args=concrete_args)
@@ -67,6 +81,7 @@ def _transform_submodules(
     registry: ConversionRegistry,
     *,
     plan: dict,
+    excluded_ids=(),
 ) -> TransformReport:
     replacements: dict[int, nn.Module] = {}
     visited = {id(model)}
@@ -81,6 +96,8 @@ def _transform_submodules(
     def visit(module: nn.Module, path: str) -> None:
         module_id = id(module)
 
+        if module_id in excluded_ids:
+            return
         if module_id in visited or module_id in replacements:
             return
         visited.add(module_id)
@@ -90,7 +107,7 @@ def _transform_submodules(
         
         rule = registry.lookup(module)
         if rule is not None:
-            replacements[module_id] = rule.converter(module, plan=plan)
+            replacements[module_id] = registry.convert(module, plan=plan, excluded_ids=excluded_ids)
             converted_modules.append(path)
             return
         
@@ -98,14 +115,14 @@ def _transform_submodules(
             graph_module = (
                 module
                 if isinstance(module, fx.GraphModule)
-                else _trace_full(module, registry)
+                else _trace_full(module, registry, excluded_ids=excluded_ids)
             )
         except TransformationTraceError:
             untraced_modules.append(path)
             graph_module = None
         
         if graph_module is not None:
-            matches = match_graph(graph_module, registry)
+            matches = match_graph(graph_module, registry, excluded_ids=excluded_ids)
 
             if matches:
                 converted_modules.extend(
@@ -125,6 +142,7 @@ def _transform_submodules(
                     registry,
                     plan=plan,
                     replacements=replacements,
+                    excluded_ids=excluded_ids,
                 )
 
                 # A successful trace may omit registered children that were
@@ -173,6 +191,7 @@ def transform_model(
     inplace: bool = True,
     registry: ConversionRegistry | None = None,
     concrete_args: dict[str, object] | None = None,
+    exclude_modules: tuple[str, ...] = (),
 ) -> tuple[nn.Module, TransformReport]:
     """Replace supported calls with DO operations and report the result.
 
@@ -193,13 +212,20 @@ def transform_model(
     working_plan = validate_fp8_plan(plan)
     working_model = model if inplace else deepcopy(model)
     registry = default_registry() if registry is None else registry
+    excluded_ids, excluded_names = excluded_module_ids(working_model, exclude_modules)
+    if any(id(module) in excluded_ids and registry.is_converted(module) for module in working_model.modules()):
+        raise ValueError("Excluded modules already use FP8; reconstruct the original eager model before changing selection")
+    if id(working_model) in excluded_ids:
+        return working_model, TransformReport(trace_mode=trace_mode, original_type=f"{type(model).__module__}.{type(model).__qualname__}",
+                                               converted_modules=(), function_calls=(), excluded_modules=excluded_names)
 
     if trace_mode == "modules":
         report = _transform_submodules(
             working_model, registry,
             plan=working_plan,
+            excluded_ids=excluded_ids,
         )
-        return working_model, report
+        return working_model, replace(report, excluded_modules=excluded_names)
 
     if isinstance(working_model, fx.GraphModule):
         if concrete_args is not None:
@@ -207,7 +233,7 @@ def transform_model(
         graph_module = working_model
     else:
         try:
-            graph_module = _trace_full(working_model, registry, concrete_args=concrete_args)
+            graph_module = _trace_full(working_model, registry, concrete_args=concrete_args, excluded_ids=excluded_ids)
         except TransformationTraceError as exc:
             if trace_mode != "auto" or concrete_args is not None:
                 raise
@@ -215,15 +241,17 @@ def transform_model(
                 working_model,
                 registry,
                 plan=working_plan,
+                excluded_ids=excluded_ids,
             )
             cause = exc.__cause__ or exc
 
             return working_model, replace(
                 report,
-                fallback_reason=f"{type(cause).__name__}: {cause}"
+                fallback_reason=f"{type(cause).__name__}: {cause}",
+                excluded_modules=excluded_names,
             )
 
-    matches = match_graph(graph_module, registry)
+    matches = match_graph(graph_module, registry, excluded_ids=excluded_ids)
 
     report = TransformReport(
         trace_mode="full",
@@ -236,7 +264,8 @@ def transform_model(
         function_calls=tuple(
             node.name for node in matches if node.op == "call_function"
         ),
+        excluded_modules=excluded_names,
     )
 
-    graph_module = rewrite_graph(graph_module, matches, registry, plan=working_plan)
+    graph_module = rewrite_graph(graph_module, matches, registry, plan=working_plan, excluded_ids=excluded_ids)
     return graph_module, report

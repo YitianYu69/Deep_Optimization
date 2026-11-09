@@ -102,7 +102,14 @@ two-dimensional shapes; roles without inherited settings use tensorwise scaling.
 Partial overrides preserve unspecified inherited roles. `num_stages`
 defaults to `"auto"` (search stages 1–5); an integer from 1–5 pins the depth.
 `out_dtype=None` uses the active AMP/input dtype.
-FP8 uses Triton's native accumulation policy, retaining the chained FP32
+`backward_backend="inherit"` keeps backward on that same backend. Tensorwise
+Triton recipes can explicitly select `native_fast` or `native_precise` for dX/dW;
+forward retains its configured backend. Automatic preparation accepts qualified
+module-name globs in `exclude_modules`; nonempty exclusions require
+`intercept_linear=False`. See the [controls and benchmark procedure](eager_linear_benchmark.md#native-backward-and-selective-preparation)
+for native eligibility, fallback rules, aliases and MHA output selection.
+
+With the inherited Triton backend, FP8 uses native accumulation, retaining the chained FP32
 accumulator in tensorwise GEMMs. DeepOpt no longer supplies
 `max_num_imprecise_acc`. Omitting this argument follows Triton's backend default
 and differs numerically from the earlier forced limit of 32; see the
@@ -111,9 +118,12 @@ The reference backend retains its FP32 emulation. Remove the obsolete setting
 from configuration and execution plans when starting a new run; it now raises
 a migration error instead of being silently ignored.
 
-Checkpoints record numerical recipe version 2, the accumulation policy, and
-the Triton version for native FP8. Exact resume rejects missing/changed recipes
-or changed Triton versions before loading training state. Continue older FP8
+Unchanged current-scaling policies use numerical recipe version 2; unchanged
+delayed policies use version 3. Native backward or projection exclusions use
+version 4, recording the selected executor/accumulation and excluded patterns.
+Native backward also records PyTorch/CUDA versions; Triton recipes record the
+Triton version. Exact resume rejects missing or changed recipes before loading
+training state. Continue older FP8
 runs with their original library/environment, or explicitly load model weights
 into a new run. Removing an old TOML field does not migrate its numerical state.
 
@@ -149,6 +159,7 @@ plan = {
             "grad": torch.float8_e5m2,
         },
         "num_stages": "auto",
+        "backward_backend": "inherit",
         "out_dtype": None,
     },
     "block_shapes": {
@@ -339,6 +350,8 @@ operation while preserving user Torch modes. For a fully prepared model, set
 to avoid installing the broad native-linear mode. In that mode, unconverted
 native `F.linear` calls stay dense; existing DO adapters still obey nested FP8
 enable/disable/override scopes. The default retains native-linear coverage.
+Module exclusions are applied during model preparation, not by the standalone
+autocast context. Excluded native projections follow the surrounding AMP policy.
 
 `execution_mode` covers FP8 as well as loss/gradient observers. `max_speed` and
 legacy `checks=False` runtimes skip quantization's passive finite-input scans.
@@ -640,7 +653,10 @@ later does not retrace inlined Python branches. Trace under the intended mode or
 keep mode-dependent code outside traced regions.
 
 The report contains `trace_mode` (the mode actually used), `original_type`,
-`converted_modules`, `function_calls`, `untraced_modules`, and `fallback_reason`.
+`converted_modules`, `function_calls`, `untraced_modules`, `excluded_modules`,
+and `fallback_reason`. Exclusions apply to subtrees and every shared alias;
+existing FX functional projections are filtered by their module/weight owner.
+Reconstruct the original eager model to exclude a previously converted adapter.
 An untraced root in module mode is expected. Reports are diagnostics, not proof
 that every runtime branch or every possible projection was converted. There is
 no `strict` coverage policy. Conversion errors propagate; automatic fallback
@@ -743,6 +759,12 @@ this FP8 path can be captured.
 
 ## Actual CUDA execution
 
+For opt-in native backward GEMM, warmed eager launch planning, and projection
+exclusions, see the [eager Linear optimization controls](eager_linear_benchmark.md#native-backward-and-selective-preparation).
+These controls retain the existing forward backend and scaling default. Native
+backward and projection exclusions are recorded in numerical recipe version 4;
+unchanged current/delayed policies retain recipe versions 2/3.
+
 Use a CUDA-enabled PyTorch installation and compatible Triton exposing
 `triton.tools.tensor_descriptor.TensorDescriptor`. The TMA kernel requires an
 NVIDIA GPU with compute capability at least 9.0. There is no CPU fallback for a
@@ -836,7 +858,11 @@ shape, operand/output format, scale layout, prepared row strides, bias policy,
 pipeline policy, or CUDA device. Forward, input-gradient, and weight-gradient products have
 different shapes; incomplete training and validation batches introduce more
 shapes. These searches add first-use latency, especially in short runs with
-small projections. Matching calls reuse the in-process winner. Set
+small projections. Matching Triton calls invoke the in-process winner directly,
+reusing a bounded pointer-free layout plan. Each invocation constructs fresh
+descriptors bound to its current tensors; activations and outputs are never
+retained in that cache. Native backward products use PyTorch's scaled-GEMM
+executor instead of this Triton search. Set
 `TRITON_PRINT_AUTOTUNING=1` to inspect selected configurations. A bounded search
 does not guarantee the fastest possible kernel; measure on the target GPU.
 
@@ -1213,7 +1239,8 @@ one optimization. Keep future features at the existing ownership boundaries:
 | GEMM backend | Execute tensor/block-scaled products | Sparse layouts, sparse kernels, and forward/backward dispatch |
 | FX registry/matcher/rewriter | Find and replace eligible operations | Register new DO operations without adding training logic to rewriting |
 
-All three adapters delegate projections through the shared functional boundary.
+All three adapters delegate their FP8 projections through the shared functional
+boundary; an explicitly excluded MHA output projection uses dense `F.linear`.
 The autograd path keeps saved-state handling separate from backend execution and
 saves only tensors needed by requested gradients. Future activation compression
 must preserve scales/layout/dtype metadata and autograd saved-tensor lifetime;
