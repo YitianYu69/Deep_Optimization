@@ -83,7 +83,7 @@ class BlockwiseConvolutionFP8CUDATests(unittest.TestCase):
 
     def test_compiled_forward_dx_dw_use_fp8_matrix_instructions(self):
         from deepopt import FP8Config
-        from deepopt.opt.backends.triton.convolution.forward import _forward_kernel
+        from deepopt.opt.backends.triton.convolution.forward_impl import _forward_kernel
         from deepopt.opt.backends.triton.convolution.backward import _input_gradient_kernel
         from deepopt.opt.backends.triton.convolution.weight_gradient_blockwise import _blockwise_weight_gradient_kernel
         from deepopt.opt.nn import functional as deepopt_f

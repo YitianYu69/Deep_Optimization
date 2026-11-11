@@ -5,7 +5,9 @@ Imports stay lazy so importing DeepOpt does not require Triton or CUDA.
 
 
 def forward(*args, **kwargs):
-    from .forward import forward as implementation
+    # Importing a submodule binds its name on this package. A module named
+    # `forward` would replace this callable after the first warmup invocation.
+    from .forward_impl import forward as implementation
 
     return implementation(*args, **kwargs)
 

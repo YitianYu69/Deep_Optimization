@@ -1,4 +1,4 @@
-"""FP8 convolution forward: gather source patches directly into dot tiles."""
+"""FP8 forward implementation, separate from the package's lazy callable."""
 
 import torch
 import triton
