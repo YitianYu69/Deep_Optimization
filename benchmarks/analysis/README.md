@@ -7,6 +7,22 @@ there. It never installs packages, downloads models, or redirects imports to a
 checkout's `src` directory. `--help`, `--list-ops`, `--write-example`, and
 `--dry-run` do not import Torch or initialize CUDA.
 
+For separate runnable files and the complete comparison grids, run the
+[exporter](../export_comparison_benchmarks.py) from the repository root:
+
+```bash
+python benchmarks/export_comparison_benchmarks.py --output work/full-comparison-benchmarks
+bash work/full-comparison-benchmarks/run_full_comparisons.sh work/full-comparison-results
+```
+
+The export includes a self-contained operator/model runner, the Linear/GEMM and
+reconstruction programs, all-operator gradient probes, the broad settings sweep,
+crossed precision boundaries, and ViT recovery/family/interaction configurations.
+Its run guide and manifest state task counts and numerical policies. The broad
+sweep changes one setting at a time; the explicit Cartesian grids test their
+declared interactions. Exporting requires only Python, and the generated scripts
+measure the installed DeepOpt build on the destination machine.
+
 ## Start with the regression
 
 Run from the repository root using the Python environment containing the build
@@ -150,6 +166,7 @@ It receives `device=torch.device(...)` plus `factory_kwargs` and returns:
     # Optional data/transfer experiment:
     "fetch": fetch,                  # returns (inputs_tuple, kwargs_dict)
     "reset": reset,                  # rewind fetch to the identical first batch
+    "after_step": after_step,        # optional EMA/application work outside model capture
 }
 ```
 
@@ -157,6 +174,9 @@ Factories run after the same seed is set in every worker. Do not download data,
 reuse mutated global models, or choose a different architecture per case.
 `fetch` is timed and can include loader/host-to-device transfer; `reset` is
 required when `fetch` exists. Omit both for resident-input compute experiments.
+An optional `after_step()` callback is timed after optimizer updates (outside
+model graph capture). It also requires `reset()` to restore its state between
+diagnostic passes. The timm ViT factory uses this for explicit EMA updates.
 Factory-owned inputs/targets and dataset RNG must be reproducible. The initial
 fingerprint covers the model, initial inputs and `fingerprint_data`; it cannot
 prove that an arbitrary external loader later emits matching data.
@@ -206,6 +226,12 @@ silently enable your application's callbacks.
   require matching initial fingerprints and passing the configured thresholds.
   Use `--strict-accuracy` to fail the command on numerical rejection, and verify
   real task convergence separately.
+- Independent `gradients` and `updates` policies can also require
+  `max_relative_l2` and `min_cosine`, preventing a loose absolute tolerance from
+  hiding large relative gradient changes. New default/example policies use
+  those gates; explicit older tolerance objects keep their supplied behavior.
+  Use task-specific budgets and inspect both the `allclose_passed` and final
+  `passed` fields.
 - Saved bytes include codec metadata observed by outer hooks, but nested
   attention/checkpoint hooks can hide payloads. Observed unique storage counts
   include references to existing parameters/inputs. They are not incremental
@@ -226,11 +252,19 @@ silently enable your application's callbacks.
   optimizer updates execute outside capture. Dynamic data fetch and module-family
   ablation scopes require eager execution. Compile mode retains DO's declared
   eager boundaries and reports Dynamo graph-break/recompile counters.
+  FP8 graph updates require `cache_enabled=false`, so captured quantization
+  reads changed parameters on every replay. `--require-fp8-plan` rejects empty
+  or failed edge plans before measuring FP8 models/pipelines.
 - Set `runtime.optimizer_options` to match AdamW/SGD options such as weight
   decay, betas, momentum, foreach or fused execution. Optimizer state is warmed
   before the memory pass. This runner measures a single process/device; it does
-  not initialize DDP or reproduce an application's scheduler, EMA, logging or
-  checkpoint callbacks. Validate those separately when reconciling epoch time.
+  not initialize DDP or automatically enable an application's scheduler, EMA,
+  logging or checkpoint callbacks. EMA is explicit in the timm factory; other
+  application work must be supplied deliberately when reconciling epoch time.
+
+The [H100 recovery guide](../../docs/activation_compression/performance_recovery.md)
+provides the real ViT configuration, grouped/copy/tiled reconstruction comparison,
+and the distinction between this model harness and the original trainer run.
 
 ## Results and restart
 

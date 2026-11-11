@@ -87,7 +87,7 @@ def _quantize_pack_groups(x_ptr, packed_ptr, step_ptr, minimum_ptr,
     group = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, BLOCK)
     rows, cols, valid = _coordinates(group, offsets, ROWS, COLS, GROUP, BLOCK_ROWS, BLOCK_COLS)
-    values = tl.load(x_ptr + rows * STRIDE0 + cols * STRIDE1, valid, other=0).to(tl.float32)
+    values = tl.load(x_ptr + rows * STRIDE0 + cols * STRIDE1, valid, other=0.0).to(tl.float32)
     words, step, minimum = _affine_quantize_pack(values, valid, BITS, BLOCK)
     word_offsets = tl.arange(0, BLOCK // (32 // BITS))
     tl.store(packed_ptr + group * WORDS + word_offsets, words, word_offsets < WORDS)
@@ -104,7 +104,7 @@ def _partial_min_max(x_ptr, partial_min_ptr, partial_max_ptr,
     group, part = tl.program_id(0).to(tl.int64), tl.program_id(1)
     offsets = part * CHUNK + tl.arange(0, CHUNK)
     rows, cols, valid = _coordinates(group, offsets, ROWS, COLS, GROUP, BLOCK_ROWS, BLOCK_COLS)
-    values = tl.load(x_ptr + rows * STRIDE0 + cols * STRIDE1, valid, other=0).to(tl.float32)
+    values = tl.load(x_ptr + rows * STRIDE0 + cols * STRIDE1, valid, other=0.0).to(tl.float32)
     tl.store(partial_min_ptr + group * PARTS + part, tl.min(tl.where(valid, values, float("inf"))))
     tl.store(partial_max_ptr + group * PARTS + part, tl.max(tl.where(valid, values, float("-inf"))))
 
@@ -129,10 +129,25 @@ def _quantize_pack_chunks(x_ptr, packed_ptr, step_ptr, minimum_ptr,
     group, part = tl.program_id(0).to(tl.int64), tl.program_id(1)
     offsets = part * CHUNK + tl.arange(0, CHUNK)
     rows, cols, valid = _coordinates(group, offsets, ROWS, COLS, GROUP, BLOCK_ROWS, BLOCK_COLS)
-    values = tl.load(x_ptr + rows * STRIDE0 + cols * STRIDE1, valid, other=0).to(tl.float32)
+    values = tl.load(x_ptr + rows * STRIDE0 + cols * STRIDE1, valid, other=0.0).to(tl.float32)
     words = _affine_quantize_pack_with_metadata(values, valid, tl.load(step_ptr + group), tl.load(minimum_ptr + group), BITS, CHUNK)
     word_offsets = part * (CHUNK // (32 // BITS)) + tl.arange(0, CHUNK // (32 // BITS))
     tl.store(packed_ptr + group * WORDS + word_offsets, words, word_offsets < WORDS)
+
+
+@triton.jit
+def _affine_decode(codes, step, minimum, BITS: tl.constexpr, OUTPUT_MAX: tl.constexpr):
+    # Keep the same operation order in the grouped and tiled paths. In
+    # particular, the negative one-bit step encodes an overflowing full span.
+    product = codes * step
+    values = tl.where(product == float("inf"),
+                      (codes * (step * 0.5) + minimum * 0.5) * 2.0,
+                      product + minimum)
+    if BITS == 1:
+        values = tl.where(step < 0, (minimum * 0.5 + codes * -step) * 2.0, values)
+    if OUTPUT_MAX > 0:
+        values = tl.minimum(tl.maximum(values, -OUTPUT_MAX), OUTPUT_MAX)
+    return values
 
 
 @triton.jit
@@ -149,15 +164,7 @@ def _dequantize_unpack_groups(packed_ptr, step_ptr, minimum_ptr, output_ptr,
     words = tl.load(packed_ptr + group * WORDS + word_offsets, word_offsets < WORDS, other=0)
     codes = (words[:, None] >> (tl.arange(0, VPW) * BITS)[None, :]) & ((1 << BITS) - 1)
     codes = tl.reshape(codes, (CHUNK,)).to(tl.float32)
-    step, minimum = tl.load(step_ptr + group), tl.load(minimum_ptr + group)
-    product = codes * step
-    values = tl.where(product == float("inf"),
-                      (codes * (step * 0.5) + minimum * 0.5) * 2.0,
-                      product + minimum)
-    if BITS == 1:
-        values = tl.where(step < 0, (minimum * 0.5 + codes * -step) * 2.0, values)
-    if OUTPUT_MAX > 0:
-        values = tl.minimum(tl.maximum(values, -OUTPUT_MAX), OUTPUT_MAX)
+    values = _affine_decode(codes, tl.load(step_ptr + group), tl.load(minimum_ptr + group), BITS, OUTPUT_MAX)
     offsets = part * CHUNK + tl.arange(0, CHUNK)
     rows, cols, valid = _coordinates(group, offsets, ROWS, COLS, GROUP, BLOCK_ROWS, BLOCK_COLS)
     if TRANSPOSE:
@@ -165,6 +172,41 @@ def _dequantize_unpack_groups(packed_ptr, step_ptr, minimum_ptr, output_ptr,
     else:
         destination = rows * STRIDE0 + cols * STRIDE1
     tl.store(output_ptr + destination, values.to(output_ptr.dtype.element_ty), valid)
+
+
+@triton.jit
+def _dequantize_unpack_transpose(packed_ptr, step_ptr, minimum_ptr, output_ptr,
+                   STRIDE0: tl.constexpr, STRIDE1: tl.constexpr,
+                   ROWS: tl.constexpr, COLS: tl.constexpr, GROUP: tl.constexpr,
+                   BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr,
+                   WORDS: tl.constexpr, BITS: tl.constexpr, OUTPUT_MAX: tl.constexpr,
+                   TILE_ROWS: tl.constexpr, TILE_COLS: tl.constexpr):
+    # Gather a matrix tile across many compression groups. A single flat group
+    # contains only 1-2 source rows in ViT, making its transposed stores scatter
+    # across cache sectors. The 2D tile permits a coalesced output layout.
+    rows = tl.program_id(0).to(tl.int64) * TILE_ROWS + tl.arange(0, TILE_ROWS)
+    cols = tl.program_id(1).to(tl.int64) * TILE_COLS + tl.arange(0, TILE_COLS)
+    r, c = rows[:, None], cols[None, :]
+    valid = (r < ROWS) & (c < COLS)
+    if BLOCK_ROWS > 0:
+        group = (r // BLOCK_ROWS) * triton.cdiv(COLS, BLOCK_COLS) + c // BLOCK_COLS
+        within = (r % BLOCK_ROWS) * BLOCK_COLS + c % BLOCK_COLS
+    else:
+        position = r * COLS + c
+        group, within = position // GROUP, position % GROUP
+    VPW: tl.constexpr = 32 // BITS
+    words = tl.load(packed_ptr + group * WORDS + within // VPW, valid, other=0)
+    codes = ((words >> ((within % VPW) * BITS)) & ((1 << BITS) - 1)).to(tl.float32)
+    step = tl.load(step_ptr + group, valid, other=0.0)
+    minimum = tl.load(minimum_ptr + group, valid, other=0.0)
+    values = _affine_decode(codes, step, minimum, BITS, OUTPUT_MAX)
+    destination = cols[:, None] * STRIDE0 + rows[None, :] * STRIDE1
+    tl.store(output_ptr + destination, tl.trans(values).to(output_ptr.dtype.element_ty), tl.trans(valid))
+
+
+def _transpose_tiles(rows, cols):
+    """Static launch policy; no device reads, runtime tuning, or hidden scratch."""
+    return (32, 64) if cols >= 64 else (32, 32)
 
 
 def quantize_pack_affine(x, group_size=512, block_shape=None, *, bits=2):
@@ -196,17 +238,35 @@ def quantize_pack_affine(x, group_size=512, block_shape=None, *, bits=2):
 
 
 def dequantize_unpack_affine(packed, step, minimum, shape, group_size=512, block_shape=None,
-                            *, dtype=torch.bfloat16, transpose=False, bits=2):
+                            *, dtype=torch.bfloat16, transpose=False, bits=2, implementation="auto"):
     """Unpack codes and dequantize into the requested dtype and orientation."""
     group = group_size if block_shape is None else block_shape[0] * block_shape[1]
     vpw, words, _ = _bits_consts(bits, group)
     rows, cols = shape
+    if implementation not in ("auto", "grouped", "tiled", "copy"):
+        raise ValueError("implementation must be auto, grouped, tiled, or copy")
+    if implementation in ("tiled", "copy") and not transpose:
+        raise ValueError("tiled/copy controls require transpose=True")
     output_shape = (cols, rows) if transpose else (rows, cols)
     stride = (triton.cdiv(output_shape[1], 16) * 16, 1)
     output = torch.empty_strided(output_shape, stride, dtype=dtype, device=packed.device)
+    if implementation == "copy":
+        dense = dequantize_unpack_affine(packed, step, minimum, shape, group_size, block_shape,
+                                        dtype=dtype, bits=bits, implementation="grouped")
+        output.copy_(dense.T)
+        return output
     block_rows, block_cols = block_shape or (0, 0)
     chunk = min(4096, max(vpw, triton.next_power_of_2(group)))
     output_max = torch.finfo(dtype).max if dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else 0.0
+    tiled = implementation == "tiled" or (implementation == "auto" and transpose and min(rows, cols) >= 32
+                                           and rows * cols >= 4096)
+    if tiled:
+        tile_rows, tile_cols = _transpose_tiles(rows, cols)
+        _dequantize_unpack_transpose[(triton.cdiv(rows, tile_rows), triton.cdiv(cols, tile_cols))](
+            packed, step, minimum, output, *output.stride(), rows, cols, group,
+            block_rows, block_cols, words, bits, output_max, tile_rows, tile_cols,
+            num_warps=4, enable_fp_fusion=False)
+        return output
     _dequantize_unpack_groups[(packed.shape[0], triton.cdiv(group, chunk))](
         packed, step, minimum, output, *output.stride(), rows, cols, group,
         block_rows, block_cols, words, bits, transpose, output_max, chunk,

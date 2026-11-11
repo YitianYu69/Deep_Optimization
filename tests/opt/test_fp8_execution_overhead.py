@@ -94,6 +94,38 @@ class FP8ExecutionOverheadTests(unittest.TestCase):
             for _ in range(3):
                 project(torch.ones(2, 7), torch.ones(4, 7))
 
+    def test_new_autocast_validates_one_owned_snapshot_without_re_resolving_sections(self):
+        from deepopt import reset_config
+
+        reset_config()
+        self.addCleanup(reset_config)
+        original = _autocast.resolve_config
+        with patch.object(_autocast, "resolve_config", wraps=original) as resolve, \
+             patch("deepopt.opt.policy.resolve_config", side_effect=AssertionError("re-resolved validated policy")):
+            context = autocast("cpu", enabled=False, fp8={"enabled": True, "intercept_linear": False},
+                               activation_compression={"enabled": True, "bits": 4, "group_size": 17})
+        self.assertEqual(resolve.call_count, 1)
+        plan = context._fp8_scope.plan
+        self.assertEqual(plan["fp8_training"]["activation_compression"]["bits"], 4)
+        self.assertEqual(plan["fp8_training"]["activation_compression"]["group_size"], 17)
+        with context:
+            self.assertIs(_autocast._get_fp8_plan("cpu"), plan)
+        self.assertIsNone(_autocast._get_fp8_plan("cpu"))
+
+    def test_disabled_fp8_does_not_install_interception_and_compression_still_can(self):
+        from deepopt import reset_config
+
+        reset_config()
+        self.addCleanup(reset_config)
+        with autocast("cpu", enabled=False, fp8=False, activation_compression=False):
+            self.assertIsNone(torch.overrides._get_current_function_mode())
+        with autocast("cpu", dtype=torch.bfloat16, fp8=False, activation_compression=True):
+            self.assertIsInstance(torch.overrides._get_current_function_mode(), _autocast._FP8LinearMode)
+            x = torch.randn(3, 7, requires_grad=True)
+            w = torch.randn(4, 7, requires_grad=True)
+            F.linear(x, w).float().sum().backward()
+            self.assertIsNotNone(w.grad)
+
     def test_adapter_operations_bypass_our_interception_but_keep_native_linear_coverage(self):
         model = DOLinear.from_linear(nn.Linear(7, 4), plan=fp8_plan(True))
         intercepted = []

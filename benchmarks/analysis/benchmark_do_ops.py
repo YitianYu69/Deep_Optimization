@@ -30,6 +30,10 @@ from analysis.reporting import write_json, write_reports
 REGRESSION_OPS = ("linear", "conv2d", "batch_norm", "group_norm", "layer_norm", "gelu", "relu",
                   "scaled_dot_product_attention", "linear_pipeline", "conv_pipeline", "attention_pipeline")
 
+DEFAULT_TOLERANCES = {"default": {"rtol": .05, "atol": .01},
+                      "gradients": {"rtol": .05, "atol": 1e-6, "max_relative_l2": .1, "min_cosine": .99},
+                      "updates": {"rtol": .05, "atol": 1e-7, "max_relative_l2": .1, "min_cosine": .99}}
+
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -62,6 +66,8 @@ def parser():
     result.add_argument("--resume", action="store_true", help="Reuse matching successful results from this code/configuration")
     result.add_argument("--in-process", action="store_true", help="CPU smoke tests only; disables process/allocator isolation")
     result.add_argument("--strict-accuracy", action="store_true", help="Exit nonzero if a matched numerical comparison fails")
+    result.add_argument("--require-fp8-plan", action="store_true",
+                        help="For FP8 models/pipelines, reject planner fallbacks or an empty FP8 edge plan before timing")
     result.add_argument("--observed-epoch-seconds", nargs=4, type=float, metavar=("BF16", "COMPRESSION", "FP8", "COMBINED"),
                         help="User observations for context, e.g. 21 27 22 47; never treated as suite measurements")
     result.add_argument("--list-ops", action="store_true")
@@ -99,11 +105,19 @@ def configuration(args):
                      for w in workloads for mode in dict.fromkeys(args.gradient_modes)]
     if not workloads or len({w["name"] for w in workloads}) != len(workloads):
         raise ValueError("Workloads must be nonempty with unique names")
-    tolerances = data.get("tolerances", {"default": {"rtol": .05, "atol": .01}})
+    tolerances = data.get("tolerances", deepcopy(DEFAULT_TOLERANCES))
+    if not isinstance(tolerances, dict):
+        raise ValueError("tolerances must be an object")
     for name, policy in tolerances.items():
-        if set(policy) != {"rtol", "atol"} or any(
-                not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in policy.values()):
+        if (not isinstance(policy, dict) or not {"rtol", "atol"} <= policy.keys()
+                or set(policy) - {"rtol", "atol", "max_relative_l2", "min_cosine"}):
             raise ValueError(f"Invalid accuracy tolerances for {name}")
+        for key, value in policy.items():
+            if key in ("max_relative_l2", "min_cosine") and value is None:
+                continue
+            lower, upper = (-1, 1) if key == "min_cosine" else (0, math.inf)
+            if type(value) not in (int, float) or not math.isfinite(value) or not lower <= value <= upper:
+                raise ValueError(f"Invalid accuracy {key} for {name}")
     return settings, grid, workloads, tolerances
 
 
@@ -121,7 +135,7 @@ def make_plan(args):
     settings, grid, workloads, tolerances = configuration(args)
     options = {key: getattr(args, key) for key in (
         "device", "seed", "warmup", "iterations", "repeats", "phase_steps", "profile_steps", "memory",
-        "capture_workloads", "max_numerical_elements", "deterministic", "cudnn_benchmark", "fill_uninitialized_memory")}
+        "capture_workloads", "max_numerical_elements", "deterministic", "cudnn_benchmark", "fill_uninitialized_memory", "require_fp8_plan")}
     tasks, digest = [], code_hash()
     for variant_id, variant in variants(settings, grid, args.sweep):
         for workload in workloads:
@@ -259,7 +273,7 @@ def main(argv=None):
                                        "grid": {"compression.bits": [1, 2, 4, 8],
                                                 "fp8.backward_precision": ["native", "auto"]},
                                        "workloads": workload_list(REGRESSION_OPS, args.small),
-                                       "tolerances": {"default": {"rtol": .05, "atol": .01}}})
+                                       "tolerances": DEFAULT_TOLERANCES})
         print(args.write_example)
         return 0
     try:

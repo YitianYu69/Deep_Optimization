@@ -61,3 +61,32 @@ def build(device, batch_size=2, sequence_length=16, width=64, heads=4, layers=2,
     if input_mode == "pinned":
         result.update(fetch=fetch, reset=reset)
     return result
+
+
+def build_timm_vit(device, batch_size=512, image_size=224, classes=10,
+                   model_name="vit_base_patch16_224", ema_decay=0.95):
+    """Resident-input ViT factory matching the reported H100 workload; no downloads."""
+    import torch
+    from torch.nn import functional as F
+    try:
+        import timm
+    except ImportError as error:
+        from .workloads import UnsupportedWorkload
+        raise UnsupportedWorkload("The ViT factory requires timm in the GPU environment") from error
+
+    model = timm.create_model(model_name, pretrained=False, img_size=image_size, num_classes=classes).to(device)
+    images = torch.randn(batch_size, 3, image_size, image_size, device=device)
+    targets = torch.randint(classes, (batch_size,), device=device)
+    result = {"model": model, "inputs": (images,), "kwargs": {},
+              "loss_fn": lambda output: F.cross_entropy(output.float(), targets), "fingerprint_data": (targets,)}
+    if ema_decay is not None:
+        from deepopt.engine.training.ema import ExponentialMovingAverage
+
+        ema = ExponentialMovingAverage(model, ema_decay)
+        initial = {**ema.state_dict(), "shadow": {name: value.cpu().clone() for name, value in ema.shadow.items()}}
+
+        def reset():
+            ema.load_state_dict(initial, completed_updates=0)
+
+        result.update(after_step=lambda: ema.update(model), reset=reset)
+    return result

@@ -219,6 +219,8 @@ def incompatibility(settings, case, workload, device):
         return "CUDA Graph requires CUDA"
     if r["execution"] == "graph" and fp8 and f["scaling_recipe"] == "delayed":
         return "Delayed scaling updates require eager processing"
+    if r["execution"] == "graph" and fp8 and r["cache_enabled"]:
+        return "FP8 graph updates require cache_enabled=False so changed weights are requantized on every replay"
     if r["execution"] == "graph" and r["check_finite"] and (fp8 or compressed):
         return "Host-visible finite diagnostics are incompatible with CUDA capture"
     if r["binding"] == "intercept" and fp8 and f["scaling_recipe"] == "delayed":
