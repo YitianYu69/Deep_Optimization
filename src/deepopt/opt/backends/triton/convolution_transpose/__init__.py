@@ -28,7 +28,7 @@ def forward(qx, qw, geometry, *, bias=None, out_dtype, num_stages="auto", output
 def input_gradient(qg, qw, geometry, *, out_dtype, num_stages="auto", gradient_output=None, gemm_backend="triton"):
     if _pointwise(geometry, qg, qw):
         return _gemm(qg, qw, gemm_backend, out_dtype, num_stages, gradient_output)
-    from ..convolution.forward import forward as convolution
+    from ..convolution.forward_impl import forward as convolution
 
     return convolution(qg, qw, geometry.adjoint, out_dtype=out_dtype, num_stages=num_stages,
                        gradient_output=gradient_output)

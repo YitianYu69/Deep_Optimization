@@ -102,7 +102,7 @@ def kernel_namespace():
                  "range": lambda *args: (torch.tensor(value, dtype=torch.int32)
                                          for value in range(*map(int, args)))}
     package = files("deepopt.opt.backends.triton.convolution")
-    for filename in ("common.py", "forward.py", "backward.py", "weight_gradient_blockwise.py"):
+    for filename in ("common.py", "forward_impl.py", "backward.py", "weight_gradient_blockwise.py"):
         tree = ast.parse(package.joinpath(filename).read_text())
         functions = []
         for node in tree.body:
