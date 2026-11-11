@@ -66,6 +66,12 @@ and reports exactness, payload bytes and repeated timings. See
 python benchmarks/activation_compression/benchmark_boolean_mask.py --help
 ```
 
+[benchmark_activation_unpack.py](activation_compression/benchmark_activation_unpack.py)
+isolates the transposed reconstruction bottleneck. It compares grouped, tiled,
+and contiguous-decode-plus-copy strategies on identical packed inputs, with
+exact numerical checks and eager/graph timing. Default shapes reproduce the
+large ViT projection inputs. See [performance recovery](../docs/activation_compression/performance_recovery.md).
+
 ## Spatial convolutions
 
 [benchmark_convolution.py](convolution/benchmark_convolution.py) compares native

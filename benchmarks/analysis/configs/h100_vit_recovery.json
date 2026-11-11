@@ -1,0 +1,19 @@
+{
+  "settings": {
+    "fp8": {"backend": "triton", "trace_mode": "modules", "num_stages": 3, "backward_backend": "native_fast", "backward_precision": "native"},
+    "compression": {"bits": 2, "group_size": 1024, "norm_xhat_recenter": true},
+    "runtime": {"binding": "prepared", "optimizer": "adamw", "optimizer_options": {"weight_decay": 0.0}, "lr": 0.0001,
+                "cache_enabled": false, "check_finite": false, "execution": "graph"}
+  },
+  "workloads": [
+    {"name": "vit_b512", "op": "model", "shape": [512, 3, 224, 224], "input_requires_grad": false,
+     "factory": "analysis.example_model:build_timm_vit",
+     "factory_kwargs": {"batch_size": 512, "image_size": 224, "classes": 10, "ema_decay": 0.95},
+     "calls_per_step": 1}
+  ],
+  "tolerances": {
+    "default": {"rtol": 0.05, "atol": 0.01},
+    "gradients": {"rtol": 0.05, "atol": 0.000001, "max_relative_l2": 0.1, "min_cosine": 0.99},
+    "updates": {"rtol": 0.05, "atol": 0.0000001, "max_relative_l2": 0.1, "min_cosine": 0.99}
+  }
+}

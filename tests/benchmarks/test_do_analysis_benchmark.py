@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import torch
 
@@ -79,6 +80,15 @@ class AnalysisMatrixTests(unittest.TestCase):
         exact = errors({"index": torch.tensor([100000001])}, {"index": torch.tensor([100000000])}, .1, .1)
         self.assertFalse(exact["passed"])
         self.assertTrue(exact["tensors"]["index"]["exact"])
+
+    def test_gradient_norm_gate_rejects_errors_hidden_by_large_absolute_tolerance(self):
+        reference = {"parameter_grad.weight": torch.tensor([1e-5, 2e-5])}
+        actual = {"parameter_grad.weight": reference["parameter_grad.weight"] * 1.234}
+        result = errors(actual, reference, .05, .01,
+                        gradient_policy={"rtol": .05, "atol": .01, "max_relative_l2": .1, "min_cosine": .99})
+        self.assertTrue(result["tensors"]["parameter_grad.weight"]["allclose_passed"])
+        self.assertFalse(result["passed"])
+        self.assertGreater(result["tensors"]["parameter_grad.weight"]["relative_l2"], .23)
 
     def test_report_recovers_known_19_second_interaction_and_gates_bad_accuracy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -179,6 +189,24 @@ class AnalysisExecutionTests(unittest.TestCase):
             self.assertIs(session.inputs[0], session.raw_inputs[0])
             first, second = snapshot(session), snapshot(session)
             self.assertTrue(torch.equal(first["loss"], second["loss"]))
+        finally:
+            session.close()
+
+    def test_model_factory_post_step_ema_rewinds_with_diagnostics(self):
+        task, options = self.task(case="fp8_compression", update={"runtime": {"optimizer": "sgd"}})
+        task["workload"] = normalize_workload({"op": "model", "shape": [2, 3, 4, 4],
+            "factory": "analysis.example_model:build_timm_vit", "factory_kwargs": {"batch_size": 2,
+                "image_size": 4, "classes": 3, "ema_decay": 0.95}})
+        fake_timm = SimpleNamespace(create_model=lambda *a, **k: torch.nn.Sequential(torch.nn.Flatten(),
+            torch.nn.Linear(48, 16), torch.nn.GELU(), torch.nn.Linear(16, 3)))
+        with patch.dict(sys.modules, {"timm": fake_timm}):
+            session = Session(task, options)
+        try:
+            self.assertIsNotNone(session.after_step)
+            first, second = snapshot(session), snapshot(session)
+            for name in first:
+                if first[name] is not None:
+                    self.assertTrue(torch.equal(first[name], second[name]), name)
         finally:
             session.close()
 

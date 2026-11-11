@@ -2,6 +2,10 @@
 
 [Documentation index](../README.md) · [FP8 guide](../fp8/README.md) · [Benchmark catalog](../../benchmarks/README.md)
 
+See [performance recovery](performance_recovery.md) for the H100 bottleneck,
+tiled unpack/transpose implementation, compatibility fixes and target-GPU
+validation commands.
+
 Affine compression reduces the activations retained for linear weight
 gradients. Forward still computes with the original FP8 or BF16 activation.
 Backward reconstructs the saved activation and uses the existing GEMM backend.

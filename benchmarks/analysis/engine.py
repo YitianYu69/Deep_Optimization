@@ -108,8 +108,10 @@ class Session:
         self.model, self.inputs, self.kwargs = package["model"], package["inputs"], package["kwargs"]
         self.loss_fn = package.get("loss_fn")
         self.fetch, self.reset_source = package.get("fetch"), package.get("reset")
-        if self.fetch is not None and self.reset_source is None:
-            raise ValueError("A factory with fetch must also provide reset() for repeatable diagnostic passes")
+        self.after_step = package.get("after_step")
+        if (self.fetch is not None or self.after_step is not None) and self.reset_source is None:
+            raise ValueError("A factory with fetch/after_step must provide reset() for repeatable diagnostic passes")
+        self.model.train(self.spec["training"])
         mode = self.spec["gradient_mode"]
         if mode != "all":
             for value in tensor_leaves(self.inputs):
@@ -369,6 +371,9 @@ class Session:
         if optimizer and self.optimizer is not None:
             with mark("analysis.optimizer"):
                 self.optimizer.step()
+        if optimizer and self.after_step is not None:
+            with mark("analysis.after_step"):
+                self.after_step()
         # Retain output buffers, not the entire autograd graph between updates.
         self.last_output = tuple(value.detach() for value in tensor_leaves(output))
         return self.last_output
@@ -394,6 +399,8 @@ class Session:
         self.graph.replay()
         if self.optimizer is not None:
             self.optimizer.step()
+        if self.after_step is not None:
+            self.after_step()
         return self.graph_output
 
     def execution_info(self):
@@ -433,6 +440,7 @@ class Session:
                 "transformation": asdict(self.report) if self.report is not None else None,
                 "precision_plan": precision_report(self.model) if not self.native else None,
                 "compile_counters": counters,
+                "factory_after_step": self.after_step is not None,
                 "effective_attention_bits": self.compression.attention_bits or max(4, self.compression.bits),
                 "activation_compression_block_override": self.fp8_config.block_shapes["activation"] if self.fp8 else None,
                 "notes": self.notes}
@@ -447,6 +455,12 @@ def run_task(task, options, directory):
 
     session = Session(task, options)
     try:
+        if options.get("require_fp8_plan") and session.fp8:
+            from deepopt.opt.precision import precision_report
+
+            plan = precision_report(session.model)
+            if (plan is None or plan["fallbacks"] or not any(edge["precision"] == "fp8" for edge in plan["edges"])):
+                raise RuntimeError(f"Required FP8 edge plan is missing or failed: {plan}")
         numerical = snapshot(session)
         recorded = []
         if options["capture_workloads"] and session.native:

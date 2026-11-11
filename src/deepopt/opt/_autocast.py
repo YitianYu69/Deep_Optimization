@@ -326,7 +326,7 @@ def _suspend_fp8_interception():
 class _FP8Scope:
     """Resolve once; each entry owns only its context token and mode lifetime."""
 
-    def __init__(self, device_type, fp8=_UNSET, *, config=None):
+    def __init__(self, device_type, fp8=_UNSET, *, config=None, _validated_snapshot=False):
         self.device_type = device_type
         self.inherit_outer = fp8 is _UNSET
         self.plan = None
@@ -338,15 +338,29 @@ class _FP8Scope:
             return
         from .policy import fp8_plan, normalize_fp8_config
 
-        settings = normalize_fp8_config(
-            {"enabled": True, **fp8} if isinstance(fp8, Mapping) else fp8, config=config)
+        if _validated_snapshot:
+            # autocast owns a fully resolved snapshot. Revalidating its entire
+            # experiment here (and again inside fp8_plan) costs more than small
+            # GPU operations. Keep public raw-config entry points unchanged.
+            from deepopt.config import fp8_config_from_dict
+
+            settings = fp8_config_from_dict(config.get("runtime", {}).get("fp8", {}))
+        else:
+            settings = normalize_fp8_config(
+                {"enabled": True, **fp8} if isinstance(fp8, Mapping) else fp8, config=config)
         if fp8 is _UNSET and not settings.enabled:
             return
         if settings.enabled and device_type not in ("cpu", "cuda"):
             raise ValueError("FP8 autocast supports CPU and CUDA devices")
         from deepopt.opt.nn.functional import _prepare_fp8_plan
 
-        self.plan = _prepare_fp8_plan(fp8_plan(settings, config=config)) if settings.enabled else False
+        if settings.enabled and _validated_snapshot:
+            from deepopt.config import activation_compression_config_from_dict
+
+            compression = activation_compression_config_from_dict(config.get("runtime", {}).get("activation_compression", {}))
+            self.plan = _prepare_fp8_plan(fp8_plan(settings, activation_compression=compression))
+        else:
+            self.plan = _prepare_fp8_plan(fp8_plan(settings, config=config)) if settings.enabled else False
         self.intercept_linear = settings.intercept_linear
         self.intercept_convolution = (settings.intercept_linear if settings.intercept_convolution is None
                                       else settings.intercept_convolution)
@@ -384,8 +398,9 @@ class _FP8Scope:
                 from deepopt.opt.scaling.delayed import fp8_scaling_scope
 
                 scaling = fp8_scaling_scope()
-            with scaling, \
-                 _linear_mode() if self.intercept_linear or self.intercept_convolution or self.intercept_normalization or self.intercept_pooling else nullcontext():
+            intercept = self.plan is not False and (self.intercept_linear or self.intercept_convolution
+                        or self.intercept_normalization or self.intercept_pooling)
+            with scaling, _linear_mode() if intercept else nullcontext():
                 yield
         finally:
             _active_pooling_interception.reset(pooling_token)
@@ -401,18 +416,24 @@ def fp8_context(device_type, fp8=_UNSET, *, config=None):
 
 
 class _ActivationCompressionScope:
-    def __init__(self, device_type, settings=_UNSET, *, config=None):
+    def __init__(self, device_type, settings=_UNSET, *, config=None, _validated_snapshot=False):
         self.device_type = device_type
         self.inherit_outer = settings is _UNSET or settings is None
         self.settings = None
         if settings is None:
             return
-        snapshot = resolve_config(config)
+        snapshot = config if _validated_snapshot else resolve_config(config)
         if settings is _UNSET and "activation_compression" not in snapshot.get("runtime", {}):
             return
         from .policy import normalize_activation_compression_config
 
-        self.settings = asdict(normalize_activation_compression_config(settings, config=snapshot))
+        if _validated_snapshot:
+            from deepopt.config import activation_compression_config_from_dict
+
+            self.settings = asdict(activation_compression_config_from_dict(
+                snapshot.get("runtime", {}).get("activation_compression", {})))
+        else:
+            self.settings = asdict(normalize_activation_compression_config(settings, config=snapshot))
 
     @contextmanager
     def enter(self):
@@ -478,8 +499,8 @@ class autocast(ContextDecorator):
         overrides = {"runtime": runtime_overrides} if runtime_overrides else None
         self.config = resolve_config(config, overrides=overrides)
         self._compression_scope = _ActivationCompressionScope(
-            device_type, self.activation_compression, config=self.config)
-        self._fp8_scope = _FP8Scope(device_type, self.fp8, config=self.config)
+            device_type, self.activation_compression, config=self.config, _validated_snapshot=True)
+        self._fp8_scope = _FP8Scope(device_type, self.fp8, config=self.config, _validated_snapshot=True)
 
     def _recreate_cm(self):
         # Entries store their state in context variables, so decorators can

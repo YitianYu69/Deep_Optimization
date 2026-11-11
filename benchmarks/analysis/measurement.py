@@ -125,16 +125,24 @@ def snapshot(session):
         session.optimizer.step()
         for name, parameter in session.model.named_parameters():
             values[f"parameter_update.{name}"] = capture(parameter, f"parameter_update.{name}") - before[name]
+    if session.after_step is not None:
+        session.after_step()
     session.snapshot_metadata = metadata
     session.reset()
     return values
 
 
-def errors(actual, expected, rtol, atol):
+def errors(actual, expected, rtol, atol, *, max_relative_l2=None, min_cosine=None,
+           gradient_policy=None, update_policy=None):
     import torch
 
     result, passed, finite = {}, True, True
     for key in sorted(set(actual) | set(expected)):
+        policy = {"rtol": rtol, "atol": atol, "max_relative_l2": max_relative_l2, "min_cosine": min_cosine}
+        selected = gradient_policy if key.startswith(("input_grad.", "parameter_grad.")) else (
+            update_policy if key.startswith("parameter_update.") else None)
+        if selected:
+            policy.update(selected)
         x, y = actual.get(key), expected.get(key)
         if x is None or y is None:
             same = x is None and y is None and key in actual and key in expected
@@ -157,12 +165,19 @@ def errors(actual, expected, rtol, atol):
         delta = x - y
         norm_x, norm_y = x.norm().item(), y.norm().item()
         cosine = ((x @ y).item() / (norm_x * norm_y)) if norm_x and norm_y else (1.0 if not norm_x and not norm_y else 0.0)
-        close = exact_match if exact else bool(torch.allclose(x, y, rtol=rtol, atol=atol))
-        result[key] = {"passed": close, "finite": True, "max_abs": delta.abs().max().item() if x.numel() else 0,
-                       "relative_l2": delta.norm().item() / max(norm_y, 1e-30), "cosine": cosine,
+        cosine = max(-1.0, min(1.0, cosine))
+        relative = delta.norm().item() / max(norm_y, 1e-30)
+        close = exact_match if exact else bool(torch.allclose(x, y, rtol=policy["rtol"], atol=policy["atol"]))
+        accepted = close and (exact or (
+            (policy["max_relative_l2"] is None or relative <= policy["max_relative_l2"])
+            and (policy["min_cosine"] is None or cosine >= policy["min_cosine"])))
+        result[key] = {"passed": accepted, "allclose_passed": close, "finite": True, "max_abs": delta.abs().max().item() if x.numel() else 0,
+                       "relative_l2": relative, "cosine": cosine,
                        "exact": exact}
-        passed &= close
-    return {"passed": passed, "finite": finite, "rtol": rtol, "atol": atol, "tensors": result}
+        passed &= accepted
+    return {"passed": passed, "finite": finite, "rtol": rtol, "atol": atol,
+            "max_relative_l2": max_relative_l2, "min_cosine": min_cosine,
+            "gradient_policy": gradient_policy, "update_policy": update_policy, "tensors": result}
 
 
 def memory_diagnostics(session):
@@ -203,6 +218,8 @@ def memory_diagnostics(session):
             session.backward(loss / accumulation)
         if session.optimizer is not None:
             session.optimizer.step()
+        if session.after_step is not None:
+            session.after_step()
     synchronize(torch, session.device)
     result = {"observed_saved_logical_bytes": sum(row["logical_bytes"] for row in rows),
               "observed_saved_unique_storage_bytes": sum(storages.values()), "saved_tensors": rows,

@@ -12,6 +12,72 @@ class ActivationCompressionCUDATests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(719)
 
+    def test_already_fp8_inputs_pack_with_float_padding_in_all_launch_paths(self):
+        from deepopt.opt.quantization.activation import quantize_pack_activation
+
+        for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            cpu = torch.randn(67, 131).to(dtype).T
+            value = cpu.T.contiguous().to("cuda").T
+            for bits in (1, 2, 4, 8):
+                for group, blocks in ((17, None), (20003, None), (512, (32, 32))):
+                    with self.subTest(dtype=dtype, bits=bits, group=group, blocks=blocks):
+                        actual = quantize_pack_activation(value, group, blocks, bits=bits)
+                        expected = quantize_pack_activation(cpu, group, blocks, bits=bits)
+                        torch.testing.assert_close(actual.data.cpu(), expected.data, rtol=0, atol=0)
+                        torch.testing.assert_close(actual.step.cpu(), expected.step, rtol=1e-6, atol=0)
+                        torch.testing.assert_close(actual.minimum.cpu(), expected.minimum, rtol=0, atol=0)
+
+    def test_tiled_transpose_matches_grouped_and_copy_with_tails_and_graph_replay(self):
+        from deepopt.opt.quantization.activation import quantize_pack_activation
+        from deepopt.opt.backends.triton.quantization.activation.affine import dequantize_unpack_affine
+
+        for bits in (1, 2, 4, 8):
+            for group, blocks in ((17, None), (1024, None), (512, (16, 32))):
+                packed = quantize_pack_activation(torch.randn(67, 131, device="cuda", dtype=torch.bfloat16), group, blocks, bits=bits)
+                for dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+                    def decode(implementation):
+                        return dequantize_unpack_affine(packed.data, packed.step, packed.minimum, packed.shape,
+                            group, blocks, dtype=dtype, bits=bits, transpose=True, implementation=implementation)
+                    expected = decode("grouped")
+                    for implementation in ("tiled", "copy", "auto"):
+                        actual = decode(implementation)
+                        torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+                        storage_dtype = torch.int16 if dtype == torch.bfloat16 else torch.uint8
+                        self.assertTrue(torch.equal(actual.view(storage_dtype), expected.view(storage_dtype)))
+                        self.assertEqual(actual.stride(0) % 16, 0)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                decode("tiled")
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = decode("tiled")
+        graph.replay()
+        torch.testing.assert_close(captured.float(), expected.float(), rtol=0, atol=0)
+
+    def test_compressed_prepared_gelu_linear_edge_accepts_already_fp8_values(self):
+        from copy import deepcopy
+        import deepopt
+        from deepopt.opt.policy import prepare_fp8_model
+        from deepopt.opt.precision import precision_report
+
+        settings = deepopt.FP8Config(enabled=True, backend="triton", trace_mode="modules", intercept_linear=False)
+        template = torch.nn.Sequential(torch.nn.Linear(64, 128), torch.nn.GELU(), torch.nn.Linear(128, 64)).cuda()
+        dense, _ = prepare_fp8_model(deepcopy(template), settings, activation_compression=False)
+        compressed, _ = prepare_fp8_model(deepcopy(template), settings, activation_compression=True)
+        self.assertFalse(precision_report(compressed)["fallbacks"])
+        self.assertTrue(any(e["precision"] == "fp8" for e in precision_report(compressed)["edges"]))
+        x = torch.randn(37, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        with deepopt.autocast("cuda", dtype=torch.bfloat16, fp8=settings, check_finite=False,
+                             activation_compression=None, cache_enabled=False):
+            expected, actual = dense(x), compressed(x)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            actual.float().square().mean().backward()
+        self.assertTrue(torch.isfinite(x.grad).all())
+        self.assertTrue(all(torch.isfinite(p.grad).all() for p in compressed.parameters()))
+
     def test_variable_bit_widths_fused_fp8_cast_and_native_codec(self):
         from deepopt.opt.quantization.activation import quantize_pack_activation, dequantize_unpack_activation
         from deepopt.opt.quantization.activation_fp8 import quantize_pack_fp8_activation

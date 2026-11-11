@@ -110,6 +110,15 @@ def _transform_submodules(
             replacements[module_id] = registry.convert(module, plan=plan, excluded_ids=excluded_ids)
             converted_modules.append(path)
             return
+
+        if type(module) in (nn.Sequential, nn.ModuleList, nn.ModuleDict):
+            # Built-in containers have no functional computation to rewrite.
+            # Retain iteration/indexing for caller forwards and checkpoint_seq;
+            # replacing them with GraphModule also breaks later FX planning.
+            for name, child in tuple(module._modules.items()):
+                if child is not None:
+                    visit(child, f"{path}.{name}")
+            return
         
         try:
             graph_module = (

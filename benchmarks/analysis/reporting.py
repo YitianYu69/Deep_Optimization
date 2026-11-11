@@ -41,7 +41,8 @@ def summarize(results, tolerances, measured_epochs=None):
                 continue
             same = row["initial_state_sha256"] == native["initial_state_sha256"]
             same_build = row.get("environment", {}).get("deepopt_source_sha256") == native.get("environment", {}).get("deepopt_source_sha256")
-            numerical = errors(snapshots[case], snapshots["torch_bf16"], **policy)
+            numerical = errors(snapshots[case], snapshots["torch_bf16"], **policy,
+                               gradient_policy=tolerances.get("gradients"), update_policy=tolerances.get("updates"))
             numerical["full_tensor_finite"] = (row.get("numerical_snapshot", {}).get("full_tensor_finite", True)
                                                 and native.get("numerical_snapshot", {}).get("full_tensor_finite", True))
             numerical["same_output_and_gradient_shapes"] = (row.get("numerical_snapshot", {}).get("original_shapes", {})
@@ -54,7 +55,8 @@ def summarize(results, tolerances, measured_epochs=None):
             row["correctness_vs_torch_bf16"] = numerical
             uncompressed = {"compression": "do_bf16", "fp8_compression": "fp8"}.get(case)
             if uncompressed in snapshots:
-                row["correctness_vs_uncompressed"] = errors(snapshots[case], snapshots[uncompressed], **policy)
+                row["correctness_vs_uncompressed"] = errors(snapshots[case], snapshots[uncompressed], **policy,
+                    gradient_policy=tolerances.get("gradients"), update_policy=tolerances.get("updates"))
             raw = median_ms(native) / median_ms(row)
             comparisons.append({"variant_id": variant, "workload": name, "case": case,
                                 "same_initial_state": same, "accuracy_passed": numerical["passed"],
