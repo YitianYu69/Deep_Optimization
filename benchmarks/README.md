@@ -8,6 +8,21 @@ The FP8 and activation-compression programs use normal library imports and can
 be copied outside the checkout to measure an installed build. They do not
 install dependencies or select this repository's source tree.
 
+## Cross-operator FP8 and compression analysis
+
+[benchmark_do_ops.py](analysis/benchmark_do_ops.py) runs matched PyTorch BF16,
+DO BF16, compression-only, FP8-only and combined cases across every public DO
+operator family. It reports the extra FP8/compression interaction, numerical
+errors, memory, separate profiler traces and explicit unsupported/error rows.
+JSON grids support main-effect or Cartesian settings sweeps; model factories
+support family ablations and recording shapes for operator replay. See the
+[analysis guide](analysis/README.md) for configurations and measurement limits.
+
+```bash
+python benchmarks/analysis/benchmark_do_ops.py --preset all --dry-run
+python benchmarks/analysis/benchmark_do_ops.py --config benchmarks/analysis/configs/interaction.json --output work/interaction
+```
+
 ## FP8 projections and training
 
 | Program | Measures | Guide |
