@@ -44,7 +44,7 @@ jobs:
         env:
           DEEPOPT_REQUIRE_MODEL_TESTS: '1'
         run: |
-          for group in opt cuda execution optimization training metrics memory observability application onboarding scheduling; do
+          for group in opt benchmarks cuda execution optimization training metrics memory observability application onboarding scheduling; do
             python -m unittest discover -s tests/$group -v
           done
       - run: python -m build
@@ -114,7 +114,7 @@ jobs:
       - run: python -m unittest discover -s tests/execution -v
       - run: python -m unittest discover -s tests/cuda -v
       - run: python -m unittest discover -s tests/distributed -v
-      - run: torchrun --standalone --nproc-per-node=2 benchmarks/benchmark_execution.py --device cuda --precision bf16 --pinned --non-blocking --profile > benchmark-cuda.json
+      - run: torchrun --standalone --nproc-per-node=2 benchmarks/training/benchmark_execution.py --device cuda --precision bf16 --pinned --non-blocking --profile > benchmark-cuda.json
       - uses: actions/upload-artifact@v4
         with:
           name: cuda-benchmark

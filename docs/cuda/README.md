@@ -217,6 +217,35 @@ counters and diagnostics would run only once. Runtime compute/backward/update
 operations reject active CUDA capture; capture the model instead. Diagnostic
 modes remain independent of graph capture.
 
+To verify that a trainer is using its captured model, inspect
+`captured.statistics`. These cumulative counters distinguish successful forward
+replays from eager fallbacks caused by mode or precision-policy changes. Warmup/capture,
+rejected inputs and failed forwards are excluded. The counters use no CUDA
+synchronization and remain readable after `close()`; they count forward
+dispatches rather than completed GPU execution or backward replays.
+
+For a trainer constructed with the captured model, report the counters after
+each epoch using an ordinary callback:
+
+```python
+from deepopt import is_main_process
+
+def report_graph(trainer, row):
+    if is_main_process():
+        print(f"Epoch {row['epoch']}: {captured.statistics}")
+
+trainer.fit(train_loader, validation_loader, epochs=2, callbacks=[report_graph])
+```
+
+`forward_replays` should increase during matching training calls.
+`eager_mode_fallbacks` normally increases during validation because `eval()`
+differs from a training capture. Unexpected `eager_autocast_fallbacks` indicate
+that calls use a different AMP, FP8, or activation compression scope. Compression
+enablement and group size, and FP8 linear interception, must match capture.
+If both mode and precision policy differ,
+only the mode fallback counter increases. The `captured` property alone means
+that the handle is open; it does not prove that any call used graph replay.
+
 Additional contracts:
 
 - Shapes, strides, dtype, device, input count and grad flags must match the
@@ -225,10 +254,14 @@ Additional contracts:
 - Model capture preserves registered buffer values and the default CPU/CUDA
   RNG states during setup. Forward must not mutate inputs, parameters or arbitrary
   Python state. Plain-function closure state is caller-owned and is not restored.
-- Train/eval changes, child mode changes and autocast changes use the original
+- Train/eval changes, child mode changes, and changes to AMP, FP8, or activation
+  compression scopes use the original
   callable eagerly. Returning to the captured settings uses the graph again.
   Capture under the intended AMP/autocast precision (BF16 where supported); the
   helper disables autocast caching during setup.
+- Inference decorators reject changed AMP, FP8, or activation compression
+  scopes and require recapture. An absent compression override inherits a
+  prepared adapter's policy; an explicit disabled override is a distinct scope.
 - Model parameters/buffers must keep their identity, storage and metadata.
   In-place optimizer updates and ordinary `load_state_dict` copies are allowed.
   Replacing parameters, changing device/dtype, adding buffers or `assign=True`

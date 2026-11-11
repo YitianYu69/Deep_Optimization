@@ -17,7 +17,7 @@ from deepopt import autocast
 from deepopt.config import FP8Config, TrainingConfig, get_config, load_config, reset_config
 from deepopt.data import ResumableDataLoader, build_loaders
 from deepopt.logger import init_logger, logging_session
-from deepopt.opt.do_nn.functional import do_linear
+from deepopt.opt.nn.functional import do_linear
 from deepopt.opt.policy import fp8_plan, normalize_fp8_config
 from deepopt.optimizer_factory import build_optimizer
 from deepopt.scheduling import Constant, ScheduleController

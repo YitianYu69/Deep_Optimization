@@ -12,14 +12,14 @@ from torch import nn
 from torch.nn import functional as F
 
 from deepopt.opt.backends import gemm_nt
-from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
-from deepopt.opt.do_nn.functional import do_linear, validate_fp8_plan
-from deepopt.opt.do_nn.hf_conv1d_module import DOHFConv1D, get_hf_conv1d_type
-from deepopt.opt.do_nn.linear_module import DOLinear
-from deepopt.opt.do_nn.mha_module import DOMultiheadAttention
+from deepopt.opt.nn.autograd import linear as linear_autograd_func
+from deepopt.opt.nn.functional import do_linear, validate_fp8_plan
+from deepopt.opt.nn.hf_conv1d import DOHFConv1D, get_hf_conv1d_type
+from deepopt.opt.nn.linear import DOLinear
+from deepopt.opt.nn.attention import DOMultiheadAttention
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from deepopt.opt.quantization.tensor import QuantizedTensor
-from deepopt.opt.scaling_strategy.amax import AmaxScaling
+from deepopt.opt.scaling.amax import AmaxScaling
 from tests.opt.fp8_support import round_fp8
 
 
@@ -306,7 +306,7 @@ class FP8AdaptersWhiteBoxTests(unittest.TestCase):
                 padding[..., 1] = float("-inf")
                 kwargs = dict(attn_mask=mask, key_padding_mask=padding, need_weights=need_weights,
                               average_attn_weights=False)
-                with patch("deepopt.opt.do_nn.mha_module.do_linear",
+                with patch("deepopt.opt.nn.attention.do_linear",
                            side_effect=lambda x, w, b=None, **kw: F.linear(x, w, b)):
                     actual, actual_weights = module(*actual_inputs, **kwargs)
                 expected, expected_weights = dense(*expected_inputs, **kwargs)
@@ -328,7 +328,7 @@ class FP8AdaptersWhiteBoxTests(unittest.TestCase):
         original = nn.MultiheadAttention(8, 2, dropout=.4, batch_first=True)
         module = DOMultiheadAttention.from_mha(original, plan=_plan())
         x = torch.randn(2, 4, 8)
-        with patch("deepopt.opt.do_nn.mha_module.do_linear", wraps=do_linear) as projection:
+        with patch("deepopt.opt.nn.attention.do_linear", wraps=do_linear) as projection:
             module(x, x, x)
         self.assertEqual(projection.call_count, 2)  # packed QKV, then output
         self.assertIs(projection.call_args_list[0].args[1], original.in_proj_weight)

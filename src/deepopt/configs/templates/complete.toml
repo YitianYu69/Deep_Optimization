@@ -87,6 +87,10 @@ enabled = false
 backend = "reference"              # reference emulation or triton native CUDA FP8 GEMM.
 trace_mode = "modules"             # modules, full, or auto.
 intercept_linear = true            # false: prepared DO operations only; native F.linear stays dense.
+# intercept_convolution = true     # Optional override; otherwise inherits intercept_linear.
+# intercept_normalization = true   # Optional override; otherwise inherits intercept_linear.
+# intercept_pooling = true         # Optional override; otherwise inherits intercept_linear.
+backward_precision = "native"    # Set "auto" for one-time planned FP8 activation gradients.
 activation_dtype = "e4m3fn"         # e4m3fn or e5m2.
 weight_dtype = "e4m3fn"             # e4m3fn or e5m2.
 grad_dtype = "e4m3fn"               # e4m3fn or e5m2; each operand chooses independently.
@@ -111,6 +115,15 @@ reduce_amax = true                 # Synchronize observations at update boundari
 # activation = [32, 32]
 # weight = [32, 32]
 # grad = [32, 32]
+
+[runtime.activation_compression]
+# Compress supported saved state: inputs, derivatives, norm xhat, pooling routing; average pooling saves no activations.
+enabled = false
+group_size = 512                  # Tensorwise FP8 and BF16 groups; block FP8 uses activation scale tiles.
+bits = 2                          # Global saved-activation precision: 1, 2, 4 or 8 bits.
+norm_xhat_recenter = false         # Preserve the original xhat mean after decoding in norm backward.
+# Attention Q/K/V default to max(4, bits). Set attention_bits explicitly to override, including lower precision.
+# attention_bits = 2
 
 [runtime.ddp]
 # Applied by the DDP core. Launch/group/rank/device assignment remains external.

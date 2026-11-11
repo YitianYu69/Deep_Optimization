@@ -9,9 +9,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from deepopt.opt.do_nn.functional import do_linear
-from deepopt.opt.do_nn.linear_module import DOLinear
-from deepopt.opt.do_nn.mha_module import DOMultiheadAttention
+from deepopt.opt.nn.functional import do_linear
+from deepopt.opt.nn.linear import DOLinear
+from deepopt.opt.nn.attention import DOMultiheadAttention
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from tests.opt.fp8_support import round_fp8
 

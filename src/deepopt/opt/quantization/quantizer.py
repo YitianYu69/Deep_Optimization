@@ -5,7 +5,7 @@ FP8 quantization with fused CUDA execution and a PyTorch CPU reference.
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
-from ..scaling_strategy.amax import AmaxScaling
+from deepopt.opt.scaling.amax import AmaxScaling
 from .tensor import QuantizedTensor
 from .._execution import finite_checks_enabled
 
@@ -36,7 +36,7 @@ def quantize_fp8(
             data = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
             scale_inv = torch.empty(shape, device=x.device, dtype=torch.float32)
         else:
-            from ..backends.triton_quantization import quantize
+            from deepopt.opt.backends.triton.quantization.fp8 import quantize
 
             data, scale_inv = quantize(x, fp8_dtype, block_shape, check_finite)
         return QuantizedTensor(data=data, scale_inv=scale_inv, block_shape=block_shape)
@@ -100,7 +100,7 @@ def _tensorwise_layouts(x, fp8_dtype, block_shape, check_finite, *, transpose_on
         transposed = torch.empty_strided((n, m), (((m + 15) // 16) * 16, 1), device=x.device, dtype=fp8_dtype)
         inverse = torch.empty((1, 1), device=x.device, dtype=torch.float32)
     else:
-        from ..backends.triton_quantization import quantize_tensorwise_pair
+        from deepopt.opt.backends.triton.quantization.fp8 import quantize_tensorwise_pair
 
         options = {"transpose_only": True} if transpose_only else {}
         normal, inverse, transposed = quantize_tensorwise_pair(x, fp8_dtype, check_finite, **options)

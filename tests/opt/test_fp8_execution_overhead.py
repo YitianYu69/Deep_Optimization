@@ -14,9 +14,9 @@ from torch.overrides import TorchFunctionMode
 from deepopt import FP8Config, TrainingRuntime, autocast
 from deepopt.opt import _autocast
 from deepopt.opt._execution import finite_checks_enabled
-from deepopt.opt.do_nn import functional
-from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func as impl
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn import functional
+from deepopt.opt.nn.autograd import linear as impl
+from deepopt.opt.nn.linear import DOLinear
 from deepopt.opt.policy import fp8_plan
 from deepopt.opt.quantization.quantizer import quantize_fp8
 
@@ -29,7 +29,7 @@ def rowwise_plan():
 class FP8ExecutionOverheadTests(unittest.TestCase):
     def test_device_metadata_is_cached_per_explicit_device_without_tensor_storage(self):
         from types import SimpleNamespace
-        from deepopt.opt.backends._cuda_launch import device_metadata
+        from deepopt.opt.backends._shared.cuda import device_metadata
 
         device_metadata.cache_clear()
         self.addCleanup(device_metadata.cache_clear)

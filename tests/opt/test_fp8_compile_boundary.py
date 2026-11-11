@@ -8,14 +8,15 @@ import torch
 from torch import nn
 
 from deepopt import autocast
-from deepopt.opt.do_nn.AOTAutograd_Func.linear_autograd_func import _DOLinearFunction
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn.autograd.linear import _DOLinearFunction
+from deepopt.opt.nn.linear import DOLinear
 from deepopt.opt.policy import prepare_fp8_model
 
 
 def prepared_model():
     torch.manual_seed(419)
-    model = nn.Sequential(nn.Linear(7, 11), nn.Tanh(), nn.Linear(11, 3))
+    # ELU stays native; sigmoid/tanh now have their own eager DO boundaries.
+    model = nn.Sequential(nn.Linear(7, 11), nn.ELU(), nn.Linear(11, 3))
     return prepare_fp8_model(model, True)[0]
 
 
@@ -80,10 +81,10 @@ class FP8CompileBoundaryBlackBoxTests(unittest.TestCase):
                     torch.testing.assert_close(parameter, baseline.get_parameter(name), rtol=0, atol=0)
 
         nodes = [node for graph in graphs for node in graph.graph.nodes]
-        self.assertTrue(any(getattr(node.target, "__name__", node.target) == "tanh" for node in nodes),
+        self.assertTrue(any(getattr(node.target, "__name__", node.target) == "elu" for node in nodes),
                         "The non-FP8 part of the model must still be compiled")
         # These operations belong to FP8 scaling/quantization, not this model's
-        # Tanh layer. Inspect real captured graphs without an instrumentation mock.
+        # ELU layer. Inspect real captured graphs without an instrumentation mock.
         for node in nodes:
             self.assertFalse(contains_fp8_dtype((node.args, node.kwargs)), str(node))
             self.assertNotIn(node.target, (torch.isfinite, torch.amax, torch.clamp, "amax", "clamp"))
@@ -113,7 +114,7 @@ class FP8CompileBoundaryWhiteBoxTests(unittest.TestCase):
             output.sum().backward()
         self.assertGreaterEqual(len(compiling), 2)
         self.assertFalse(any(compiling), f"FP8 autograd was traced by Dynamo: {compiling}")
-        self.assertTrue(any(getattr(node.target, "__name__", node.target) == "tanh"
+        self.assertTrue(any(getattr(node.target, "__name__", node.target) == "elu"
                             for graph in graphs for node in graph.graph.nodes))
 
 

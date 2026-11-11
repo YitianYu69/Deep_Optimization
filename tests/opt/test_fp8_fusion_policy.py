@@ -9,14 +9,14 @@ from torch import nn
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from deepopt import DiagnosticPolicy, TrainingRuntime, autocast
-from deepopt.opt.do_nn.functional import do_linear
-from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
+from deepopt.opt.nn.functional import do_linear
+from deepopt.opt.nn.autograd import linear as linear_autograd_func
 from deepopt.opt.policy import fp8_plan
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from deepopt.opt.quantization.quantizer import _quantize_tensorwise_pair
 from deepopt.opt.quantization.quantizer import _quantize_tensorwise_transpose
 from deepopt.opt.quantization.tensor import QuantizedTensor
-from deepopt.opt.scaling_strategy.amax import AmaxScaling
+from deepopt.opt.scaling.amax import AmaxScaling
 
 
 class FP8FusionPolicyTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class FP8FusionPolicyTests(unittest.TestCase):
             expected = quantize_fp8(source, fp8_dtype=dtype).transpose()
             torch.testing.assert_close(actual.data.float(), expected.data.float(), rtol=0, atol=0)
             torch.testing.assert_close(actual.scale_inv, expected.scale_inv, rtol=0, atol=0)
-        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton_quantization": None}), \
+        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton.quantization.fp8": None}), \
              patch.object(torch, "empty_strided", wraps=torch.empty_strided) as allocate:
             source = torch.empty(129, 65, device="cuda")
             transposed = _quantize_tensorwise_transpose(source, fp8_dtype=torch.float8_e4m3fn, check_finite=False)
@@ -67,7 +67,7 @@ class FP8FusionPolicyTests(unittest.TestCase):
         self.assertEqual(len(cache._entries), 1)
 
     def test_fake_cuda_pair_uses_tma_ready_strides_and_mode_checks(self):
-        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton_quantization": None}):
+        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton.quantization.fp8": None}):
             x = torch.empty(129, 65, device="cuda", dtype=torch.bfloat16)
             normal, transposed = _quantize_tensorwise_pair(x, check_finite=False)
             self.assertEqual(normal.data.stride(), (80, 1))
@@ -76,7 +76,7 @@ class FP8FusionPolicyTests(unittest.TestCase):
             self.assertEqual(transposed.data.shape, (65, 129))
             self.assertIs(normal.scale_inv, transposed.scale_inv)
     def test_fake_cuda_dequantization_avoids_fp32_copies_and_expanded_scales(self):
-        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton_quantization": None}):
+        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton.quantization.fp8": None}):
             data = torch.empty(65, 37, device="cuda", dtype=torch.float8_e4m3fn).T
             inverse = torch.empty_strided((19, 22), (44, 2), device="cuda")
             value = QuantizedTensor(data, inverse, (2, 3))
@@ -138,7 +138,7 @@ class FP8FusionPolicyTests(unittest.TestCase):
             self.assertEqual(checked, [False, True, False, True, True, False, False, True, False])
 
     def test_fake_cuda_quantization_produces_only_output_metadata_without_triton(self):
-        with patch.dict(sys.modules, {"deepopt.opt.backends.triton_quantization": None}), FakeTensorMode():
+        with patch.dict(sys.modules, {"deepopt.opt.backends.triton.quantization.fp8": None}), FakeTensorMode():
             for shape in ((37, 65), (129, 97), (257, 259)):
                 for blocks in (None, (1, 32), (32, 32), (128, 128), (256, 256), (1024, 1024)):
                     x = torch.empty(shape, device="cuda", dtype=torch.bfloat16).T

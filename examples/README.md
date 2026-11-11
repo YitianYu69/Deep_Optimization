@@ -1,6 +1,6 @@
 # Runnable examples
 
-[Project README](../README.md) · [Documentation index](../docs/README.md)
+[Project README](../README.md) · [Documentation index](../docs/README.md) · [Benchmarks](../benchmarks/README.md)
 
 Run commands from the repository root after installing the project into your
 Python environment:

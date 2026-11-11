@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from deepopt import autocast
-from deepopt.opt.do_nn.functional import do_linear
+from deepopt.opt.nn.functional import do_linear
 from deepopt.opt.policy import fp8_plan
 
 

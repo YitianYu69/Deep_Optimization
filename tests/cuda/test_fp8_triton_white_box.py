@@ -6,7 +6,7 @@ from unittest.mock import patch
 import torch
 
 from deepopt.opt.backends import gemm_nt
-from deepopt.opt.backends._triton_autotune import AUTOTUNE_KEY
+from deepopt.opt.backends.triton.gemm.autotune import AUTOTUNE_KEY
 from deepopt.opt.quantization.tensor import QuantizedTensor
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON, quantize_gemm_operand as quantize_fp8
 
@@ -17,7 +17,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
         torch.manual_seed(271)
 
     def test_unchecked_cuda_scaling_has_no_python_scalar_reads_and_handles_zero(self):
-        from deepopt.opt.scaling_strategy.amax import AmaxScaling
+        from deepopt.opt.scaling.amax import AmaxScaling
 
         for blocks in (None, (1, 32), (32, 32)):
             for value in (0.0, 0.25):
@@ -32,7 +32,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
     @staticmethod
     def _split_config(split):
         import triton
-        from deepopt.opt.backends._triton_autotune import set_descriptor_block_shapes
+        from deepopt.opt.backends.triton.gemm.autotune import set_descriptor_block_shapes
 
         return triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 32,
                               "SPLIT_K": split, "NUM_STAGES": 2, "GROUP_SIZE_M": 1},
@@ -41,7 +41,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
     def test_grouped_stage_five_launches_cover_partial_groups_and_cached_split_k(self):
         import triton
         from deepopt.opt.backends import triton_fp8
-        from deepopt.opt.backends._triton_autotune import set_descriptor_block_shapes
+        from deepopt.opt.backends.triton.gemm.autotune import set_descriptor_block_shapes
 
         kernel = triton_fp8._gemm_nt_kernel
         # Nine M tiles: the last eight-row group contains just one row of tiles.
@@ -206,7 +206,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
             self.assertTrue(torch.all(guarded[:13, 19:] == 123).item())
 
     def test_aligned_rows_reuse_storage_and_ragged_rows_get_zero_padding(self):
-        from deepopt.opt.backends.triton_fp8 import _pack_fp8_rows
+        from deepopt.opt.backends.triton.gemm.fp8 import _pack_fp8_rows
 
         aligned = torch.randn(5, 64, device="cuda").to(torch.float8_e4m3fn)
         self.assertIs(_pack_fp8_rows(aligned, 32), aligned)
@@ -219,7 +219,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
         self.assertEqual(torch.count_nonzero(packed[:, 37:].float()).item(), 0)
 
     def test_misaligned_and_noncontiguous_rows_are_packed_without_changing_values(self):
-        from deepopt.opt.backends.triton_fp8 import _pack_fp8_rows
+        from deepopt.opt.backends.triton.gemm.fp8 import _pack_fp8_rows
 
         storage = torch.arange(1 + 4 * 64, device="cuda").to(torch.float8_e4m3fn)
         misaligned = storage[1:].view(4, 64)
@@ -263,7 +263,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
                 torch.testing.assert_close(actual.cpu(), expected, rtol=3e-4, atol=5e-4)
 
     def test_fused_scaling_matches_cpu_for_strided_inputs_and_edge_blocks(self):
-        from deepopt.opt.scaling_strategy.amax import AmaxScaling
+        from deepopt.opt.scaling.amax import AmaxScaling
 
         for dtype in (torch.float32, torch.bfloat16):
             x = torch.arange(1, 36, device="cuda", dtype=dtype).reshape(5, 7).T
@@ -301,7 +301,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
 
     def test_native_autotuner_reuses_winner_with_fresh_inputs_and_descriptors(self):
         from triton.runtime.autotuner import Autotuner
-        from deepopt.opt.backends.triton_fp8 import _gemm_nt_kernel
+        from deepopt.opt.backends.triton.gemm.fp8 import _gemm_nt_kernel
 
         self.assertIsInstance(_gemm_nt_kernel, Autotuner)
         outputs = []
@@ -338,7 +338,7 @@ class TritonFP8WhiteBoxTests(unittest.TestCase):
         self.assertFalse(torch.equal(*outputs))
 
     def test_autotuner_cache_separates_formats_outputs_shapes_scales_and_stages(self):
-        from deepopt.opt.backends.triton_fp8 import _gemm_nt_kernel
+        from deepopt.opt.backends.triton.gemm.fp8 import _gemm_nt_kernel
 
         e4m3, e5m2 = torch.float8_e4m3fn, torch.float8_e5m2
         cases = (

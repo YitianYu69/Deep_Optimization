@@ -9,8 +9,8 @@ from torch import nn
 
 from deepopt import FP8Config, TrainingRuntime, autocast
 from deepopt.config import ConfigError, fp8_config_from_dict
-from deepopt.opt.do_nn.linear_module import DOLinear
-from deepopt.opt.do_nn.mha_module import DOMultiheadAttention
+from deepopt.opt.nn.linear import DOLinear
+from deepopt.opt.nn.attention import DOMultiheadAttention
 from deepopt.opt.policy import prepare_fp8_model
 from deepopt.opt.backends import gemm_nt
 
@@ -126,7 +126,7 @@ class ProjectionSelectionTests(unittest.TestCase):
         self.assertEqual(fp8_config_from_dict(asdict(options)), options)
         source = Projections()
         runtime = TrainingRuntime(source, torch.optim.SGD(source.parameters(), lr=.001), fp8=options, execution_mode="max_speed")
-        with patch("deepopt.opt.do_nn.AOTAutograd_Func.linear_autograd_func.gemm_nt", wraps=gemm_nt) as gemm:
+        with patch("deepopt.opt.nn.autograd.linear.gemm_nt", wraps=gemm_nt) as gemm:
             loss = runtime.compute(torch.randn(2, 8), lambda x: runtime.model(x).sum())
             runtime.backward(loss)
             runtime.step()

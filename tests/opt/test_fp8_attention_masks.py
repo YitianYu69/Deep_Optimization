@@ -5,7 +5,7 @@ import unittest
 import torch
 from torch import nn
 
-from deepopt.opt.do_nn.mha_module import DOMultiheadAttention
+from deepopt.opt.nn.attention import DOMultiheadAttention
 from tests.opt.fp8_support import fp8_plan
 
 

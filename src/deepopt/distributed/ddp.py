@@ -74,7 +74,7 @@ class DDPCore:
         model = self.model
         self._delayed_states = ()
         if self.fp8.enabled and self.fp8.scaling_recipe == "delayed":
-            from deepopt.opt.scaling_strategy.delayed import delayed_states
+            from deepopt.opt.scaling.delayed import delayed_states
 
             self._delayed_states = delayed_states(model)
         if any(parameter.requires_grad for parameter in model.parameters()):
@@ -88,7 +88,7 @@ class DDPCore:
                 owner, device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 **self.options)
         if self.fp8.enabled:
-            from deepopt.opt.do_nn._cached_weights import CachedWeightModule
+            from deepopt.opt.nn._cached_weights import CachedWeightModule
 
             # DDP's initial parameter broadcast can replace rank-local values
             # after a caller has already warmed an adapter's weight cache.
@@ -117,7 +117,7 @@ class DDPCore:
     def compute(self, batch, step):
         with self._fp8_scope.enter():
             if self.wrapper is not None and self.model.training and torch.is_grad_enabled():
-                from deepopt.opt.scaling_strategy.delayed import fp8_scaling_scope
+                from deepopt.opt.scaling.delayed import fp8_scaling_scope
 
                 scope = fp8_scaling_scope(states=self._delayed_states) if self._delayed_states else nullcontext()
                 with scope:

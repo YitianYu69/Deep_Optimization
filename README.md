@@ -66,6 +66,8 @@ and [checkpoints](docs/checkpoints/README.md).
 Precedence is explicit arguments, per-call configuration, global defaults, then
 API defaults. Existing trainers keep their snapshots; supplied optimizers and
 schedulers remain caller-owned. See [configuration inputs and templates](docs/runs/README.md).
+The [configuration reference](docs/configuration/README.md) lists every framework
+option, its default, accepted values, and behavior.
 
 The CLI runs a synthetic classification recipe. Installed presets work from any
 directory; `--config` also accepts your own TOML path:
@@ -108,7 +110,16 @@ the existing FP8 defaults remain unchanged.
 
 ## Guides and development
 
-Start with the [documentation index](docs/README.md) or [example catalog](examples/README.md).
+Start with the [documentation index](docs/README.md), [example catalog](examples/README.md),
+or [benchmark catalog](benchmarks/README.md).
+
+The [activation guide](docs/activation/elementwise.md) covers sigmoid, SiLU,
+exact/tanh GELU, tanh and ReLU6 with fused BF16/FP8 conversion, compressed local
+derivatives and planned FP8 gradients. ReLU/ReLU6 retain exact one-bit masks.
+
+[LayerNorm](docs/normalization/layer_norm.md) supports normalized suffix shapes,
+pre-affine xhat compression and planned FP8 forward/backward transport through
+the same precision and compression settings.
 
 | Need | Guide |
 | --- | --- |
@@ -117,8 +128,10 @@ Start with the [documentation index](docs/README.md) or [example catalog](exampl
 | Multiple devices, compilation, or graph replay | [Distributed](docs/distributed/README.md) · [Execution](docs/execution/README.md) · [CUDA Graphs](docs/cuda/README.md) |
 | Diagnostics, tests, or framework changes | [Observers](docs/observers/README.md) · [Architecture and development](docs/architecture/README.md) |
 
-Trainer AMP supports FP32 on CPU/CUDA and BF16 on CUDA. FP16 AMP, automatic GPU
-OOM retries, activation compression, and sparse execution are not implemented.
+Trainer AMP supports FP32 on CPU/CUDA and BF16 on CUDA. Optional
+[activation compression](docs/activation_compression/README.md) reduces saved
+linear activations using affine 2-bit groups. FP16 AMP, automatic GPU OOM retries,
+and sparse execution are not implemented.
 Memory estimates do not establish GPU fit or throughput; validate on target hardware.
 
 Run `python -m unittest discover -s tests -v` for the tests. The

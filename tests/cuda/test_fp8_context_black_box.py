@@ -9,7 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from deepopt import TrainingRuntime, autocast
-from deepopt.opt.do_nn.functional import do_linear
+from deepopt.opt.nn.functional import do_linear
 from deepopt.opt.policy import fp8_plan
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 

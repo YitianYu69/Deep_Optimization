@@ -60,7 +60,7 @@ class QuantizedTensor:
         if self.data.device.type == "cuda":
             if isinstance(self.data, FakeTensor):
                 return torch.empty(self.data.shape, device=self.data.device, dtype=torch.float32)
-            from ..backends.triton_quantization import dequantize
+            from deepopt.opt.backends.triton.quantization.fp8 import dequantize
 
             return dequantize(self.data, self.scale_inv, self.block_shape)
 

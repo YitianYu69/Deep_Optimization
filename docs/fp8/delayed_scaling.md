@@ -137,9 +137,9 @@ DeepOpt. The benchmark refuses a different installed version unless its pin is
 explicitly changed with `--te-version`; target-stack compatibility is a GPU check.
 
 ```bash
-python benchmarks/benchmark_fp8_te_linear.py --implementation all \
+python benchmarks/fp8/benchmark_fp8_te_linear.py --implementation all \
   --batches 512 336 272 --format e4m3fn --no-fill-uninitialized --output te-linear.json
-python benchmarks/benchmark_fp8_te_linear.py --implementation all \
+python benchmarks/fp8/benchmark_fp8_te_linear.py --implementation all \
   --format hybrid --math-policy matched-fp32 --no-fill-uninitialized \
   --optimizer-updates --output te-linear-updates.json
 ```
@@ -182,7 +182,7 @@ and the effective numerical recipe is recorded from that runtime.
 bytes outside the timed passes so metadata transfer reuse can be audited.
 
 ```bash
-python benchmarks/benchmark_fp8_training.py \
+python benchmarks/fp8/benchmark_fp8_training.py \
   --cases bf16-runtime fp8-prepared fp8-delayed --batches 512 336 272 \
   --history-length 1024 --amax-algorithm max --margin 0 \
   --no-fill-uninitialized-memory --output results/delayed-training

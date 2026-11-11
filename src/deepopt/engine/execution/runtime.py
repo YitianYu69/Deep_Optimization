@@ -236,7 +236,7 @@ class TrainingRuntime:
                                "cuda_graph_core.capture_model before constructing the runtime")
 
     def _mark_failed(self) -> None:
-        from deepopt.opt.scaling_strategy.delayed import finish_runtime_scaling
+        from deepopt.opt.scaling.delayed import finish_runtime_scaling
 
         finish_runtime_scaling(self, commit=False)
         self._failed = True
@@ -280,7 +280,7 @@ class TrainingRuntime:
             self._prepare_mode()
         scaling = nullcontext()
         if self.fp8.enabled and self.fp8.scaling_recipe == "delayed":
-            from deepopt.opt.scaling_strategy.delayed import runtime_scaling_scope
+            from deepopt.opt.scaling.delayed import runtime_scaling_scope
 
             scaling = runtime_scaling_scope(self)
         with scaling, self.diagnostic_scope("deepopt.compute"), self._precision.autocast() as context:
@@ -327,7 +327,7 @@ class TrainingRuntime:
             with self.diagnostic_scope("deepopt.backward", phase="backward"):
                 self._observe("loss", loss, name="backward loss")
                 if self.fp8.enabled and self.fp8.scaling_recipe == "delayed":
-                    from deepopt.opt.scaling_strategy.delayed import runtime_scaling_scope
+                    from deepopt.opt.scaling.delayed import runtime_scaling_scope
 
                     with runtime_scaling_scope(self):
                         self.core.backward(loss, **kwargs)
@@ -344,7 +344,7 @@ class TrainingRuntime:
         if self.optimizer is None:
             raise RuntimeError("zero_grad requires an optimizer")
         if getattr(self, "_delayed_window", None) is not None:
-            from deepopt.opt.scaling_strategy.delayed import finish_runtime_scaling
+            from deepopt.opt.scaling.delayed import finish_runtime_scaling
 
             finish_runtime_scaling(self, commit=False)
         self.optimizer.zero_grad(set_to_none=True)
@@ -392,7 +392,7 @@ class TrainingRuntime:
             with self.diagnostic_scope("deepopt.step", phase="backward"):
                 self._stepper.step(divisor)
             if getattr(self, "_delayed_window", None) is not None:
-                from deepopt.opt.scaling_strategy.delayed import finish_runtime_scaling
+                from deepopt.opt.scaling.delayed import finish_runtime_scaling
 
                 finish_runtime_scaling(self, commit=True)
             self._forward_pending = self._pending_gradients = False

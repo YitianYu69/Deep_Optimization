@@ -51,6 +51,15 @@ class DelayedScalingConfig:
 
 
 @dataclass(frozen=True)
+class ActivationCompressionConfig:
+    enabled: bool = False
+    group_size: int = 512
+    bits: int = 2
+    attention_bits: int | None = None
+    norm_xhat_recenter: bool = False
+
+
+@dataclass(frozen=True)
 class FP8Config:
     enabled: bool = False
     backend: str = "reference"
@@ -64,10 +73,14 @@ class FP8Config:
     num_stages: int | str = "auto"
     out_dtype: str | None = None
     intercept_linear: bool = True
+    intercept_convolution: bool | None = None
+    intercept_normalization: bool | None = None
     scaling_recipe: str = "current"
     delayed_scaling: DelayedScalingConfig = field(default_factory=DelayedScalingConfig)
     backward_backend: str = "inherit"
+    backward_precision: str = "native"
     exclude_modules: tuple[str, ...] = ()
+    intercept_pooling: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +97,7 @@ class RuntimeConfig:
     fp8: FP8Config = field(default_factory=FP8Config)
     ddp: dict[str, Any] = field(default_factory=dict)
     cuda_graph: dict[str, Any] = field(default_factory=dict)
+    activation_compression: ActivationCompressionConfig = field(default_factory=ActivationCompressionConfig)
 
 
 @dataclass(frozen=True)
@@ -246,7 +260,8 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
     application = _application_value(application, "application")
     r = raw.get("runtime", {})
     _require_keys(r, set(), "runtime", {"device", "precision", "deterministic", "checks", "execution_mode",
-                                          "diagnostics", "mode_schedule", "non_blocking", "compile", "fp8", "ddp", "cuda_graph"})
+                                          "diagnostics", "mode_schedule", "non_blocking", "compile", "fp8", "ddp", "cuda_graph",
+                                          "activation_compression"})
     device, precision = r.get("device", "cpu"), r.get("precision", "fp32")
     if not isinstance(device, str) or not (
         device in ("cpu", "cuda", "auto") or
@@ -299,6 +314,7 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
         raise ConfigError("runtime.non_blocking must be a boolean")
     compilation = compile_config_from_dict(r.get("compile", {}))
     fp8 = fp8_config_from_dict(r.get("fp8", {}))
+    activation_compression = activation_compression_config_from_dict(r.get("activation_compression", {}))
     ddp = _ddp_config_from_dict(r.get("ddp", {}))
     cuda_graph = _cuda_graph_config_from_dict(r.get("cuda_graph", {}))
     loader = _loader_config_from_dict(raw.get("loader", {}))
@@ -309,7 +325,7 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
     identity = _application_value(identity, "experiment_identity")
     return ExperimentConfig(name, seed, training, application=application,
                             runtime=RuntimeConfig(device, precision, deterministic, checks, mode, diagnostics, schedule,
-                                                  non_blocking, compilation, fp8, ddp, cuda_graph),
+                                                  non_blocking, compilation, fp8, ddp, cuda_graph, activation_compression),
                             experiment_identity=identity, schedules=schedules, loader=loader, logging=logging)
 
 
@@ -442,6 +458,26 @@ def delayed_scaling_config_from_dict(raw) -> DelayedScalingConfig:
     return DelayedScalingConfig(history, algorithm, margin, reduce)
 
 
+def activation_compression_config_from_dict(raw: Mapping[str, Any]) -> ActivationCompressionConfig:
+    """Validate affine saved-activation policies without importing Torch."""
+    _require_keys(raw, set(), "runtime.activation_compression",
+                  {"enabled", "group_size", "bits", "attention_bits", "norm_xhat_recenter"})
+    enabled = raw.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ConfigError("runtime.activation_compression.enabled must be a boolean")
+    group_size = _integer(raw.get("group_size", 512), "runtime.activation_compression.group_size", 1)
+    bits = raw.get("bits", 2)
+    if type(bits) is not int or bits not in (1, 2, 4, 8):
+        raise ConfigError("runtime.activation_compression.bits must be 1, 2, 4 or 8")
+    attention_bits = raw.get("attention_bits")
+    if attention_bits is not None and (type(attention_bits) is not int or attention_bits not in (1, 2, 4, 8)):
+        raise ConfigError("runtime.activation_compression.attention_bits must be 1, 2, 4, 8 or None")
+    recenter = raw.get("norm_xhat_recenter", False)
+    if type(recenter) is not bool:
+        raise ConfigError("runtime.activation_compression.norm_xhat_recenter must be a boolean")
+    return ActivationCompressionConfig(enabled, group_size, bits, attention_bits, recenter)
+
+
 def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     """Validate FP8 settings without importing Torch or loading a GPU backend."""
     if isinstance(raw, Mapping) and "max_num_imprecise_acc" in raw:
@@ -450,7 +486,8 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     _require_keys(raw, set(), "runtime.fp8", {
         "enabled", "backend", "trace_mode", "activation_dtype", "weight_dtype",
         "grad_dtype", "block_shapes", "num_stages", "out_dtype", "intercept_linear",
-        "scaling_recipe", "delayed_scaling", "backward_backend", "exclude_modules",
+        "scaling_recipe", "delayed_scaling", "backward_backend", "exclude_modules", "intercept_convolution",
+        "intercept_normalization", "backward_precision", "intercept_pooling",
     })
     raw = _copy_tables(raw)
     enabled = raw.get("enabled", False)
@@ -465,6 +502,15 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     intercept_linear = raw.get("intercept_linear", True)
     if type(intercept_linear) is not bool:
         raise ConfigError("runtime.fp8.intercept_linear must be a boolean")
+    intercept_convolution = raw.get("intercept_convolution")
+    if intercept_convolution is not None and type(intercept_convolution) is not bool:
+        raise ConfigError("runtime.fp8.intercept_convolution must be a boolean or None")
+    intercept_normalization = raw.get("intercept_normalization")
+    if intercept_normalization is not None and type(intercept_normalization) is not bool:
+        raise ConfigError("runtime.fp8.intercept_normalization must be a boolean or None")
+    intercept_pooling = raw.get("intercept_pooling")
+    if intercept_pooling is not None and type(intercept_pooling) is not bool:
+        raise ConfigError("runtime.fp8.intercept_pooling must be a boolean or None")
     roles = ("activation", "weight", "grad")
     dtypes = {role: raw.get(f"{role}_dtype", "e4m3fn") for role in roles}
     for role, dtype in dtypes.items():
@@ -495,6 +541,9 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
     if recipe == "delayed" and any(block is not None for block in block_shapes.values()):
         raise ConfigError("Delayed FP8 scaling currently requires tensorwise block_shapes")
     backward_backend = raw.get("backward_backend", "inherit")
+    backward_precision = raw.get("backward_precision", "native")
+    if backward_precision not in ("native", "auto"):
+        raise ConfigError("runtime.fp8.backward_precision must be native or auto")
     if backward_backend not in ("inherit", "native_fast", "native_precise"):
         raise ConfigError("runtime.fp8.backward_backend must be inherit, native_fast, or native_precise")
     if backward_backend != "inherit" and (backend != "triton" or any(block is not None for block in block_shapes.values())):
@@ -505,12 +554,20 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
         raise ConfigError("runtime.fp8.exclude_modules must contain nonempty module-name glob patterns")
     if exclusions and intercept_linear:
         raise ConfigError("FP8 module exclusions require intercept_linear=false so excluded projections remain dense")
+    if exclusions and intercept_convolution:
+        raise ConfigError("FP8 module exclusions require intercept_convolution=false so excluded convolutions remain dense")
+    if exclusions and intercept_normalization:
+        raise ConfigError("FP8 module exclusions require intercept_normalization=false so excluded normalization remains dense")
+    if exclusions and intercept_pooling:
+        raise ConfigError("FP8 module exclusions require intercept_pooling=false so excluded pooling remains dense")
     return FP8Config(enabled=enabled, backend=backend, trace_mode=trace_mode,
-                     intercept_linear=intercept_linear,
+                     intercept_linear=intercept_linear, intercept_convolution=intercept_convolution,
+                     intercept_normalization=intercept_normalization, intercept_pooling=intercept_pooling,
                      activation_dtype=dtypes["activation"], weight_dtype=dtypes["weight"],
                      grad_dtype=dtypes["grad"], block_shapes=block_shapes,
                      num_stages=stages, out_dtype=out_dtype, scaling_recipe=recipe, delayed_scaling=delayed,
-                     backward_backend=backward_backend, exclude_modules=tuple(exclusions))
+                     backward_backend=backward_backend, backward_precision=backward_precision,
+                     exclude_modules=tuple(exclusions))
 
 
 def normalize_config(value: ExperimentConfig | Mapping[str, Any]) -> ExperimentConfig:

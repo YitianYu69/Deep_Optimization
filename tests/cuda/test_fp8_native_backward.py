@@ -8,7 +8,7 @@ from torch import nn
 
 from deepopt import FP8Config, TrainingRuntime
 from deepopt.opt.backends import gemm_nt
-from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
+from deepopt.opt.nn.autograd import linear as linear_autograd_func
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 

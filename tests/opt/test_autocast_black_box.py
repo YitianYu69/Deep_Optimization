@@ -10,8 +10,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from deepopt import FP8Config, autocast
-from deepopt.opt.do_nn.functional import do_linear
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn.functional import do_linear
+from deepopt.opt.nn.linear import DOLinear
 from deepopt.opt.policy import fp8_plan
 from tests.opt.fp8_support import round_fp8
 

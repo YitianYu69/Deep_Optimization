@@ -12,9 +12,9 @@ from torch.nn import functional as F
 
 from deepopt import FP8Config, autocast
 from deepopt.opt._autocast import _get_fp8_plan, _FP8LinearMode, fp8_context
-from deepopt.opt.do_nn import functional
-from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn import functional
+from deepopt.opt.nn.autograd import linear as linear_autograd_func
+from deepopt.opt.nn.linear import DOLinear
 from deepopt.opt.policy import fp8_plan
 
 
@@ -146,7 +146,7 @@ class AutocastWhiteBoxTests(unittest.TestCase):
         programs = (
             "import sys; from deepopt import FP8Config; from deepopt.opt import FP8Config as Other; "
             "assert FP8Config is Other; assert 'torch' not in sys.modules",
-            "from deepopt.opt.do_nn.functional import do_linear; import deepopt, deepopt.opt; "
+            "from deepopt.opt.nn.functional import do_linear; import deepopt, deepopt.opt; "
             "from deepopt.opt._autocast import autocast; "
             "assert deepopt.autocast is autocast; assert deepopt.opt.autocast is autocast",
         )

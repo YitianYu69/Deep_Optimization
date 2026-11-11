@@ -77,7 +77,7 @@ def _validate_snapshot(raw, require_complete):
         if section not in raw:
             normalized.pop(section)
     if "runtime" in normalized:
-        for policy in ("fp8", "compile", "ddp", "cuda_graph", "precision"):
+        for policy in ("fp8", "activation_compression", "compile", "ddp", "cuda_graph", "precision"):
             if policy not in raw["runtime"]:
                 normalized["runtime"].pop(policy)
     # JSON round-trip gives snapshots independent mutable containers and turns

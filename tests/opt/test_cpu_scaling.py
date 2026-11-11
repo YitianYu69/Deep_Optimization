@@ -12,9 +12,9 @@ class CPUScalingTests(unittest.TestCase):
         import torch
         from unittest.mock import patch
         from torch._subclasses.fake_tensor import FakeTensorMode
-        from deepopt.opt.scaling_strategy.amax import AmaxScaling
+        from deepopt.opt.scaling.amax import AmaxScaling
 
-        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton_quantization": None}):
+        with FakeTensorMode(), patch.dict(sys.modules, {"deepopt.opt.backends.triton.quantization.fp8": None}):
             x = torch.empty(257, 259, device="cuda", dtype=torch.bfloat16).T
             with patch.object(torch.Tensor, "float", side_effect=AssertionError("full FP32 copy")), \
                  patch.object(torch.Tensor, "contiguous", side_effect=AssertionError("dense input copy")):
@@ -36,8 +36,8 @@ import torch
 # PyTorch may probe the optional package and catch ImportError. Force it to
 # be unavailable even on hosts with Triton installed, without blocking probes.
 sys.modules["triton"] = None
-from deepopt.opt.scaling_strategy.amax import AmaxScaling
-from deepopt.opt.do_nn.functional import do_linear
+from deepopt.opt.scaling.amax import AmaxScaling
+from deepopt.opt.nn.functional import do_linear
 
 x = torch.tensor([[0., 0., 4., -8., 2.], [0., 0., 1., -2., -3.],
                   [16., -2., -6., 1., .5]])
@@ -70,7 +70,7 @@ weight = torch.randn(4, 7, requires_grad=True)
 do_linear(inputs, weight, plan=plan).sum().backward()
 assert torch.isfinite(inputs.grad).all() and torch.isfinite(weight.grad).all()
 assert sys.modules["triton"] is None
-assert "deepopt.opt.backends.scaling_utils.fused_amax" not in sys.modules
+assert "deepopt.opt.backends.triton.scaling.amax" not in sys.modules
 '''
         result = subprocess.run([sys.executable, "-B", "-c", code], cwd=root,
                                 env={**os.environ, "PYTHONPATH": str(root / "src")},
@@ -80,7 +80,7 @@ assert "deepopt.opt.backends.scaling_utils.fused_amax" not in sys.modules
     def test_cuda_block_restrictions_remain_enforced_before_kernel_execution(self):
         import torch
         from torch._subclasses.fake_tensor import FakeTensorMode
-        from deepopt.opt.scaling_strategy.amax import AmaxScaling
+        from deepopt.opt.scaling.amax import AmaxScaling
 
         # Fake tensors exercise device-specific validation, not GPU execution.
         with FakeTensorMode():

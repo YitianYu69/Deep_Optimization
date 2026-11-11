@@ -9,7 +9,7 @@ from deepopt._config_resolution import _UNSET
 
 from ._configuration import _capture_settings
 from ._validation import (arguments, autocast_spec, capture_guard, check_arguments,
-                          cuda_device, static_arguments, warmup_count)
+                          cuda_device, operation_policy_spec, static_arguments, warmup_count)
 from ._warmup import warmup_on_stream
 
 
@@ -111,6 +111,7 @@ class CapturedFunction:
         self._capture = CapturedGraph(**options)
         self.config = self._capture.config
         self._inputs = self._outputs = self._specs = self._autocast = None
+        self._operation_policy = None
 
     @property
     def graph(self):
@@ -128,6 +129,7 @@ class CapturedFunction:
         if any(arg.requires_grad for arg in args):
             raise ValueError("The capture decorator is inference-only; use capture_model for autograd")
         self._autocast = autocast_spec()
+        self._operation_policy = operation_policy_spec()
         with torch.cuda.device(device), torch.no_grad():
             self._inputs = static_arguments(args)
             stream = self._capture.stream or torch.cuda.Stream(device=device)
@@ -158,6 +160,8 @@ class CapturedFunction:
         check_arguments(args, kwargs, self._specs)
         if autocast_spec() != self._autocast:
             raise ValueError("Autocast settings changed; recapture the function")
+        if operation_policy_spec() != self._operation_policy:
+            raise ValueError("FP8 or activation compression policy changed; recapture the function")
         with torch.cuda.device(self._capture.device), torch.no_grad():
             for target, source in zip(self._inputs, args):
                 target.copy_(source)

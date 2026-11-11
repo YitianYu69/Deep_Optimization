@@ -9,8 +9,8 @@ from torch import fx, nn
 from torch.nn import functional as F
 
 from deepopt.opt import transform_model
-from deepopt.opt.do_nn.functional import do_linear, validate_fp8_plan
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn.functional import do_linear, validate_fp8_plan
+from deepopt.opt.nn.linear import DOLinear
 from deepopt.opt.fx import ConversionRegistry, DOTracer, default_registry, match_graph, rewrite_graph
 
 
@@ -48,7 +48,7 @@ class TransformationWhiteBoxTests(unittest.TestCase):
         before = str(graph_module.graph)
         matches = match_graph(graph_module, registry)
         self.assertEqual([(node.op, node.target) for node in matches],
-                         [("call_module", "layer"), ("call_function", F.linear)])
+                         [("call_module", "layer"), ("call_module", "activation"), ("call_function", F.linear)])
         self.assertEqual(str(graph_module.graph), before)
         self.assertIsInstance(graph_module.layer, nn.Linear)
 
@@ -91,7 +91,7 @@ class TransformationWhiteBoxTests(unittest.TestCase):
         returned = rewrite_graph(graph_module, matches[:1], registry, plan=plan())
         self.assertIs(returned, graph_module)
         self.assertIsInstance(graph_module.layer, DOLinear)
-        self.assertIs(matches[1].target, F.linear)
+        self.assertIs(matches[2].target, F.linear)
         self.assertIsInstance(graph_module.activation, nn.ReLU)
 
     def test_function_rewrite_retains_weight_nodes_and_renames_keyword(self):

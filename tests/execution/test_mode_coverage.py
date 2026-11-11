@@ -12,7 +12,7 @@ from deepopt.engine.reporting.metrics import MetricAccumulator
 from deepopt.engine.execution.policy import ModeController
 from deepopt.observers import CheckObservers
 from deepopt.opt._execution import finite_checks_enabled
-from deepopt.opt.scaling_strategy.amax import AmaxScaling
+from deepopt.opt.scaling.amax import AmaxScaling
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from deepopt.tasks.base import BatchOutput
 

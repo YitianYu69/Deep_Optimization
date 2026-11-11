@@ -6,7 +6,7 @@ import sys
 
 from torch import fx, nn
 
-from ..do_nn.linear_module import DOLinear
+from deepopt.opt.nn.linear import DOLinear
 
 
 def _is_hf_conv1d(module: nn.Module) -> bool:
@@ -29,7 +29,22 @@ def _is_hf_conv1d(module: nn.Module) -> bool:
 
 class DOTracer(fx.Tracer):
     def __init__(self, *, extra_leaf_types: tuple[type[nn.Module], ...] = (), excluded_ids=()) -> None:
-        super().__init__()
+        from deepopt.opt.nn.functional import (do_linear, do_conv1d, do_conv2d, do_conv3d, do_batch_norm,
+                                              do_group_norm, do_layer_norm, do_relu, do_sigmoid, do_silu, do_gelu, do_tanh, do_relu6)
+
+        from ..nn import functional as doF
+        from ..nn.pooling.spec import SPECS
+
+        transposed = tuple(getattr(doF, f"do_conv_transpose{rank}d") for rank in (1, 2, 3))
+        pools = tuple(getattr(doF, "do_" + name) for name in SPECS)
+        pools += tuple(getattr(doF, "do_" + name + "_with_indices") for name, spec in SPECS.items() if "max" in spec.family)
+        super().__init__(autowrap_functions=(do_linear, do_conv1d, do_conv2d, do_conv3d, do_batch_norm,
+                                            do_group_norm, do_layer_norm, do_relu, do_sigmoid, do_silu, do_gelu, do_tanh, do_relu6, *pools, *transposed))
+        # Match both imported aliases and doF.activation(...) attribute calls;
+        # keep the allowlist above rather than wrapping every frontend helper.
+        from deepopt.opt.nn import functional
+
+        self._autowrap_search.append(functional)
         self._excluded_ids = frozenset(excluded_ids)
 
         if not isinstance(extra_leaf_types, tuple):

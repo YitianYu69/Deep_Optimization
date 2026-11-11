@@ -13,6 +13,10 @@ Automatic setup is available through `Trainer(..., fp8=True)`,
 `[runtime.fp8]`. Manual `transform_model(...)` remains available for applications
 that want to own conversion explicitly.
 
+Optional [saved-activation compression](../activation_compression/README.md) fuses
+affine 2-bit packing with FP8 casts and reconstructs directly to FP8 during
+backward. Its independent configuration also supports native BF16 linear.
+
 For complete training examples, see the [regular engine core](#train-with-the-regular-engine-core)
 and [DDP core](#train-with-the-ddp-core). Both include `Trainer` usage and direct
 core calls, with a manual `TrainingRuntime` loop between those levels.
@@ -395,7 +399,7 @@ or CUDA Graph capture support.
 FX transformation is optional. With the plan above, a functional projection is:
 
 ```python
-from deepopt.opt.do_nn.functional import do_linear
+from deepopt.opt.nn.functional import do_linear
 
 x = torch.randn(4, 8, requires_grad=True)
 weight = torch.nn.Parameter(torch.randn(3, 8))
@@ -407,7 +411,7 @@ output.square().mean().backward()
 For an existing module, keep its parameter objects through the adapter:
 
 ```python
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn.linear import DOLinear
 
 original = torch.nn.Linear(8, 3)
 adapted = DOLinear.from_linear(original, plan=plan)
@@ -416,8 +420,8 @@ optimizer = torch.optim.AdamW(adapted.parameters(), lr=1e-3)
 
 The same pattern is available as `DOHFConv1D.from_hf_conv1d(...)` and
 `DOMultiheadAttention.from_mha(...)` in their respective
-[HF projection](../../src/deepopt/opt/do_nn/hf_conv1d_module.py) and
-[attention](../../src/deepopt/opt/do_nn/mha_module.py) modules. Use these adapters
+[HF projection](../../src/deepopt/opt/nn/hf_conv1d.py) and
+[attention](../../src/deepopt/opt/nn/attention.py) modules. Use these adapters
 when the application already owns its module-selection logic; use
 `transform_model` to discover supported calls in a model.
 
@@ -697,7 +701,7 @@ register its conversion:
 
 ```python
 from deepopt.opt import default_registry
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn.linear import DOLinear
 
 class ProjectLinear(torch.nn.Linear):
     pass
@@ -719,12 +723,14 @@ those matches. Training policy belongs to the runtime/trainer, not these passes.
 | --- | --- | --- |
 | `torch.nn.Linear` | `DOLinear` | Original weight and optional bias |
 | `torch.nn.functional.linear` | `do_linear` | Functional graph target; parameter references stay intact |
+| `torch.nn.Conv1d`, `Conv2d`, `Conv3d` | `DOConv1d`, `DOConv2d`, `DOConv3d` | Spatial convolution; independent saved-input compression |
+| `torch.nn.functional.conv1d`, `conv2d`, `conv3d` | `do_conv1d`, `do_conv2d`, `do_conv3d` | Functional spatial convolution targets |
 | HF Transformers `Conv1D` | `DOHFConv1D` | Keeps stored `[in, out]` weights and transposes for the linear operation |
 | `torch.nn.MultiheadAttention` | `DOMultiheadAttention` | FP8 Q/K/V and output projections |
 
-HF `Conv1D` is a linear projection, not `torch.nn.Conv1d`. The name `DOConv1D`
-remains reserved for a future actual convolution adapter. Exact registered module
-types are matched; arbitrary subclasses need an explicit conversion rule.
+HF `Conv1D` is a linear projection; spatial convolutions use the separate
+[convolution adapters](../convolution/README.md). Exact registered module types
+are matched; arbitrary subclasses need an explicit conversion rule.
 Construct HF models before requesting the default registry so their projection
 class is loaded. Transformers is an optional dependency.
 
@@ -766,544 +772,39 @@ this FP8 path can be captured.
 
 ## Actual CUDA execution
 
-For opt-in native backward GEMM, warmed eager launch planning, and projection
-exclusions, see the [eager Linear optimization controls](eager_linear_benchmark.md#native-backward-and-selective-preparation).
-These controls retain the existing forward backend and scaling default. Numerical
-recipe version 5 records the dW output policy together with any native backward
-executor and projection exclusions.
-
-Use a CUDA-enabled PyTorch installation and compatible Triton exposing
-`triton.tools.tensor_descriptor.TensorDescriptor`. The TMA kernel requires an
-NVIDIA GPU with compute capability at least 9.0. There is no CPU fallback for a
-requested Triton backend.
-
-```bash
-python examples/optimization/fp8_training.py --device cuda --backend triton
-python examples/optimization/fp8_training.py --device cuda --backend triton --block-size 32 --precision bf16
-```
-
-The Triton backend supports independent `e4m3fn`/`e5m2` formats. Fused CUDA
-quantization requires power-of-two block dimensions other than `[1, 1]`.
-For example, activation `[1, 32]` with weight and gradient
-`[32, 32]` is supported. Pipeline stages are tuned automatically by default;
-an explicit integer from 1 through 5 fixes the depth.
-
-Tensorwise scaling and blockwise scales whose reduction-axis widths are multiples
-of 32 use native FP8 dot products. Other layouts use fused per-element FP32
-dequantization followed by a `tf32x3` dot product. Rowwise activation and gradient
-roles use the independently quantized orientations described above to retain
-native FP8 reductions. Other transposes may still require the fallback when
-their reduction-axis scale widths are unaligned.
-The fallback preserves the stored FP8 values and scales without additional
-FP8 quantization, but may have lower throughput than native FP8 dot products.
-The backend packs strided/misaligned operands, pads partial tiles, and returns
-FP32/BF16/FP16 results. Correctness/performance must be measured on the target GPU.
-
-The kernel automatically uses Triton's native `@triton.autotune` to select
-matrix tile sizes, warp counts, pipeline stages, grouped launch ordering, and
-eligible split-K factors. The search measures at most 48 configurations,
-retaining the historical tile/warp/stage choice as a measured candidate.
-Compatible CUDA configurations from
-[Triton's GEMM tutorial](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html)
-are reserved in the measured set, including 128x256/256x128 FP8 tiles with
-K=128 and the two-warp, five-stage small tiles. Shape-aware pruning still
-excludes inappropriate sizes and incompatible scale boundaries. Up to 12
-additional heuristic tile/reduction families supply narrow and split-K choices.
-Candidates include small tiles along long axes to increase parallelism for
-skinny products, two-warp small tiles, and larger tiles for dense products.
-Shortlisting ranks estimated padded work and memory traffic, reserves narrow-axis
-alternatives, and distributes the budget across reduction widths and split
-factors before stage/warp variants. Candidate-list order does not affect selection.
-The shortlist reserves stage-depth coverage before filling the remaining budget.
-An explicit `num_stages` from 1–5 constrains the search; `"auto"` searches pipeline
-depths with matching loop and compiler stages. Candidates with incompatible
-reduction-scale boundaries or resource requirements are pruned. Quantization
-`block_shapes` stay independent of kernel tile sizes: a 32-wide reduction-scale
-block still forbids 64/128-wide native FP8 reduction tiles.
-
-Grouped launches traverse up to eight M tiles before advancing along N to
-promote L2 reuse. Row-major order (`GROUP_SIZE_M=1`) competes with grouped order
-(`GROUP_SIZE_M=8`); up to eight otherwise-identical configuration pairs isolate
-the scheduling choice without consuming the entire search budget. When either
-output axis has a single tile, the equivalent grouped variant is omitted.
-The final partial M group and split-K planes use the same coordinate mapping.
-These CUDA/TMA choices do not introduce a HIP backend.
-
-Split-K factors 2, 4, and 8 compete with unsplit launches for skinny products
-(an output axis at most 32, K at least 512, and at most 262144 output elements)
-and dense products with K at least 4096. This admits ViT weight gradients such
-as a 768x768 output reducing across 100864 tokens. The number of split planes
-is capped by a 64 MiB FP32 scratch bound, including aligned row strides.
-Pruning accounts for SM count, output-grid occupancy, and at least two reduction
-tiles per split. A separate reduction adds bias once and converts to the
-requested output dtype. Both kernels are included in candidate timing. Each
-launch overwrites its partials, so cached launches need no clearing or atomics.
-Cached unsplit winners allocate no partial buffer; cached split winners allocate
-only their selected number of planes.
-Different reduction orders can produce small floating-point differences.
-
-Candidate timing replays the prepared GEMM in a CUDA graph with a
-20 ms repetition parameter and compares median timings. This avoids Python launch gaps
-and repeated L2-cache flushing dominating the ranking of short kernels.
-Packing and quantization run before this isolated timing; the training loop
-does not need CUDA Graph mode. The full FP8 path still has its documented
-capture limitation. The search follows the shape-aware approach used by
-[Inductor's GEMM heuristics](https://github.com/pytorch/pytorch/blob/main/torch/_inductor/heuristics/template/triton.py)
-and the descriptor-based tuning in
-[Triton's TMA matmul tutorial](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html).
-
-Packing uses only the stride alignment required by TMA. Logical descriptor
-bounds handle partial tiles through zero-filled loads and discarded stores
-outside the matrix. Buffers therefore do not require padding to the largest
-tile in the candidate set, including on calls that reuse a cached winner.
-Already aligned row-strided FP8 views are reused directly. Other layouts use
-one copy/padding kernel that overwrites every destination byte; fully overwritten
-buffers do not incur a preliminary zero fill.
-
-Autotuning compiles and benchmarks candidates on the first call for each new
-shape, operand/output format, scale layout, prepared row strides, bias policy,
-pipeline policy, or CUDA device. Forward, input-gradient, and weight-gradient products have
-different shapes; incomplete training and validation batches introduce more
-shapes. These searches add first-use latency, especially in short runs with
-small projections. Matching Triton calls invoke the in-process winner directly,
-reusing a bounded pointer-free layout plan. Each invocation constructs fresh
-descriptors bound to its current tensors; activations and outputs are never
-retained in that cache. Native backward products use PyTorch's scaled-GEMM
-executor instead of this Triton search. Set
-`TRITON_PRINT_AUTOTUNING=1` to inspect selected configurations. A bounded search
-does not guarantee the fastest possible kernel; measure on the target GPU.
-
-On Triton runtimes supporting `cache_results`, tuning timings and winners also
-persist in the native Triton cache. A launch adapter sets descriptor block shapes
-for benchmarks, cached calls and warmups, so normal configurations contain no
-`Config.pre_hook` that would disable Triton 3.9 result serialization. See the
-[native cache implementation](https://github.com/triton-lang/triton/blob/v3.9.0/python/triton/runtime/autotuner.py).
-The cache is invalidated by the kernel, target, environment, tuning key and
-pruned configurations. A new key still pays compilation and search costs;
-compiled-kernel caching alone is not tuning-result persistence.
-Static capability/SM metadata is cached per explicit CUDA device. Descriptors,
-outputs and split-K buffers remain owned by each invocation; no pointer-bound
-descriptor or global scratch storage is shared across concurrent launches.
-
-Benchmark the DeepOpt library installed in your active Python environment on
-the target GPU with the [projection benchmark](../../benchmarks/benchmark_fp8_autotune.py).
-For an editable installation, run `python -m pip install -e .` from the checkout
-first. The script uses normal library imports and can be copied outside the
-repository; it does not select a source tree or modify Python's import path.
-To compare library versions, run it in the corresponding installed environments.
-
-```bash
-python benchmarks/benchmark_fp8_autotune.py
-# Use an explicit pipeline depth with the installed library.
-python benchmarks/benchmark_fp8_autotune.py --num-stages 3
-# Dense projection with scale widths that allow K=128 native FP8 tiles.
-python benchmarks/benchmark_fp8_autotune.py --batches 1024 --input-features 1024 --output-features 1024 --scale-k 128
-# Isolate quantization, including independently scaled transpose views.
-python benchmarks/benchmark_fp8_autotune.py --scope quantize
-python benchmarks/benchmark_fp8_autotune.py --scope quantize --no-check-finite
-python benchmarks/benchmark_fp8_autotune.py --scope scale --no-check-finite
-python benchmarks/benchmark_fp8_autotune.py --scope dequantize
-# Larger scale groups use chunked fusion rather than the unfused fallback.
-python benchmarks/benchmark_fp8_autotune.py --scope quantize --batches 1024 --input-features 1024 --output-features 1024 --scale-k 256 --no-check-finite
-# Actual ViT-B projection dimensions: 512 samples x 197 tokens, tensorwise.
-python benchmarks/benchmark_fp8_autotune.py --preset vit --scaling tensorwise --grad-format e4m3fn --implementation both --num-stages 3 --no-check-finite --iterations 10 --output results/fp8-vit.json
-# Compare an identical supported tile in two separately installed builds.
-# Start with one projection shape; scales and scratch compatibility are checked.
-python benchmarks/benchmark_fp8_autotune.py --scope gemm --scaling tensorwise --batches 100864 --input-features 768 --output-features 768 --gemm-config 128 128 64 8 3 1 1 --no-check-finite --output results/fp8-fixed.json
-```
-
-Use `--output PATH` to save the complete combined JSON report, including timings,
-environment details, numerical errors, and autotuning diagnostics, for sharing
-or later analysis. Missing parent directories are created and an existing file
-is replaced after the benchmark completes successfully. The same JSON is still
-printed to stdout; progress and the saved-file location go to stderr.
-
-For a detailed H100 comparison using the same tensorwise recipe:
-
-```bash
-python benchmarks/benchmark_fp8_autotune.py \
-  --preset vit --implementation both --scaling tensorwise \
-  --grad-format e4m3fn --num-stages 3 --no-check-finite \
-  --reuse-cache --iterations 20 --repeats 5 \
-  --detailed --profile-iterations 2 --profile-rows 30 \
-  --output results/fp8-detailed.json
-```
-
-`--detailed` retains the synchronized wall timings and adds measurements made
-in separate passes after warmup:
-
-- `cuda_events`: elapsed time on the current CUDA stream, including gaps while
-  Python submits work. This is not a sum of kernel durations.
-- `memory`: allocated/reserved baseline and peak bytes for one invocation,
-  plus the extra peak above baseline. Linear gradients are cleared before the
-  baseline; the result and new gradients remain alive through sampling.
-  Inputs, prepared operands and existing caches are resident at baseline.
-  These numbers do not measure whole-model training memory or optimizer/EMA.
-- `profile`: the top CPU operators by self time, CUDA runtime calls, and raw
-  CUDA activities grouped by name. Times are normalized per invocation; counts
-  cover all `--profile-iterations`. `--profile-rows` limits the ranked lists,
-  while CUDA activity totals include every recorded activity. CPU totals are
-  nested, and CUDA activities can overlap; neither should be added to wall time.
-  Missing CUDA profiler activities are explicitly marked `unavailable`.
-- `cuda_graph`: event timings of graph replay for prepared GEMMs, removing
-  per-operation Python dispatch and reusing captured output/scratch storage.
-  Other scopes are skipped; unsupported capture reports its error. Memory and
-  profiling run before this operation's graph capture. Replay is a diagnostic
-  comparison, not a claim that full training can use the same graph.
-
-The prepared BF16 GEMM path uses detached operands, matching FP8's lack of
-autograd bookkeeping in this scope. Full linear measurements retain autograd.
-The default input is BF16; repeat with `--input-dtype fp32` and a different
-output filename to measure FP32 projection inputs, as can occur after
-normalization. Input gradients follow this dtype in both implementations.
-The benchmark continues to import the installed library; detailed mode does not
-change its kernels or runtime policy. `--host-profile` additionally records
-warmed Python submission with cProfile, separately from Kineto. Instrumented
-wall time can contain synchronous waits; nested cumulative times are not additive.
-CUPTI/profiler or graph failures are
-recorded in the JSON so other available measurements remain usable.
-
-By default it uses generated tensors for a `512 -> 10` CIFAR-10 classifier,
-with batch sizes 2048, 848 (training tail), and 1808 (validation tail).
-`--input-features`, `--output-features`, and `--batches` select other projection
-shapes; `--scale-k` selects a power-of-two scale width from 32 through 1024 (default 32).
-The report records group sizes, stages, and split factors for winners and trials.
-`--scaling tensorwise` makes all operand block shapes `None`; the default
-`blockwise` recipe is unchanged. Independent `--activation-format`, `--weight-format`,
-and `--grad-format` select the actual operand formats (historical benchmark
-defaults are E4M3FN/E4M3FN/E5M2). `--implementation both` runs FP8 and BF16 in
-separate fresh processes. The ViT preset measures qkv, attention projection,
-fc1, fc2 and head projections, including their forward/dX/dW products; body
-rows equal `--batches` times `--tokens-per-sample` (default 197). It is not a
-whole-model or epoch benchmark. Defaults are 512, 336 and 272 samples for ViT,
-covering the training batch and training/validation tails; classifier
-defaults remain 2048/848/1808.
-
-Full-linear and BF16 accuracy reporting compares outputs and gradients with
-IEEE FP32 after timing. Prepared FP8 GEMMs separately report quantization error,
-accumulation plus output-cast error, and total error against tiled FP64
-references. The quantized reference applies scale inverses in FP64, avoiding an
-intermediate FP32 dequantization round. It bounds reference temporaries by
-processing output rows and the reduction dimension in chunks. All error reports
-include relative L2, maximum absolute, RMS and finite-value results.
-The accumulation/output-cast category also includes FP32 scale application
-rounding. It is separate from the error of choosing FP8 values and scales.
-`--input-pattern cancellation`, `zeros`, and `mixed-magnitude` exercise numerical
-stress cases; use both FP8 formats and irregular feature dimensions as well.
-Use `--no-accuracy` only when those extra comparisons are unwanted. Candidate
-records also include wall time for compilation plus benchmarking, and the worker
-reports whether native tuning-result caching is enabled. These measurements
-separate cold searches from warmed execution; they do not attribute data loading
-or other epoch costs to autotuning.
-`--scope quantize`, `--scope scale`, and `--scope dequantize` report each operation's
-allocation/latency, operand shapes, and strides independently of GEMM.
-Use `--scope quantize-pair --scaling tensorwise` for the actual converter that
-emits both aligned layouts; ordinary `quantize` measures one layout.
-`--scope bias-gradient` isolates the existing FP32 bias sum to establish whether
-collecting partial bias sums during conversion would repay its added traffic.
-Dequantization prepares FP8 inputs outside the timed region. Finite checks are enabled by default;
-`--no-check-finite` applies the unchecked policy to all measured scopes and
-requires a library version that supports the explicit check override. Use it
-to compare unchecked updates; keep checks enabled when comparing strict runs.
-Each implementation and measurement
-scope runs in a fresh process with the same Python interpreter and an isolated Triton compilation cache by
-default; `--reuse-cache` retains the normal disk cache. Reports separate first-use
-latency from synchronized warmed timings, identify the imported DeepOpt package
-path and installed distribution version, and record
-the installed Python-source fingerprint, Triton version and numerical recipe.
-They include cached winning tiles and
-per-key candidate median/p20/p80 device timings when the library exposes a tuner.
-Unavailable candidates are marked explicitly. Timing instrumentation runs only
-during cold searches. Use `--num-stages auto` for the new default, or an integer
-to compare installed versions that predate automatic stages. The full projection measurement
-includes quantization, forward, backward, and gradient-buffer reset; it excludes
-the convolutional backbone, optimizer, and data loading. Prequantized GEMM
-measurements capture the imported library's actual autograd operands, including independently
-quantized rowwise transposes, before timing. They include packing, padding,
-dispatch, and split scratch allocation, so they are not kernel-only timings.
-Candidate timings include split reduction but exclude allocation and packing;
-compare warmed wrapper and full-projection timings as well. Neither CPU tests
-nor this benchmark's existence establishes a GPU
-speedup.
+See [CUDA execution and autotuning](cuda.md#actual-cuda-execution) for hardware
+requirements, scale layouts, kernel selection, and projection measurements.
 
 ## Full-model training experiments
 
-Use [benchmark_fp8_training.py](../../benchmarks/benchmark_fp8_training.py) after
-projection benchmarks to locate costs in a real timm ViT training update.
-Like the projection script, it imports the installed DeepOpt library, can be
-copied outside the checkout, and does not modify library files or import paths.
-Run directly with Python on one GPU. It requires timm, torchmetrics and a
-CUDA-enabled PyTorch installation; CIFAR10 mode also requires torchvision.
-No pretrained weights or datasets are downloaded.
-
-Start with the compute experiment. BF16 runtime, prepared current FP8, and
-prepared delayed FP8 run by default; the older ablation cases remain opt-in:
-
-```bash
-python benchmarks/benchmark_fp8_training.py \
-  --input-mode resident --batches 512 --trace --no-fill-uninitialized-memory \
-  --output results/fp8-resident
-```
-
-| Case | Precision/execution | EMA | AdamW |
-|---|---|---|---|
-| `bf16-native` | Native AMP and ordinary PyTorch updates | On | Native default selection |
-| `bf16-runtime` | DeepOpt TrainingRuntime, FP8 disabled | On | Native default selection |
-| `fp8-intercept` | FP8 runtime, native-linear interception enabled | On | Native default selection |
-| `fp8-prepared` | FP8 runtime, interception disabled | On | Native default selection |
-| `fp8-delayed` | Prepared delayed FP8, interception disabled | On | Native default selection |
-| `bf16-no-ema` | BF16 runtime | Off | Native default selection |
-| `fp8-no-ema` | FP8 runtime, interception disabled | Off | Native default selection |
-| `bf16-fused-adamw` | BF16 runtime | On | Explicit `fused=True` |
-| `fp8-fused-adamw` | FP8 runtime, interception disabled | On | Explicit `fused=True` |
-
-All cases use the same model seed and initial-state SHA256, FP32 parameters and
-images, BF16 AMP, CrossEntropyLoss and TorchMetrics Accuracy. Each case/batch
-runs in a fresh process. Every step updates weights and clears gradients;
-therefore warmed timing does not incorrectly reuse unchanged FP8 weights.
-The default model is `vit_base_patch16_224`, batch 512, 10 classes, learning rate
-`1e-4`, weight decay `.01` (the original script's AdamW constructor default), EMA
-decay `.95`, tensorwise E4M3FN operands, three stages, full FX transformation and
-`max_speed`. These settings are recorded. Deterministic execution sets
-`CUBLAS_WORKSPACE_CONFIG=:4096:8` inside each worker if the variable is unset.
-The script does not load the application's TOML configuration.
-
-Then isolate host-to-device transfer using a fixed pinned CPU batch:
-
-```bash
-python benchmarks/benchmark_fp8_training.py \
-  --input-mode pinned --cases bf16-runtime fp8-intercept fp8-prepared \
-  --batches 512 --trace --output results/fp8-pinned
-```
-
-Finally, include real CIFAR10 loading and the original augmentation recipe:
-
-```bash
-python benchmarks/benchmark_fp8_training.py \
-  --input-mode cifar10 --data-root /existing/CIFAR10/root \
-  --workers 25 --prefetch-factor 2 \
-  --cases bf16-runtime fp8-intercept fp8-prepared fp8-no-ema \
-  --batches 512 --trace --output results/fp8-cifar10
-```
-
-CIFAR10 uses resize, horizontal flip, RandAugment, FP32 normalization and random
-erasing. It uses an ordinary pinned PyTorch DataLoader with persistent workers,
-not DeepOpt's resumable-loader state machinery. Incomplete batches are dropped
-to keep the measured shape fixed. Test tail shapes separately with `--batches
-336 272`; these are independent fixed-batch training experiments, not validation
-or complete epochs. Resident mode instead reuses one synthetic GPU batch and
-provides a compute ceiling. Compare precision cases within each input mode;
-differences between modes are diagnostic and not an additive decomposition.
-
-Each output directory contains an incrementally saved `summary.json` and one
-subdirectory per case/batch with `result.json`, `worker.log`, GPU telemetry and
-optional `training-trace.json` Chrome traces. Use a distinct output directory for
-each experiment. JSON includes:
-
-- Uninstrumented synchronized wall and CUDA-stream timing distributions and
-  throughput. Defaults are one separately recorded cold update, 10 warmups, and
-  three repeats of 20 updates. Setup and first-use costs are reported separately.
-- A separate event/host breakdown of fetch, transfer, forward/loss, metrics,
-  backward, optimizer/zero-grad and EMA. There is no per-phase synchronization.
-- Warmed peak allocated/reserved memory with model, AdamW state, caches, EMA and
-  the input source already resident at baseline.
-- Actual FP8 projection calls, parameter names and input/output dtypes, plus
-  module observations, the conversion report, and distinct autograd-saved
-  storage bytes by dtype. Saved-storage totals are not simultaneous peak memory.
-- CPU/CUDA operator summaries and a separate Python submission profile. CUDA
-  profiling has its own warmup update; profiling is excluded from throughput.
-- Installed library source SHA256, package versions, relevant environment
-  flags, GPU/process snapshots and one-second GPU telemetry when nvidia-smi is
-  available. Telemetry cannot establish exclusive GPU access by itself.
-
-FP8-to-FP8 ablations suppress speedup calculations when observed FP8 projection
-calls differ, preventing an interception-off case from claiming a gain by
-silently leaving projections dense. All comparisons require identical initial
-weight fingerprints. Cases execute sequentially; inspect sample distributions
-and telemetry for clock/contention drift and repeat close comparisons in reverse
-case order. `--cases` preserves the specified order.
-
-`--steps`, `--repeats`, `--breakdown-steps`, `--profile-steps` and `--profile-rows`
-control collection length. `--profile-steps 0` disables CUDA profiling;
-`--no-host-profile` and `--no-telemetry` disable their respective passes.
-Profiler failures are recorded explicitly. Other worker failures preserve
-completed measurements where possible, leave logs, allow later cases to run,
-and cause a nonzero final exit. The suite saves its partial summary after every
-completed worker. Share `summary.json` first; share traces when timeline analysis
-is needed.
-
-The experiment uses a manual training-step loop, not Trainer epochs: it excludes
-validation, scheduler/callback handling and checkpoint I/O. Synthetic losses are
-diagnostic rather than training-quality evidence. Model, input shape, diagnostic
-policy and optimizer/EMA behavior must match before comparing with epoch logs.
-Component event intervals include host gaps, Python times include implicit
-waits, and profiler CPU totals are nested; do not add these measurements together.
-
-To isolate deterministic allocation filling while retaining deterministic
-algorithms, compare these two runs with the same installed library:
-
-```bash
-python benchmarks/benchmark_fp8_training.py --cases bf16-runtime fp8-prepared \
-  --input-mode resident --trace --output results/fill-on
-python benchmarks/benchmark_fp8_training.py --cases bf16-runtime fp8-prepared \
-  --input-mode resident --trace --no-fill-uninitialized-memory \
-  --output results/fill-off
-```
-
-PyTorch normally initializes `empty`/`empty_strided` allocations when deterministic
-algorithms and `torch.utils.deterministic.fill_uninitialized_memory` are enabled.
-This can add fills before Triton overwrites outputs and scratch buffers. The
-new flag changes only allocation filling; it does not change the deterministic
-algorithm setting. Keep the default enabled until all consumed bytes, including
-padding and split-K scratch, are verified written before use. Compare outputs
-and gradients before adopting it in training. The new runs also record
-`after_timing_state_sha256`: compare the same case across fill-on/fill-off runs
-after the same update count. Investigate a mismatch rather than accepting a
-latency improvement alone. This fingerprint is collected outside timing. See
-[PyTorch's documentation](https://docs.pytorch.org/docs/2.15/deterministic.html).
-
-Report version 2 preserves sample collection order and excludes CUDA user
-annotation ranges from activity totals. It also synchronizes only within the
-separate profiler pass so warmup kernels do not spill into the active capture.
-Earlier raw traces can still be analyzed by selecting `kernel` events inside
-complete GPU update windows; their aggregate CUDA activity totals may include
-annotation ranges and warmup spillover. Uninstrumented throughput timing is
-unchanged by these accounting corrections.
+See [full-model training benchmarks](training_benchmarks.md#full-model-training-experiments)
+for matched ViT updates, memory accounting, profiling, and measurement limits.
 
 ## Black-box and white-box validation
 
-Install optional real-model dependencies without downloading pretrained weights:
+See [validation and test environments](validation.md#black-box-and-white-box-validation)
+for dependency setup, CPU reference checks, actual CUDA coverage, and required
+environment switches.
 
-```bash
-python -m pip install -e '.[model-tests]'
-DEEPOPT_REQUIRE_MODEL_TESTS=1 python -m unittest discover -s tests/opt -v
-python -m unittest discover -s tests/distributed -p 'test_fp8_*.py' -v
-```
+<a id="future-activation-compression-and-sparse-operations"></a>
 
-For a fresh Linux/Windows CPU environment, install PyTorch and torchvision
-together from the CPU wheel index **before** installing the model-test extra:
+## Compression and operation extensions
 
-```bash
-python -m pip install 'torch>=2.4,<3' 'torchvision>=0.19,<1' --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -e '.[model-tests]'
-python -m pip check
-```
+Saved-activation compression is implemented as an opt-in affine 2-bit codec.
+Its [configuration and representation](../activation_compression/README.md)
+cover BF16, tensorwise FP8, and FP8 scaling blocks. The operation and autograd
+layers own the saved payload and reconstruction; GEMM backends consume the
+reconstructed operands and retain their execution responsibilities.
 
-Mixing CPU PyTorch with a torchvision binary from a different build channel can
-cause `RuntimeError: operator torchvision::nms does not exist`. That import error
-also affects timm, Transformers and TorchMetrics. Recreate the environment with
-a matching pair instead of skipping the model tests or registering a fake NMS
-operator. For macOS or CUDA, use the corresponding matching pair from the
-[official PyTorch installation commands](https://pytorch.org/get-started/previous-versions/).
-The CPU CI job installs both wheels from the CPU index and executes real NMS
-before running the test groups.
-
-CPU CI also installs Triton and checks language attributes referenced inside
-the kernel bodies, which Python imports and compileall do not resolve. This
-check needs no GPU and catches missing APIs before a CUDA launch. It does not
-replace compilation and numerical validation on real hardware.
-
-The tiny randomly initialized real architectures are torchvision ViT, timm ViT,
-HF GPT-2, and HF Llama. Black-box tests compare outputs/gradients against dense or
-independently quantized references, perform optimizer updates, and verify exact
-checkpoint continuation. White-box tests inspect replacement identity, tied
-embeddings, graph targets, saved FP8 tensors/scales, gradient dispatch, and DDP
-reducer ownership. Native attention tests with quantization disabled isolate
-adapter semantics from quantization error.
-
-On a compatible GPU:
-
-```bash
-DEEPOPT_REQUIRE_MODEL_TESTS=1 DEEPOPT_REQUIRE_CUDA_FP8=1 \
-  python -m unittest discover -s tests/cuda -p 'test_fp8_*.py' -v
-```
-
-CUDA tests execute actual Triton kernels against dequantized FP32 or reference
-oracles, covering edge tiles, scale boundaries, strided layouts, backward,
-real-model training, and conditional two-GPU NCCL resume. One GPU runs the kernel
-and full-model cases; two compatible GPUs and NCCL are needed for DDP cases.
-The required-environment switches turn missing prerequisites into failures.
-Ordinary local discovery skips unavailable hardware/packages explicitly.
-The existing opt-in GPU CI job requires two FP8-capable GPUs and model packages
-so an all-skipped FP8 job cannot be mistaken for validation.
-
-CPU/reference validation was executed in the development environment with
-PyTorch 2.14.1, torchvision 0.29.1, Transformers 4.57.6 and timm 1.0.31. No CUDA
-device is available in that macOS environment; actual Triton/NCCL FP8 results
-remain pending a compatible GPU run. CPU passes and hardware skips are not GPU
-validation or performance results.
-
-## Future activation compression and sparse operations
-
-The DO names and conversion registry are operation-oriented, rather than tied to
-one optimization. Keep future features at the existing ownership boundaries:
-
-| Layer | Current responsibility | Future extension location |
-| --- | --- | --- |
-| DO modules | Parameters, layouts, module semantics | Choose operation policy while retaining ownership and checkpoint names |
-| Shared functional operation | Execute a projection under a validated plan | Compose implemented FP8, compression, and sparse operation policies |
-| Custom autograd function | Save required operands and compute gradients | Encode/decode saved activations with reconstruction metadata; maintain backward lifetime |
-| GEMM backend | Execute tensor/block-scaled products | Sparse layouts, sparse kernels, and forward/backward dispatch |
-| FX registry/matcher/rewriter | Find and replace eligible operations | Register new DO operations without adding training logic to rewriting |
-
-All three adapters delegate their FP8 projections through the shared functional
-boundary; an explicitly excluded MHA output projection uses dense `F.linear`.
-The autograd path keeps saved-state handling separate from backend execution and
-saves only tensors needed by requested gradients. Future activation compression
-must preserve scales/layout/dtype metadata and autograd saved-tensor lifetime;
-sparse execution must implement the corresponding backward products as well as
-forward. Neither feature is enabled by placeholder flags. The current plan
-validator accepts only the implemented FP8 schema; new policy fields should be
-added with their implementation and tests.
+The existing conversion registry remains the extension boundary for additional
+operations. Sparse execution is not implemented. A sparse policy needs forward
+and backward products, explicit layouts, and validation before it can be
+enabled; placeholder flags do not provide that behavior.
 
 ### Controlled native-accumulation comparisons
 
-Use two environments with separately installed baseline and candidate builds,
-with identical Torch/Triton versions. Copy the same benchmark script outside the
-checkout and run it with each environment's Python. The script uses normal
-library imports and records an installed-source SHA256 fingerprint, recipe,
-formats, input dtype and selected configurations. A legacy library is identified
-from its API; the script never injects the removed accumulation setting.
-
-First compare one fixed configuration to isolate the accumulation change:
-
-```bash
-python benchmark_fp8_autotune.py --scope gemm --preset vit \
-  --scaling tensorwise --grad-format e4m3fn --input-dtype bf16 \
-  --gemm-config 128 128 64 8 3 1 1 --num-stages 3 \
-  --no-check-finite --output fixed.json
-```
-
-Then omit `--gemm-config` and use `--num-stages auto` to tune each build afresh.
-Use separate output files and initially omit `--reuse-cache` to keep compilation
-and tuning caches isolated. The changed JIT source also gives native accumulation
-its own kernel/cache identity. Repeat GEMM diagnostics with `--input-pattern
-cancellation`, `mixed-magnitude` and `zeros`, both FP8 formats, and irregular
-feature dimensions. Fixed configurations must satisfy each product's scale,
-stage, occupancy and split-scratch constraints; invalid choices fail before
-launch. Fixed mode adds a small Python validation wrapper and bypasses winner
-caching; compare fixed runs with fixed runs rather than mixing timing modes.
-
-Measure full projections with `--scope linear --implementation both --detailed
---host-profile`. Repeat with `--input-dtype fp32`; also measure `quantize-pair`,
-`scale` and `bias-gradient` separately. Keep input formats, current-tensor scaling
-and finite-check settings identical across runs. Projection sums and graph replay
-are diagnostics, not full-model latency or training capture.
-
-Native accumulation changes numerical behavior. Before accepting a performance
-result, run matched short full-model training comparisons from the same initial
-model/optimizer state, batches and augmentation seeds, with the same EMA,
-diagnostics and checkpoint cadence. Compare loss and validation accuracy, startup
-and steady-state timings, and allocated versus reserved memory separately; then
-confirm with a longer run. Warmed weight-cache reuse does not represent a weight
-update on every step. Retain the deterministic ordered split-K reduction.
-
-Further consumer/producer fusion and head exclusions remain measurement-gated
-experiments. The optional delayed recipe below implements checkpointed history
-and fused bias preprocessing; its performance and training quality still need
-target-hardware validation. The native accumulation, static device
-metadata and selective-layout changes do not establish a GPU speedup or a
-training-quality result without these target-hardware measurements.
+See [controlled installed-build comparisons](cuda.md#controlled-native-accumulation-comparisons)
+for fixed configurations, independently tuned builds, and numerical checks.
 
 ### Optional delayed-scaling recipe
 

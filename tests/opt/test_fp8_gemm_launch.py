@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from deepopt.opt.backends._gemm_launch import gemm_launch_plan, launch_selected, selected_config
-from deepopt.opt.backends._triton_autotune import autotune_cache_key, DescriptorKernel
+from deepopt.opt.backends.triton.gemm.launch import gemm_launch_plan, launch_selected, selected_config
+from deepopt.opt.backends.triton.gemm.autotune import autotune_cache_key, DescriptorKernel
 
 
 def plan(**updates):

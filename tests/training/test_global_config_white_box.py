@@ -10,7 +10,7 @@ from torch.nn import functional as F
 
 from deepopt import Trainer, TrainingRuntime
 from deepopt.config import get_config, load_config, reset_config
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn.linear import DOLinear
 from deepopt.optimizer_factory import build_optimizer
 from tests.training.config_support import make_batches, make_config
 

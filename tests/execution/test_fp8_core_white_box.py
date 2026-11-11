@@ -11,7 +11,7 @@ from torch.utils.data import TensorDataset
 from deepopt import Trainer, TrainingCore, TrainingRuntime
 from deepopt.config import FP8Config, config_from_dict
 from deepopt.experiment import build_experiment
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn.linear import DOLinear
 
 
 class AutomaticFP8CoreWhiteBoxTests(unittest.TestCase):

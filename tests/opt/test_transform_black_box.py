@@ -9,7 +9,7 @@ from torch import fx, nn
 from torch.nn import functional as F
 
 from deepopt.opt import TransformationTraceError, transform_model
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn.linear import DOLinear
 
 
 def plan():
@@ -94,7 +94,7 @@ class TransformationBlackBoxTests(unittest.TestCase):
         self.assertFalse(torch.equal(before, transformed.projection.weight))
         self.assertEqual(report.trace_mode, "full")
         self.assertEqual(report.converted_modules, ("projection",))
-        self.assertEqual(len(report.function_calls), 1)
+        self.assertEqual(set(report.function_calls), {"tanh", "linear"})
         self.assertEqual(report.untraced_modules, ())
 
     def test_modules_preserves_root_methods_and_dynamic_branches(self):

@@ -4,6 +4,8 @@
 
 This guide is for changing DeepOpt. Training recipes can use the public APIs
 without knowing the implementation layers below.
+The [backend organization guide](backends.md) explains executor families,
+operation directories, GEMM operands, and optional GPU imports.
 
 ## Responsibility boundaries
 
@@ -67,8 +69,20 @@ src/deepopt/
 │   └── core.py         # CUDA Graph core, composed with either training core
 ├── opt/                # FX model transformation and optimized operations
 │   ├── fx/             # Tracing, conversion registry, matching and rewriting
-│   ├── do_nn/          # DO modules and first-order projection autograd
-│   └── backends/       # Reference, Triton CUDA GEMM, and optional native backward
+│   ├── nn/             # Projection modules, functional operations and autograd
+│   │   ├── functional.py # Shared linear entry point and plan dispatch
+│   │   └── autograd/   # Native/FP8 gradients and saved activations
+│   ├── quantization/   # FP8 tensors, weight caches and activation codecs
+│   ├── scaling/        # Current and delayed scaling state
+│   └── backends/       # Execution backend dispatch and compatibility aliases
+│       ├── reference/  # Reference GEMM implementation
+│       ├── native/     # PyTorch scaled-FP8 GEMM
+│       ├── _shared/    # Common CUDA launch helpers
+│       └── triton/
+│           ├── gemm/   # FP8 GEMM, launch planning and autotuning
+│           ├── scaling/ # Amax reductions
+│           └── quantization/ # FP8 casting and delayed-scale launches
+│               └── activation/ # Affine 2-bit codecs and fused FP8 casts
 ├── scheduling/         # Pure curves, coefficient lifecycle and native LR factory
 ├── optimizer_factory.py # PyTorch/custom optimizer construction
 ├── optim.py            # Reserved optimizer algorithms; lazy legacy factory aliases
@@ -86,18 +100,27 @@ imports remain aliases to the same implementations through `engine/_compat.py`.
 Serialized engine class identities and logger namespaces are retained, so this
 folder change does not invalidate existing checkpoints. `deepopt.memory` keeps
 its public exports; its implementation is split among three focused modules.
+The optimized-operation code follows the same rule: canonical implementations
+live under `opt/nn`, `opt/scaling`, and the backend-specific packages. Former
+private module paths remain compatibility aliases to the same module objects;
+they do not contain duplicate implementations.
 
 Tests are grouped by feature under `tests/`, and examples under `examples/`.
 The progressive walkthrough stays at `examples/progressive_training.py`.
 See [test groups](../../tests/README.md) and [examples](../../examples/README.md)
 for focused commands. The usual recursive test discovery covers all groups.
+Standalone measurements are grouped by workload in the
+[benchmark catalog](../../benchmarks/README.md), with their contract tests in
+[tests/benchmarks/](../../tests/benchmarks/).
 
 | Area | Files and responsibilities |
 | --- | --- |
 | Packaging | [pyproject.toml](../../pyproject.toml): dependencies, `src` layout, `deepopt` console entry point |
 | Public exports | [src/deepopt/__init__.py](../../src/deepopt/__init__.py): lazily load training APIs; configuration can be imported without loading Torch |
 | CUDA Graphs | [cuda_graph/core.py](../../src/deepopt/cuda_graph/core.py): model/function capture, raw blocks and inference decorators; graph lifetime stays separate from training and DDP |
-| FP8 and model conversion | [opt/transform.py](../../src/deepopt/opt/transform.py): full/submodule FX orchestration; [opt/do_nn/](../../src/deepopt/opt/do_nn/) owns operation semantics and autograd, while [opt/backends/](../../src/deepopt/opt/backends/) owns GEMM execution |
+| Linear operations and model conversion | [opt/nn/functional.py](../../src/deepopt/opt/nn/functional.py) owns shared functional plan dispatch; [opt/policy.py](../../src/deepopt/opt/policy.py) builds plans; [opt/transform.py](../../src/deepopt/opt/transform.py) owns full/submodule FX orchestration; [opt/backends/](../../src/deepopt/opt/backends/) owns FP8 GEMM execution |
+| FP8 execution | [triton/gemm/](../../src/deepopt/opt/backends/triton/gemm/) owns Triton GEMM and tuning; [native/fp8.py](../../src/deepopt/opt/backends/native/fp8.py) owns native scaled GEMM; [reference/gemm.py](../../src/deepopt/opt/backends/reference/gemm.py) provides emulation |
+| Activation compression | [quantization/activation.py](../../src/deepopt/opt/quantization/activation.py) owns the payload and codec contract; [triton/quantization/activation/](../../src/deepopt/opt/backends/triton/quantization/activation/) owns CUDA kernels |
 | Compilation | [engine/execution/compilation.py](../../src/deepopt/engine/execution/compilation.py): optional model-only compilation before DDP wrapping; runtime and optimizer remain eager |
 | Application configuration | [config.py](../../src/deepopt/config.py): typed settings, strict common keys, application-owned metadata |
 | Model storage summary | [memory/statistics.py](../../src/deepopt/memory/statistics.py): parameter counts/percentages, current storage and initialization logging without fake execution |
@@ -217,12 +240,12 @@ tensors can still increase memory usage.
 
 Numerical checks add work, particularly for small models. Benchmark the actual
 recipe before changing checks or accumulation. The bundled
-[CPU benchmark](../../benchmarks/benchmark_training.py) compares a plain PyTorch
+[CPU benchmark](../../benchmarks/training/benchmark_training.py) compares a plain PyTorch
 loop with the functional trainer on two fixed MLP workloads:
 
 ```bash
-python benchmarks/benchmark_training.py --source src --profile --output work/perf-checks-on.json
-python benchmarks/benchmark_training.py --source src --checks off --profile --output work/perf-checks-off.json
+python benchmarks/training/benchmark_training.py --source src --profile --output work/perf-checks-on.json
+python benchmarks/training/benchmark_training.py --source src --checks off --profile --output work/perf-checks-off.json
 ```
 
 It uses one CPU thread, warmups, repeated median timings and identical initial
@@ -254,7 +277,9 @@ serve a different purpose and do not replace measured workload validation.
   Pointer-free launch plans cache layout decisions while each call binds fresh
   descriptors; preparation owns projection exclusions and alias handling.
   Training/DDP cores stay independent of these
-  operation implementations. See [FP8 and future compression/sparse boundaries](../fp8/README.md).
+  operation implementations. See [FP8](../fp8/README.md) and
+  [activation compression](../activation_compression/README.md). Sparse execution
+  remains an extension point.
 - Ordinary loaders are the default for epoch saving. Built-in index-skip
   sampler/loader utilities do not claim state recovery. The resumable loader
   supports rebatching and worker prefetch with a delivered-sample cursor;

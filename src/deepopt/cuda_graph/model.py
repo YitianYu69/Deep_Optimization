@@ -9,7 +9,7 @@ from deepopt._config_resolution import _UNSET
 
 from ._configuration import _capture_settings
 from ._validation import (arguments, autocast_spec, capture_guard, check_arguments,
-                          cuda_device, static_arguments, tensor_spec, warmup_count)
+                          cuda_device, operation_policy_spec, static_arguments, tensor_spec, warmup_count)
 from .capture import CapturedFunction
 
 
@@ -78,7 +78,7 @@ class CapturedCallable:
             raise ValueError("Autograd capture cannot run under inference_mode; use autograd=False")
         model = function if isinstance(function, nn.Module) else None
         modules = tuple(model.modules()) if model is not None else ()
-        from deepopt.opt.scaling_strategy.delayed import DelayedScalingState
+        from deepopt.opt.scaling.delayed import DelayedScalingState
 
         if any(isinstance(module, DelayedScalingState) for module in modules):
             raise ValueError("Delayed scaling requires eager preprocessing; full training CUDA capture is unsupported")
@@ -108,8 +108,10 @@ class CapturedCallable:
         self._signature = _storage_signature(model) if model is not None else None
         self._modes = _modes(model) if model is not None else None
         self._autocast = autocast_spec()
+        self._operation_policy = operation_policy_spec()
         self._closed = False
         self._graphed = None
+        self._statistics = {"forward_replays": 0, "eager_mode_fallbacks": 0, "eager_autocast_fallbacks": 0}
         try:
             with torch.cuda.device(self.device), torch.enable_grad() if autograd else torch.no_grad():
                 # Native warmup runs real forwards. Preserve module buffers
@@ -151,13 +153,22 @@ class CapturedCallable:
             # A graph must not silently serve a different train/eval/precision
             # path. Such calls run the original callable eagerly instead.
             mode_changed = model is not None and _modes(model) != self._modes
-            if mode_changed or autocast_spec() != self._autocast:
+            fallback = None
+            if mode_changed:
+                fallback = "eager_mode_fallbacks"
+            elif autocast_spec() != self._autocast or operation_policy_spec() != self._operation_policy:
+                fallback = "eager_autocast_fallbacks"
+            if fallback is not None:
                 with nullcontext() if autograd else torch.no_grad():
-                    return self._original(*args, **kwargs)
+                    outputs = self._original(*args, **kwargs)
+                self._statistics[fallback] += 1
+                return outputs
             check_arguments(args, kwargs, self._specs)
             with torch.cuda.device(self.device):
                 outputs = self._graphed(*args)
-                return _own_backward_gradients(outputs) if autograd else outputs
+                outputs = _own_backward_gradients(outputs) if autograd else outputs
+            self._statistics["forward_replays"] += 1
+            return outputs
 
         forward._deepopt_cuda_capture = True
         self._installed = forward
@@ -174,6 +185,19 @@ class CapturedCallable:
     @property
     def captured(self):
         return not self._closed
+
+    @property
+    def statistics(self):
+        """Cumulative successful forward routes, without synchronizing CUDA.
+
+        Warmup/capture and rejected or failed forwards are excluded. Mode
+        fallback takes precedence if both mode and precision policy changed.
+        Autocast fallbacks include changed FP8 and activation compression
+        scopes as well as native AMP. Counts
+        describe dispatch, not completed GPU execution or backward replays.
+        The returned snapshot stays available after close().
+        """
+        return self._statistics.copy()
 
     @property
     def graph(self):
