@@ -1,4 +1,9 @@
 from importlib import import_module
+from os.path import join as _join
+
+# Resolve former package names lazily while keeping canonical modules first.
+__path__.append(_join(__path__[0], "_legacy"))
+del _join
 
 __all__ = [
     "transform_model",
@@ -15,8 +20,8 @@ _EXPORTS = {
     "autocast": "._autocast",
     "FP8Config": "..config",
     "DelayedScalingConfig": "..config",
-    "fp8_scaling_scope": ".scaling_strategy.delayed",
-    "fp8_checkpoint": ".scaling_strategy.delayed",
+    "fp8_scaling_scope": ".scaling.delayed",
+    "fp8_checkpoint": ".scaling.delayed",
     "transform_model": ".transform",
     "TransformReport": ".transform",
     "TransformationTraceError": ".transform",

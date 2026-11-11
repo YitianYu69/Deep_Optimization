@@ -137,7 +137,7 @@ class ExampleBlackBoxTests(unittest.TestCase):
         setup, trainer_loop = trainer.split("runtime = TrainingRuntime(", 1)
         setup += "\nbefore = [parameter.detach().clone() for parameter in model.parameters()]\n"
         checks = (
-            "\nassert report.converted_modules == ('0', '2')\n"
+            "\nassert report.converted_modules == ('0', '1', '2')\n"
             "assert all(p.dtype == torch.float32 and torch.isfinite(p).all() for p in model.parameters())\n"
             "assert any(not torch.equal(old, new) for old, new in zip(before, model.parameters()))\n"
         )

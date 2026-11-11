@@ -17,6 +17,7 @@ python -m unittest discover -s tests -v
 | `metrics/` | Metric inputs, aggregation, saved state and optional counts |
 | `optimization/` | Loss semantics, accumulation, strategies and optimizers |
 | `opt/` | FP8 numerical/autograd and AMP/FP8 scope checks, FX transformation, shared state, trainer resume, and optional real ViT/GPT-2/Llama models |
+| `benchmarks/` | Installed-library benchmark interfaces, timing/profiling reports, numerical comparisons and portable script entry points |
 | `scheduling/` | Curve/controller white-box checks; training, LR timing, resume, compilation counts and two/four-rank Gloo acceptance |
 | `memory/` | Storage accounting, fake estimation, planning and activation retention |
 | `observability/` | Logging, numerical observers and their configuration |
@@ -147,4 +148,4 @@ Ordinary discovery permits explicit skips. CPU emulation, mocked boundaries,
 and skipped GPU tests are not actual CUDA validation.
 
 See the [FP8 guide](../docs/fp8/README.md) for supported behavior, plan constraints,
-checkpoint reconstruction, and future activation-compression/sparse boundaries.
+checkpoint reconstruction, activation compression, and sparse extension boundaries.

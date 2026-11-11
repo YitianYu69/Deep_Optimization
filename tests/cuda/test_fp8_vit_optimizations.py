@@ -22,11 +22,11 @@ from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
 class ViTFP8OptimizationTests(unittest.TestCase):
     def test_weight_only_backward_writes_only_the_consumed_gradient_layout(self):
-        from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func as implementation
+        from deepopt.opt.nn.autograd import linear as implementation
         from deepopt.opt.quantization.quantizer import _quantize_tensorwise_transpose
         from deepopt.opt.policy import fp8_plan
         from deepopt import FP8Config
-        from deepopt.opt.do_nn.functional import do_linear
+        from deepopt.opt.nn.functional import do_linear
 
         x = torch.randn(129, 65, device="cuda")
         weight = torch.randn(97, 65, device="cuda", requires_grad=True)
@@ -80,7 +80,7 @@ class ViTFP8OptimizationTests(unittest.TestCase):
 
     def test_pair_training_keeps_independent_forward_backward_check_cadences(self):
         from deepopt.opt.backends import triton_quantization
-        from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
+        from deepopt.opt.nn.autograd import linear as linear_autograd_func
 
         model = nn.Linear(65, 97, device="cuda")
         runtime = TrainingRuntime(model, torch.optim.SGD(model.parameters(), lr=.001), device="cuda",
@@ -154,7 +154,7 @@ class ViTFP8OptimizationTests(unittest.TestCase):
             self.assertEqual(len(kernel.cache), 1)
 
     def test_tuning_results_survive_a_fresh_process_without_config_hooks(self):
-        from deepopt.opt.backends.triton_fp8 import _gemm_nt_kernel
+        from deepopt.opt.backends.triton.gemm.fp8 import _gemm_nt_kernel
 
         if not getattr(_gemm_nt_kernel, "cache_results", False):
             self.skipTest("This Triton runtime does not support persistent tuning results")

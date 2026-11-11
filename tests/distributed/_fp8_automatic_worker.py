@@ -133,7 +133,7 @@ def reject_mismatched_policy(context):
 
 def check_mode_coverage(context):
     from deepopt import DiagnosticPolicy
-    from deepopt.opt.scaling_strategy.amax import AmaxScaling
+    from deepopt.opt.scaling.amax import AmaxScaling
 
     torch.manual_seed(91)
     model = nn.Linear(8, 4)

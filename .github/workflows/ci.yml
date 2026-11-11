@@ -19,7 +19,9 @@ jobs:
           python-version: '3.11'
       - name: Install matching CPU PyTorch and torchvision wheels
         run: python -m pip install 'torch>=2.4,<3' 'torchvision>=0.19,<1' --index-url https://download.pytorch.org/whl/cpu
-      - run: python -m pip install -e '.[dev,model-tests]'
+      # Copied benchmark scripts must exercise the installed wheel, not a
+      # checkout exposed through an editable-install path hook.
+      - run: python -m pip install '.[dev,model-tests]'
       - name: Install Triton for GPU-free kernel API checks
         run: python -m pip install 'triton>=3.3,<4'
       - name: Check deferred Triton language API references
@@ -44,7 +46,7 @@ jobs:
         env:
           DEEPOPT_REQUIRE_MODEL_TESTS: '1'
         run: |
-          for group in opt cuda execution optimization training metrics memory observability application onboarding scheduling; do
+          for group in opt benchmarks cuda execution optimization training metrics memory observability application onboarding scheduling; do
             python -m unittest discover -s tests/$group -v
           done
       - run: python -m build
@@ -114,7 +116,7 @@ jobs:
       - run: python -m unittest discover -s tests/execution -v
       - run: python -m unittest discover -s tests/cuda -v
       - run: python -m unittest discover -s tests/distributed -v
-      - run: torchrun --standalone --nproc-per-node=2 benchmarks/benchmark_execution.py --device cuda --precision bf16 --pinned --non-blocking --profile > benchmark-cuda.json
+      - run: torchrun --standalone --nproc-per-node=2 benchmarks/training/benchmark_execution.py --device cuda --precision bf16 --pinned --non-blocking --profile > benchmark-cuda.json
       - uses: actions/upload-artifact@v4
         with:
           name: cuda-benchmark

@@ -6,7 +6,7 @@ from fnmatch import fnmatchcase
 
 from torch import fx, nn
 
-from .do_nn.functional import validate_fp8_plan
+from deepopt.opt.nn.functional import validate_fp8_plan
 from .fx.matcher import match_graph
 from .fx.registry import ConversionRegistry, default_registry
 from .fx.rewriter import rewrite_graph
@@ -133,7 +133,7 @@ def _transform_submodules(
                 function_calls.extend(
                     f"{path}.{node.name}"
                     for node in matches
-                    if node.op == "call_function"
+                    if node.op in ("call_function", "call_method")
                 )
 
                 replacements[module_id] = rewrite_graph(
@@ -262,7 +262,7 @@ def transform_model(
             node.target for node in matches if node.op == "call_module"
         ),
         function_calls=tuple(
-            node.name for node in matches if node.op == "call_function"
+            node.name for node in matches if node.op in ("call_function", "call_method")
         ),
         excluded_modules=excluded_names,
     )

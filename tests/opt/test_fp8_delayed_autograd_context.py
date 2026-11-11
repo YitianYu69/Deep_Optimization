@@ -11,14 +11,22 @@ import torch
 from torch import nn
 
 from deepopt import FP8Config, DelayedScalingConfig, DiagnosticPolicy, TrainingRuntime, fp8_checkpoint, fp8_scaling_scope
-from deepopt.opt.do_nn.AOTAutograd_Func.linear_autograd_func import _DOLinearFunction
+from deepopt.opt.nn.autograd.linear import _DOLinearFunction
 from deepopt.opt.policy import prepare_fp8_model
-from deepopt.opt.scaling_strategy.delayed import DelayedScalingState, current_scaling_batch, delayed_states
+from deepopt.opt.scaling.delayed import DelayedScalingState, current_scaling_batch, delayed_states
 
 
 def settings():
     return FP8Config(enabled=True, scaling_recipe="delayed", intercept_linear=False,
                      delayed_scaling=DelayedScalingConfig(history_length=3))
+
+
+def expected_updates(model, state):
+    if state is model[1].fp8_scaling:
+        return [1, 0, 0]  # Activation output owns its own delayed observation.
+    if state is model[2].fp8_scaling:
+        return [0, 1, 1]  # Compatible encoded input is reused by the next Linear.
+    return [1, 1, 1]
 
 
 @contextmanager
@@ -66,7 +74,7 @@ class DelayedAutogradContextTests(unittest.TestCase):
                     torch.testing.assert_close(value, expected, rtol=0, atol=0)
                     torch.testing.assert_close(value.grad, expected.grad, rtol=0, atol=0)
                 for state, expected in zip(delayed_states(actual.model), delayed_states(oracle.model)):
-                    self.assertEqual(state.updates.tolist(), [1, 1, 1])
+                    self.assertEqual(state.updates.tolist(), expected_updates(actual.model, state))
                     torch.testing.assert_close(state.scales, expected.scales, rtol=0, atol=0)
                     torch.testing.assert_close(state.history, expected.history, rtol=0, atol=0)
 
@@ -82,7 +90,7 @@ class DelayedAutogradContextTests(unittest.TestCase):
                     for state in delayed_states(model):
                         self.assertEqual(state.updates.tolist(), [0, 0, 0])
                 for state in delayed_states(model):
-                    self.assertEqual(state.updates.tolist(), [1, 1, 1])
+                    self.assertEqual(state.updates.tolist(), expected_updates(model, state))
                 self.assertTrue(torch.isfinite(x.grad).all())
 
     def test_standalone_backward_does_not_reopen_a_finished_forward_boundary(self):
@@ -119,7 +127,7 @@ class DelayedAutogradContextTests(unittest.TestCase):
         loss = runtime.compute(torch.ones(7, 5), lambda x: runtime.model(x).sum())
         original, worker = _DOLinearFunction.backward, Context()
         with patch.object(_DOLinearFunction, "backward", new=lambda ctx, grad: worker.run(original, ctx, grad)), \
-             patch("deepopt.opt.do_nn.AOTAutograd_Func.linear_autograd_func.gemm_nt", side_effect=RuntimeError("test failure")):
+             patch("deepopt.opt.nn.autograd.linear.gemm_nt", side_effect=RuntimeError("test failure")):
             with self.assertRaisesRegex(RuntimeError, "test failure"):
                 runtime.backward(loss)
         self.assertIsNone(worker.run(current_scaling_batch))

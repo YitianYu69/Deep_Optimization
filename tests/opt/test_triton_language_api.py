@@ -15,7 +15,16 @@ class TritonLanguageAPITests(unittest.TestCase):
 
         root = Path(deepopt.__file__).parent / "opt" / "backends"
         references = 0
-        for name in ("triton_fp8.py", "triton_quantization.py", "triton_delayed.py", "scaling_utils/fused_amax.py"):
+        for name in ("triton/gemm/fp8.py", "triton/quantization/fp8.py", "triton/quantization/delayed.py",
+                     "triton/scaling/amax.py", "triton/quantization/activation/affine.py",
+                     "triton/quantization/activation/fp8.py", "triton/quantization/activation/boolean.py",
+                     "triton/activation/common.py", "triton/activation/forward.py", "triton/activation/backward.py",
+                     "triton/gradient/epilogue.py", "triton/gradient/reduction.py", "triton/gradient/transpose.py",
+                     "triton/activation/gradient.py", "triton/normalization/gradient.py", "triton/normalization/recenter.py",
+                     "triton/quantization/activation/indices.py", "triton/pooling/common/addressing.py",
+                     "triton/pooling/common/windows.py", "triton/pooling/common/output.py",
+                     "triton/pooling/common/global_reduce.py", "triton/pooling/window/forward.py",
+                     "triton/pooling/window/backward.py", "triton/pooling/power/factors.py", "triton/pooling/unpool/forward.py"):
             path = root / name
             tree = ast.parse(path.read_text(), filename=str(path))
             aliases = {alias.asname for node in ast.walk(tree) if isinstance(node, ast.Import)

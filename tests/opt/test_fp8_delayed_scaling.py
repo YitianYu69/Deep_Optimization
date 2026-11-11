@@ -14,9 +14,9 @@ from deepopt import FP8Config, DelayedScalingConfig, fp8_scaling_scope, fp8_chec
 from deepopt._config_resolution import ResolvedConfig
 from deepopt.config import ConfigError, fp8_config_from_dict
 from deepopt.opt.policy import fp8_plan, prepare_fp8_model
-from deepopt.opt.do_nn.functional import do_linear
-from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
-from deepopt.opt.scaling_strategy.delayed import DelayedScalingState, delayed_states
+from deepopt.opt.nn.functional import do_linear
+from deepopt.opt.nn.autograd import linear as linear_autograd_func
+from deepopt.opt.scaling.delayed import DelayedScalingState, delayed_states
 
 
 def settings(**kwargs):
@@ -43,13 +43,13 @@ class DelayedScalingTests(unittest.TestCase):
                 CUDAGraphCore(device="cuda", config=ResolvedConfig({})).capture_model(runtime.model, (torch.ones(7, 5),))
 
     def test_warmed_runtime_reuses_state_discovery_and_validated_recipe(self):
-        from deepopt.opt.do_nn import functional
+        from deepopt.opt.nn import functional
 
         source = nn.Linear(5, 3)
         runtime = TrainingRuntime(source, torch.optim.SGD(source.parameters(), lr=.001), fp8=settings(), checks=False)
         runtime.compute(torch.ones(7, 5), lambda x: runtime.model(x).sum())
         runtime.zero_grad()
-        with patch("deepopt.opt.scaling_strategy.delayed.delayed_states", side_effect=AssertionError("rescanned model")), \
+        with patch("deepopt.opt.scaling.delayed.delayed_states", side_effect=AssertionError("rescanned model")), \
              patch.object(functional, "asdict", side_effect=AssertionError("rebuilt recipe dictionary")):
             loss = runtime.compute(torch.ones(7, 5), lambda x: runtime.model(x).sum())
             runtime.backward(loss)
@@ -101,7 +101,7 @@ class DelayedScalingTests(unittest.TestCase):
     def test_fake_cuda_layout_probe_needs_no_gpu_kernel_or_scalar_read(self):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
-        with FakeTensorMode(), patch.dict("sys.modules", {"deepopt.opt.backends.triton_delayed": None}):
+        with FakeTensorMode(), patch.dict("sys.modules", {"deepopt.opt.backends.triton.quantization.delayed": None}):
             state = DelayedScalingState({}, dict.fromkeys(("activation", "weight", "grad"), torch.float8_e4m3fn), device="cuda")
             normal, transposed, bias = state.quantize(torch.empty(65, 129, device="cuda"), "grad",
                                                       transposed=True, bias=True, check_finite=False)

@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import torch
 
-from deepopt.opt.backends._delayed_launch import (observation_rows, scratch_tile, MetadataCache,
+from deepopt.opt.backends.triton.quantization.launch import (observation_rows, scratch_tile, MetadataCache,
                                                   conversion_cache_key, retained_bytes)
-from deepopt.opt.scaling_strategy.delayed import DelayedScalingState, _UpdateBatch
+from deepopt.opt.scaling.delayed import DelayedScalingState, _UpdateBatch
 
 
 def state():

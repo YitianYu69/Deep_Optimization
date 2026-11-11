@@ -342,8 +342,8 @@ reducer configuration and recipe/data identity remain relevant.
   gated. A CPU-only run does not verify GPU correctness or performance.
 
 ```bash
-python benchmarks/benchmark_execution.py --device cpu --batches 24 --repeats 7 --profile
-torchrun --standalone --nproc-per-node=2 benchmarks/benchmark_execution.py \
+python benchmarks/training/benchmark_execution.py --device cpu --batches 24 --repeats 7 --profile
+torchrun --standalone --nproc-per-node=2 benchmarks/training/benchmark_execution.py \
   --device cuda --precision bf16 --accumulation 4 --pinned --non-blocking --profile
 ```
 

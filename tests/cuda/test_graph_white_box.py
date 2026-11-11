@@ -8,10 +8,12 @@ import torch
 from torch import nn
 
 from deepopt import CUDAGraphCore, TrainingRuntime, cuda_graph_core
+from deepopt._config_resolution import ResolvedConfig
 from deepopt.cuda_graph import CapturedFunction
 from deepopt.cuda_graph._validation import (arguments, capture_guard, check_arguments,
-                                            static_arguments, tensor_spec)
+                                            operation_policy_spec, static_arguments, tensor_spec)
 from deepopt.cuda_graph.model import _own_backward_gradients
+from deepopt.opt._autocast import _ActivationCompressionScope, fp8_context
 
 
 class GraphLifecycleWhiteBoxTests(unittest.TestCase):
@@ -196,6 +198,7 @@ class CaptureContractsWhiteBoxTests(unittest.TestCase):
         captured._inputs = (torch.zeros(2),)
         captured._specs = (tensor_spec(captured._inputs[0]),)
         captured._autocast = (False, None)
+        captured._operation_policy = operation_policy_spec()
         captured._outputs = torch.ones(2)
         captured._capture.replay = Mock()
         with patch("torch.cuda.device", return_value=nullcontext()):
@@ -205,6 +208,46 @@ class CaptureContractsWhiteBoxTests(unittest.TestCase):
         captured._capture.replay.assert_called_once()
         function.assert_not_called()
         torch.testing.assert_close(captured._inputs[0], torch.full((2,), 7.))
+
+    def test_operation_policy_retains_explicit_disable_and_inherited_scope_semantics(self):
+        original = operation_policy_spec()
+        with _ActivationCompressionScope("cuda", {"enabled": True, "group_size": 512}, config=ResolvedConfig()).enter():
+            enabled = operation_policy_spec()
+            self.assertEqual(enabled[1], (True, 512, 2, None, False))
+            with _ActivationCompressionScope("cuda", None, config=ResolvedConfig()).enter():
+                self.assertEqual(operation_policy_spec(), enabled)
+            with _ActivationCompressionScope("cuda", False, config=ResolvedConfig()).enter():
+                self.assertNotEqual(operation_policy_spec(), enabled)
+                self.assertEqual(operation_policy_spec()[1][0], False)
+            with _ActivationCompressionScope("cuda", {"enabled": True, "norm_xhat_recenter": True}, config=ResolvedConfig()).enter():
+                self.assertNotEqual(operation_policy_spec(), enabled)
+                self.assertTrue(operation_policy_spec()[1][-1])
+        self.assertEqual(operation_policy_spec(), original)
+        with fp8_context("cuda", {"enabled": True, "intercept_linear": False}, config=ResolvedConfig()):
+            no_interception = operation_policy_spec()
+        with fp8_context("cuda", {"enabled": True, "intercept_linear": True}, config=ResolvedConfig()):
+            intercepted = operation_policy_spec()
+        self.assertEqual(no_interception[:2], intercepted[:2])
+        self.assertNotEqual(no_interception[2], intercepted[2])
+
+    def test_decorator_rejects_changed_compression_policy_before_replay(self):
+        captured = CapturedFunction(Mock())
+        captured._capture._state = "ready"
+        captured._capture.device = "cuda:0"
+        captured._inputs = (torch.zeros(2),)
+        captured._specs = (tensor_spec(captured._inputs[0]),)
+        captured._autocast = (False, None)
+        captured._outputs = torch.ones(2)
+        captured._capture.replay = Mock()
+        with _ActivationCompressionScope("cuda", {"enabled": True, "group_size": 512}, config=ResolvedConfig()).enter():
+            captured._operation_policy = operation_policy_spec()
+            for policy in (False, {"enabled": True, "group_size": 129},
+                           {"enabled": True, "bits": 4}, {"enabled": True, "attention_bits": 2}):
+                with _ActivationCompressionScope("cuda", policy, config=ResolvedConfig()).enter():
+                    with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "policy changed"):
+                        captured(torch.full((2,), 7.))
+        captured._capture.replay.assert_not_called()
+        torch.testing.assert_close(captured._inputs[0], torch.zeros(2))
 
     def test_runtime_rejects_raw_capture_before_python_or_optimizer_mutation(self):
         model = nn.Linear(2, 1)
@@ -242,6 +285,43 @@ class ModelCaptureWhiteBoxTests(unittest.TestCase):
             return graphed
 
         self.native = self.stack.enter_context(patch("torch.cuda.make_graphed_callables", side_effect=make))
+
+    def test_statistics_distinguish_replay_from_mode_and_autocast_fallback(self):
+        model = nn.Linear(3, 2)
+        handle = cuda_graph_core.capture_model(model, (torch.ones(2, 3),))
+        self.assertEqual(handle.statistics, {"forward_replays": 0, "eager_mode_fallbacks": 0,
+                                             "eager_autocast_fallbacks": 0})
+        model(torch.ones(2, 3))
+        model.eval()
+        model(torch.ones(1, 3))
+        model.train()
+        with patch("deepopt.cuda_graph.model.autocast_spec", return_value=(True, torch.bfloat16)):
+            model(torch.ones(1, 3))
+        model(torch.ones(2, 3))
+        expected = {"forward_replays": 2, "eager_mode_fallbacks": 1, "eager_autocast_fallbacks": 1}
+        self.assertEqual(handle.statistics, expected)
+        self.assertEqual(self.graph_call.call_count, 2)
+        snapshot = handle.statistics
+        snapshot["forward_replays"] = 999
+        self.assertEqual(handle.statistics, expected)
+        handle.close()
+        self.assertEqual(handle.statistics, expected)
+
+    def test_statistics_do_not_count_rejected_or_failed_forward_calls(self):
+        model = nn.Linear(3, 2)
+        handle = cuda_graph_core.capture_model(model, (torch.ones(2, 3),))
+        with self.assertRaises(ValueError):
+            model(torch.ones(1, 3))
+        self.graph_call.side_effect = RuntimeError("replay failed")
+        with self.assertRaisesRegex(RuntimeError, "replay failed"):
+            model(torch.ones(2, 3))
+        self.graph_call.side_effect = None
+        model.eval()
+        with self.assertRaises(RuntimeError):
+            model(torch.ones(1, 2))
+        self.assertEqual(handle.statistics, {"forward_replays": 0, "eager_mode_fallbacks": 0,
+                                             "eager_autocast_fallbacks": 0})
+        handle.close()
 
     def test_original_identity_optimizer_and_state_keys_survive_capture_and_close(self):
         model = nn.Linear(3, 2)
@@ -376,6 +456,22 @@ class ModelCaptureWhiteBoxTests(unittest.TestCase):
         with patch("deepopt.cuda_graph.model.autocast_spec", return_value=(True, torch.bfloat16)):
             model(torch.ones(1, 3))
         self.graph_call.assert_not_called()
+        handle.close()
+
+    def test_compression_scope_changes_fall_back_and_matching_scope_replays(self):
+        model = nn.Linear(3, 2)
+        with _ActivationCompressionScope("cuda", {"enabled": True, "group_size": 512}, config=ResolvedConfig()).enter():
+            handle = cuda_graph_core.capture_model(model, (torch.ones(2, 3),))
+            model(torch.ones(2, 3))
+            for policy in (False, {"enabled": True, "group_size": 129},
+                           {"enabled": True, "bits": 4}, {"enabled": True, "attention_bits": 2}):
+                with _ActivationCompressionScope("cuda", policy, config=ResolvedConfig()).enter():
+                    model(torch.ones(1, 3))
+            with _ActivationCompressionScope("cuda", None, config=ResolvedConfig()).enter():
+                model(torch.ones(2, 3))
+        self.assertEqual(self.graph_call.call_count, 2)
+        self.assertEqual(handle.statistics, {"forward_replays": 2, "eager_mode_fallbacks": 0,
+                                             "eager_autocast_fallbacks": 4})
         handle.close()
 
 

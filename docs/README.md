@@ -29,15 +29,31 @@ model, loader, and optimizer already exist unless the snippet constructs them.
 
 ## Functionality map
 
+[BatchNorm2d, GroupNorm and one-time FP8 edge planning](normalization/README.md)
+cover normalized-activation compression and automatic output precision.
+[LayerNorm](normalization/layer_norm.md) adds suffix-shaped normalization,
+saved-xhat compression and bidirectional FP8 transport.
+[Pooling](pooling/README.md) covers regular/adaptive pooling, LP/fractional
+pooling and unpooling with FP8 transport and family-specific backward-state
+compression. The [design plan](pooling/plan.md) records its implementation contract.
+
 | I want to… | Read |
 | --- | --- |
+| Look up every configuration option, default, valid value, and interaction | [Configuration reference](configuration/README.md) |
 | Follow one complete recipe from first training through resume | [Getting started](getting-started/README.md) |
 | Skip a batch prefix or use worker-aware loading | [Data loading](data/README.md) |
 | Train with a scalar loss or customize the whole forward/loss computation | [Training APIs](training/README.md) |
 | Train across CPU/GPU ranks with separate regular and DDP cores | [Distributed training](distributed/README.md) |
 | Capture models/functions or CUDA code blocks and replay with training/DDP | [CUDA Graphs](cuda/README.md) |
 | Transform projections for FP8 training, preserve model methods, and validate real models | [FP8 and model transformation](fp8/README.md) |
+| Optimize ordinary/transposed Conv1d, Conv2d and Conv3d with FP8 and saved-input compression | [Spatial convolutions](convolution/README.md) |
+| Fuse ReLU, BF16/FP8 conversion and exact one-bit backward masks | [Fused ReLU](activation/README.md) |
+| Optimize sigmoid, SiLU, GELU, tanh and ReLU6 with compressed derivatives and planned FP8 gradients | [Activation functions](activation/elementwise.md) |
+| Plan FP8 activation gradients once across DO backward operations | [Backward precision](fp8/backward_precision.md) |
+| Compress saved FP8 or BF16 linear activations with configurable affine 2-bit groups | [Activation compression](activation_compression/README.md) |
 | Compare eager FP8 Linear, select native backward GEMM, or exclude projections | [Eager Linear benchmarks and controls](fp8/eager_linear_benchmark.md) |
+| Select and tune CUDA FP8 kernels, or compare complete training updates | [CUDA and autotuning](fp8/cuda.md) · [Full-model benchmarks](fp8/training_benchmarks.md) |
+| Find a standalone installed-library measurement program | [Benchmark catalog](../benchmarks/README.md) |
 | Use validation, best-metric selection, progress bars, callbacks, or graceful stopping | [Training APIs](training/README.md) |
 | Control backward and optimizer order, or wrap a model without using the trainer | [Training APIs](training/README.md) |
 | Reuse a `Task`, `TrainingModule`, or custom batch/device-transfer method | [Training APIs](training/README.md) |
@@ -85,8 +101,9 @@ models and datasets belong to recipes.
 
 Guides describe supported behavior and boundaries. The [example catalog](../examples/README.md)
 provides runnable programs, required dependencies, and expected artifacts.
-Future activation compression and sparse operations are documented as extension
-points in the [FP8 guide](fp8/README.md), not as currently enabled features.
+Optional [activation compression](activation_compression/README.md) supports
+saved FP8 and BF16 linear and [convolution](convolution/README.md) activations. Sparse execution remains an extension
+point in the [FP8 guide](fp8/README.md).
 
 ## Compatibility with earlier documentation links
 

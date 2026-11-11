@@ -9,7 +9,7 @@ from torch import nn
 
 from deepopt import FP8Config, DelayedScalingConfig, TrainingRuntime, DiagnosticPolicy, fp8_scaling_scope, fp8_checkpoint
 from deepopt.opt.policy import prepare_fp8_model
-from deepopt.opt.scaling_strategy.delayed import DelayedScalingState, delayed_states
+from deepopt.opt.scaling.delayed import DelayedScalingState, delayed_states
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 
 
@@ -83,8 +83,8 @@ class DelayedScalingCUDATests(unittest.TestCase):
                 torch.testing.assert_close(actual.scales, torch.ones_like(actual.scales), rtol=0, atol=0)
 
     def test_flat_chunk_reduction_preserves_nonfinite_and_activity_flags(self):
-        from deepopt.opt.backends.triton_delayed import reduce_observations
-        from deepopt.opt.backends._delayed_launch import MetadataCache
+        from deepopt.opt.backends.triton.quantization.delayed import reduce_observations
+        from deepopt.opt.backends.triton.quantization.launch import MetadataCache
 
         observations = [(0, torch.tensor([2.], device="cuda")),
                         (0, torch.full((25001,), 7., device="cuda")),
@@ -99,7 +99,7 @@ class DelayedScalingCUDATests(unittest.TestCase):
 
     def test_warmed_converter_allocates_only_selected_tile_scratch(self):
         from deepopt.opt.backends import triton_delayed
-        from deepopt.opt.backends._delayed_launch import conversion_cache_key
+        from deepopt.opt.backends.triton.quantization.launch import conversion_cache_key
 
         source = torch.randn(129, 257, device="cuda")
         scale = torch.ones(1, device="cuda")
@@ -156,7 +156,7 @@ class DelayedScalingCUDATests(unittest.TestCase):
 
     def test_execution_mode_cadences_cover_delayed_forward_and_fused_backward(self):
         from deepopt.opt.backends import triton_delayed
-        from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
+        from deepopt.opt.nn.autograd import linear as linear_autograd_func
         from deepopt.opt.backends import gemm_nt
 
         model = nn.Linear(65, 97, device="cuda")

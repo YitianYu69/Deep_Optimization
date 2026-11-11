@@ -64,6 +64,28 @@ def autocast_spec():
     return (enabled, torch.get_autocast_dtype("cuda") if enabled else None)
 
 
+def operation_policy_spec():
+    """Snapshot scoped projection choices without reading device tensors.
+
+    Missing compression policy means adapters retain their prepared setting;
+    an explicit disabled policy can select different backward work. Preserve
+    that distinction. FP8 plans are owned immutable execution dictionaries.
+    """
+    from deepopt.opt._autocast import (_active_interception, _active_convolution_interception,
+                                      _active_normalization_interception, _active_pooling_interception, _get_activation_compression,
+                                      _get_fp8_plan)
+
+    compression = _get_activation_compression("cuda")
+    compression_spec = (None if compression is None else
+                        (compression["enabled"], compression["group_size"],
+                         compression.get("bits", 2), compression.get("attention_bits"),
+                         compression.get("norm_xhat_recenter", False)))
+    return (_get_fp8_plan("cuda"), compression_spec, _active_interception.get().get("cuda", True),
+            _active_convolution_interception.get().get("cuda", True),
+            _active_normalization_interception.get().get("cuda", True),
+            _active_pooling_interception.get().get("cuda", True))
+
+
 def static_arguments(args):
     # Own the storage: callers can release or overwrite their example tensors.
     # Preserve arbitrary non-overlapping strides, including sliced inputs.

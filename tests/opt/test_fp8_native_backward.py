@@ -15,8 +15,8 @@ from deepopt.config import ConfigError, fp8_config_from_dict
 from deepopt.opt._recipe import fp8_recipe
 from deepopt.opt.backends import gemm_nt
 from deepopt.opt.backends import native_fp8
-from deepopt.opt.do_nn import functional
-from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
+from deepopt.opt.nn import functional
+from deepopt.opt.nn.autograd import linear as linear_autograd_func
 from deepopt.opt.policy import fp8_plan
 from deepopt.opt.quantization.tensor import QuantizedTensor
 
@@ -80,7 +80,7 @@ class NativeBackwardTests(unittest.TestCase):
         with FakeTensorMode(), patch.object(native_fp8, "device_metadata", return_value=(90, 132)), \
              patch.object(torch.cuda, "device", return_value=nullcontext()), \
              patch.object(torch, "autocast", return_value=nullcontext()), \
-             patch.dict(sys.modules, {"deepopt.opt.backends.triton_fp8": SimpleNamespace(gemm_nt=fallback)}):
+             patch.dict(sys.modules, {"deepopt.opt.backends.triton.gemm.fp8": SimpleNamespace(gemm_nt=fallback)}):
             gemm_nt(operand(device="cuda:0"), operand(rows=17, device="cuda:0"), backend="native_fast")
             self.assertEqual(fallback.call_count, 1)
             with patch.object(torch, "_scaled_mm", side_effect=RuntimeError("native failure")):
@@ -102,7 +102,7 @@ class NativeBackwardTests(unittest.TestCase):
 
                     def gemm(a, b, **kwargs):
                         records.append((kwargs["backend"], kwargs["out_dtype"]))
-                        from deepopt.opt.backends.reference import gemm_nt as oracle
+                        from deepopt.opt.backends.reference.gemm import gemm_nt as oracle
 
                         return oracle(a, b, out_dtype=kwargs["out_dtype"], bias=kwargs.get("bias"))
 

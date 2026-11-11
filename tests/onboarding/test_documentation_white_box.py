@@ -47,6 +47,7 @@ class DocumentationWhiteBoxTests(unittest.TestCase):
     def test_python_and_toml_documentation_blocks_are_syntactically_valid(self):
         pages = [ROOT / "README.md", ROOT / "examples/README.md", ROOT / "tests/README.md"]
         pages.extend((ROOT / "docs").rglob("*.md"))
+        pages.extend((ROOT / "benchmarks").rglob("*.md"))
         for page in pages:
             blocks = re.findall(r"^```(python|toml)\n(.*?)^```", page.read_text(), re.M | re.S)
             for index, (language, block) in enumerate(blocks, 1):
@@ -59,6 +60,7 @@ class DocumentationWhiteBoxTests(unittest.TestCase):
     def test_local_document_links_and_section_anchors_resolve(self):
         pages = [ROOT / "README.md", ROOT / "examples/README.md", ROOT / "tests/README.md"]
         pages.extend((ROOT / "docs").rglob("*.md"))
+        pages.extend((ROOT / "benchmarks").rglob("*.md"))
         problems = []
         for page in pages:
             for original, target in links(page):

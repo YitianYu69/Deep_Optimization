@@ -13,7 +13,7 @@ import torch
 from deepopt.baseline import build_baseline_experiment
 from deepopt.config import CompileConfig, FP8Config, _read_config as load_config, reset_config
 from deepopt.engine.checkpointing.checkpoint import read_checkpoint
-from deepopt.opt.do_nn.linear_module import DOLinear
+from deepopt.opt.nn.linear import DOLinear
 from deepopt.run import evaluate, train
 
 

@@ -6,9 +6,9 @@ import torch
 from torch import fx
 
 from deepopt.opt import transform_model
-from deepopt.opt.do_nn.hf_conv1d_module import DOHFConv1D
-from deepopt.opt.do_nn.linear_module import DOLinear
-from deepopt.opt.do_nn.mha_module import DOMultiheadAttention
+from deepopt.opt.nn.hf_conv1d import DOHFConv1D
+from deepopt.opt.nn.linear import DOLinear
+from deepopt.opt.nn.attention import DOMultiheadAttention
 from tests.opt.full_model_support import fp8_plan, make_gpt2, make_llama, make_timm_vit, make_vit
 
 

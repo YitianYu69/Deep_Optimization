@@ -5,7 +5,8 @@ from dataclasses import asdict
 
 from deepopt._config_resolution import _UNSET, ResolvedConfig, resolve_config
 from deepopt.config import FP8Config, RuntimeConfig, compile_config_from_dict
-from deepopt.opt.policy import prepare_fp8_model, resolve_fp8_config
+from deepopt.opt.policy import (prepare_fp8_model, resolve_activation_compression_config,
+                               resolve_fp8_config)
 from .compilation import compile_model
 from .policy import DiagnosticPolicy, ModeController
 
@@ -69,7 +70,10 @@ def execution_config(config=None, *, device=_UNSET, precision=_UNSET, checks=_UN
 def prepare_execution_model(model, snapshot, fp8=_UNSET):
     """Reuse matching preparation while keeping parameter objects unchanged."""
     settings = resolve_fp8_config(model, fp8, config=snapshot)
-    model, report = prepare_fp8_model(model, settings, config=snapshot)
+    compression = resolve_activation_compression_config(model, config=snapshot)
+    model, report = prepare_fp8_model(model, settings, config=snapshot, activation_compression=compression)
+    if compression.enabled or hasattr(model, "_deepopt_activation_compression_config"):
+        snapshot.setdefault("runtime", {})["activation_compression"] = asdict(compression)
     compilation = compile_config_from_dict(snapshot.get("runtime", {}).get("compile", {}))
     if compilation.enabled:
         previous = getattr(model, "_deepopt_compile_config", None)

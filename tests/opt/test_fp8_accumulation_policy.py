@@ -10,8 +10,8 @@ import torch
 
 from deepopt.config import FP8Config, ConfigError, fp8_config_from_dict
 from deepopt.opt.backends import gemm_nt
-from deepopt.opt.do_nn.AOTAutograd_Func import linear_autograd_func
-from deepopt.opt.do_nn.functional import do_linear, validate_fp8_plan
+from deepopt.opt.nn.autograd import linear as linear_autograd_func
+from deepopt.opt.nn.functional import do_linear, validate_fp8_plan
 from deepopt.opt.policy import fp8_plan
 
 
@@ -37,7 +37,7 @@ class FP8AccumulationPolicyTests(unittest.TestCase):
         self.assertEqual(weight.grad.dtype, weight.dtype)
 
     def test_native_dot_calls_omit_limit_and_keep_chained_fp32_accumulator(self):
-        path = Path(__file__).resolve().parents[2] / "src/deepopt/opt/backends/triton_fp8.py"
+        path = Path(__file__).resolve().parents[2] / "src/deepopt/opt/backends/triton/gemm/fp8.py"
         tree = ast.parse(path.read_text())
         dots = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute) and node.func.attr == "dot"]

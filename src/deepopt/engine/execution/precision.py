@@ -24,7 +24,10 @@ class PrecisionPolicy:
 
     def configure(self, *, fp8=None, config=None):
         self.fp8, self.config = fp8, config
-        if self.precision == "fp32" and self.fp8 is None:
+        from deepopt.opt.policy import normalize_activation_compression_config
+
+        compression = normalize_activation_compression_config(config=config)
+        if self.precision == "fp32" and self.fp8 is None and not compression.enabled:
             self._context = nullcontext()
             return
         from deepopt.opt._autocast import autocast

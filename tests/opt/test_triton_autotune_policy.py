@@ -5,7 +5,7 @@ import json
 from types import SimpleNamespace
 import unittest
 
-from deepopt.opt.backends._triton_autotune import (
+from deepopt.opt.backends.triton.gemm.autotune import (
     AUTOTUNE_KEY, AUTOTUNE_TILES, MAX_BLOCK_M, MAX_BLOCK_N, MAX_BLOCK_K,
     MAX_TUNING_CONFIGS, SPLIT_K_CHOICES, baseline_gemm_tile, prune_gemm_configs,
     autotune_cache_key, set_descriptor_block_shapes, split_k_enabled,

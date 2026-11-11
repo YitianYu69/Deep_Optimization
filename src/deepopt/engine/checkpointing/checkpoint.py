@@ -13,7 +13,8 @@ from importlib.metadata import version
 import torch
 from deepopt.distributed import _process as distributed
 from deepopt._config_resolution import _merge, resolve_config
-from deepopt.config import compile_config_from_dict, ema_config_from_dict, fp8_config_from_dict
+from deepopt.config import (compile_config_from_dict, ema_config_from_dict, fp8_config_from_dict,
+                            activation_compression_config_from_dict)
 
 from deepopt.engine.training.state import TrainingState
 from deepopt.engine.training.progress import EpochProgress, type_name
@@ -98,6 +99,16 @@ def _trainer_settings(trainer) -> dict:
     return settings
 
 
+def _actual_activation_compression(trainer):
+    """Prepared policy owns backward semantics even when restore config is omitted."""
+    from deepopt.opt.policy import normalize_activation_compression_config
+
+    policy = getattr(trainer.model, "_deepopt_activation_compression_config", None)
+    if policy is not None:
+        return normalize_activation_compression_config(policy, config=trainer.config)
+    return activation_compression_config_from_dict(trainer.config.get("runtime", {}).get("activation_compression", {}))
+
+
 def _optimizer_topology(trainer) -> dict:
     """Bind positional optimizer state to the model parameters it belongs to."""
     parameter_names = {id(parameter): name for name, parameter in trainer.model.named_parameters()}
@@ -163,6 +174,14 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
             or (trainer.ema is not None and configured_ema["decay"] != trainer.ema.decay)):
         raise ValueError("Checkpoint configuration must match the trainer's EMA settings")
     runtime_config = saved_config.setdefault("runtime", {})
+    actual_compression = _actual_activation_compression(trainer)
+    if "activation_compression" in runtime_config:
+        configured_compression = activation_compression_config_from_dict(
+            _merge(asdict(actual_compression), runtime_config["activation_compression"]))
+        if configured_compression != actual_compression:
+            raise ValueError("Checkpoint configuration must match the trainer's activation compression settings")
+    if actual_compression.enabled or "activation_compression" in runtime_config:
+        runtime_config["activation_compression"] = asdict(actual_compression)
     actual_fp8 = trainer.runtime.fp8
     if "fp8" in runtime_config:
         configured_fp8 = runtime_config["fp8"]
@@ -324,6 +343,9 @@ def _resume_config_for_comparison(config) -> dict:
     # Logging is passive and can change without changing training state.
     settings.pop("logging", None)
     if "runtime" in settings:
+        if "activation_compression" in settings["runtime"]:
+            settings["runtime"]["activation_compression"] = asdict(activation_compression_config_from_dict(
+                settings["runtime"]["activation_compression"]))
         # Passive diagnostics may be enabled after a resume. Their objects
         # and counters are not part of optimization or checkpoint state.
         settings["runtime"] = {k: v for k, v in settings["runtime"].items()
@@ -410,6 +432,10 @@ def _validate_resume_state(payload, trainer, requested, *, generators, train_loa
     if _resume_config_for_comparison(payload["config"]) != _resume_config_for_comparison(requested):
         raise ValueError("Resume configuration differs from checkpoint "
                          "(only epochs, batch size, checkpoint cadence, and diagnostic checks may change)")
+    saved_compression = activation_compression_config_from_dict(
+        payload["config"].get("runtime", {}).get("activation_compression", {}))
+    if saved_compression != _actual_activation_compression(trainer):
+        raise ValueError("Resume configuration differs from checkpoint: activation compression policy changed")
     saved_settings = dict(payload["trainer_settings"])
     if "fp8" in saved_settings:
         # Older snapshots omit newly added default policy fields. Preserve

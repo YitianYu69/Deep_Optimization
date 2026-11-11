@@ -13,8 +13,8 @@ from torch.nn import functional as F
 
 from deepopt.config import (ConfigError, FP8Config, config_from_dict, fp8_config_from_dict,
                             _read_config as load_config, reset_config)
-from deepopt.opt.do_nn.linear_module import DOLinear
-from deepopt.opt.do_nn.mha_module import DOMultiheadAttention
+from deepopt.opt.nn.linear import DOLinear
+from deepopt.opt.nn.attention import DOMultiheadAttention
 from deepopt.opt.policy import normalize_fp8_config, prepare_fp8_model
 
 

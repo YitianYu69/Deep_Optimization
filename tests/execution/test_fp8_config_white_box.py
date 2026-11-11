@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from deepopt.config import ConfigError, FP8Config, fp8_config_from_dict
-from deepopt.opt.do_nn.functional import validate_fp8_plan
+from deepopt.opt.nn.functional import validate_fp8_plan
 from deepopt.opt.policy import fp8_plan, normalize_fp8_config, prepare_fp8_model
 
 

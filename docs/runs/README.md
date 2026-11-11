@@ -8,6 +8,11 @@ checkpoint restoration and optional batch planning around the same trainer.
 The CLI is an offline synthetic classification recipe; it does not discover or
 import arbitrary user models from TOML.
 
+Use the [configuration reference](../configuration/README.md) to look up every
+framework option, default, accepted value, and policy interaction. The
+[complete TOML template](../../src/deepopt/configs/templates/complete.toml)
+provides an editable starting point.
+
 ## Run the bundled recipe
 
 After installing the library, these commands work from any directory:

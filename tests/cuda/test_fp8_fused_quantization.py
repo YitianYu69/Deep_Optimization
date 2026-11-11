@@ -9,7 +9,7 @@ from torch import nn
 from deepopt import DiagnosticPolicy, TrainingRuntime
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from deepopt.opt.quantization.tensor import QuantizedTensor
-from deepopt.opt.scaling_strategy.amax import AmaxScaling
+from deepopt.opt.scaling.amax import AmaxScaling
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 
 

@@ -1,6 +1,9 @@
 # Eager Linear comparison: DeepOpt, PyTorch BF16 and TorchAO FP8
 
-[The standalone benchmark](../../benchmarks/benchmark_fp8_linear_compare.py) uses
+For a single portable benchmark covering **DeepOpt, torchao and Transformer
+Engine**, see the [three-library eager benchmark](eager_three_library_benchmark.md).
+
+[The standalone benchmark](../../benchmarks/fp8/benchmark_fp8_linear_compare.py) uses
 the packages installed in the selected Python environment. It can be copied
 outside the checkout. It does not modify import paths, install packages, download
 data, compile the model, or fuse producers with Linear. Use one Python process,
@@ -11,7 +14,7 @@ PyTorch/CUDA stack first. A preflight records import/configuration errors rather
 than substituting another implementation:
 
 ```bash
-python benchmarks/benchmark_fp8_linear_compare.py --check --output fp8-linear-check
+python benchmarks/fp8/benchmark_fp8_linear_compare.py --check --output fp8-linear-check
 ```
 
 The comparison requires an NVIDIA SM90+ device, such as the H100 used for the
@@ -23,7 +26,7 @@ fingerprints are saved in each worker report.
 ## Recommended first run
 
 ```bash
-python benchmarks/benchmark_fp8_linear_compare.py \
+python benchmarks/fp8/benchmark_fp8_linear_compare.py \
   --implementations bf16 deepopt-current deepopt-delayed torchao \
   --math-policies amp matched-fp32 \
   --batches 512 --format e4m3fn --accumulation fast \
@@ -104,10 +107,10 @@ backend. To evaluate the native scaled-GEMM backward executor on the same
 installed build, repeat the AMP workload in separate output directories:
 
 ```bash
-python benchmarks/benchmark_fp8_linear_compare.py \
+python benchmarks/fp8/benchmark_fp8_linear_compare.py \
   --math-policies amp --backward-backend inherit \
   --no-fill-uninitialized-memory --output fp8-linear-triton-backward
-python benchmarks/benchmark_fp8_linear_compare.py \
+python benchmarks/fp8/benchmark_fp8_linear_compare.py \
   --math-policies amp --backward-backend native_fast \
   --no-fill-uninitialized-memory --output fp8-linear-native-backward
 ```
@@ -165,14 +168,14 @@ sum of isolated projections is not a measured full-model speedup.
 If the first run completes, measure the two tail sizes without repeating 512:
 
 ```bash
-python benchmarks/benchmark_fp8_linear_compare.py \
+python benchmarks/fp8/benchmark_fp8_linear_compare.py \
   --batches 336 272 --no-fill-uninitialized-memory --output fp8-linear-tails
 ```
 
 For the library's default accumulation policy:
 
 ```bash
-python benchmarks/benchmark_fp8_linear_compare.py \
+python benchmarks/fp8/benchmark_fp8_linear_compare.py \
   --accumulation torchao-default --math-policies amp \
   --output fp8-linear-default-accumulation
 ```

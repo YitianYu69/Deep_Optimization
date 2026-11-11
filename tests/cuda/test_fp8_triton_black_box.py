@@ -9,7 +9,7 @@ import torch
 
 from deepopt.opt import transform_model
 from deepopt.opt.backends import gemm_nt
-from deepopt.opt.do_nn.functional import do_linear
+from deepopt.opt.nn.functional import do_linear
 from tests.opt.fp8_support import round_fp8
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON, quantize_gemm_operand as quantize_fp8
 from tests.opt.full_model_support import (

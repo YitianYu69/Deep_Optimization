@@ -274,7 +274,7 @@ CUDA replay coverage lives in [tests/cuda](../../tests/cuda/).
 ```bash
 python -m unittest discover -s tests/scheduling -v
 DEEPOPT_EXTENDED_DDP=1 python -m unittest discover -s tests/scheduling -p test_ddp_black_box.py -v
-python benchmarks/benchmark_scheduling.py --updates 10000 --repeats 5
+python benchmarks/training/benchmark_scheduling.py --updates 10000 --repeats 5
 ```
 
 The compilation test counts actual Dynamo compilations while coefficients change.
