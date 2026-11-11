@@ -68,17 +68,30 @@ class ReLUTests(unittest.TestCase):
                                 torch.testing.assert_close(x.grad, torch.where(predicate, gradient, 0), rtol=0, atol=0)
 
     def test_special_values_match_native_forward_and_threshold_backward(self):
-        values = torch.tensor([-float("inf"), -2, -0.0, 0.0, 1, float("inf"), float("nan")], dtype=torch.bfloat16)
-        dy = torch.tensor([float("nan"), float("inf"), float("nan"), 3, 4, 5, 6], dtype=torch.bfloat16)
-        for compressed in (False, True):
-            x, native = values.clone().requires_grad_(), values.clone().requires_grad_()
-            actual = doF.relu(x, plan=relu_plan(fp8=False, activation_compression=compressed))
-            expected = F.relu(native)
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
-            self.assertEqual(torch.signbit(actual).tolist(), torch.signbit(expected).tolist())
-            actual.backward(dy)
-            expected.backward(dy)
-            torch.testing.assert_close(x.grad, native.grad, rtol=0, atol=0, equal_nan=True)
+        for dtype in (torch.bfloat16, torch.float32, torch.float64):
+            values = torch.tensor([-float("inf"), -2, -0.0, 0.0, 1, float("inf"),
+                                   float("nan"), -float("nan")], dtype=dtype)
+            if dtype == torch.bfloat16:
+                # Construct both quiet-NaN signs without a host float cast,
+                # which can itself canonicalize their representation.
+                values.view(torch.int16)[-2:] = torch.tensor([0x7FC0, -0x40], dtype=torch.int16)
+            dy = torch.tensor([float("nan"), float("inf"), float("nan"), 3, 4, 5, 6, 7], dtype=dtype)
+            for compressed in (False, True):
+                with self.subTest(dtype=dtype, compressed=compressed):
+                    x, native = values.clone().requires_grad_(), values.clone().requires_grad_()
+                    actual = doF.relu(x, plan=relu_plan(fp8=False, activation_compression=compressed))
+                    expected = F.relu(native)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+                    # BF16's documented signed-zero contract is exact. NaN
+                    # signs/payloads can be canonicalized by casts; native
+                    # FP32/FP64 CPU kernels also differ in their zero signs.
+                    if dtype == torch.bfloat16:
+                        non_nan = ~torch.isnan(expected)
+                        self.assertEqual(torch.signbit(actual)[non_nan].tolist(),
+                                         torch.signbit(expected)[non_nan].tolist())
+                    actual.backward(dy)
+                    expected.backward(dy)
+                    torch.testing.assert_close(x.grad, native.grad, rtol=0, atol=0, equal_nan=True)
 
     def test_packed_mask_uses_pre_cast_predicate_when_fp8_output_underflows(self):
         x = torch.tensor([[1e-8, -1e-8, 0.0, 1.0]], dtype=torch.bfloat16, requires_grad=True)
