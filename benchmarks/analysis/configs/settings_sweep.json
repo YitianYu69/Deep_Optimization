@@ -1,0 +1,20 @@
+{
+  "settings": {"fp8": {"backend": "triton"}, "runtime": {"binding": "functional"}},
+  "grid": {
+    "compression.bits": [1, 2, 4, 8],
+    "compression.group_size": [32, 128, 512, 2048, 32768],
+    "compression.norm_xhat_recenter": [false, true],
+    "compression.attention_bits": [null, 1, 2, 4, 8],
+    "fp8.backward_precision": ["native", "auto"],
+    "fp8.backward_backend": ["inherit", "native_fast", "native_precise"],
+    "fp8.scaling_recipe": ["current", "delayed"],
+    "fp8.block_shapes.activation": [null, [1, 32], [32, 32]],
+    "fp8.block_shapes.weight": [null, [1, 32], [32, 32]],
+    "fp8.block_shapes.grad": [null, [1, 32], [32, 32]]
+  },
+  "workloads": [
+    {"name": "projection", "op": "linear", "shape": [4096, 768], "kwargs": {"out_features": 3072}},
+    {"name": "norm", "op": "layer_norm", "shape": [4096, 768], "kwargs": {}},
+    {"name": "sdpa", "op": "scaled_dot_product_attention", "shape": [8, 12, 197, 64], "kwargs": {}}
+  ]
+}

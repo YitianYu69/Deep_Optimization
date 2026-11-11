@@ -1,0 +1,29 @@
+{
+  "settings": {
+    "fp8": {"backend": "triton", "trace_mode": "modules", "backward_precision": "auto"},
+    "compression": {"bits": 2, "group_size": 512},
+    "runtime": {"binding": "prepared", "optimizer": "adamw", "lr": 0.0001}
+  },
+  "grid": {
+    "runtime.compression_families": [
+      null,
+      [],
+      ["linear"],
+      ["attention"],
+      ["normalization"],
+      ["activation"],
+      ["linear", "attention", "normalization", "activation", "convolution", "pooling"]
+    ]
+  },
+  "workloads": [
+    {
+      "name": "classifier",
+      "op": "model",
+      "shape": [32, 197, 768],
+      "factory": "analysis.example_model:build",
+      "factory_kwargs": {"batch_size": 32, "sequence_length": 197, "width": 768, "heads": 12, "layers": 2, "input_mode": "resident"},
+      "calls_per_step": 1,
+      "steps_per_epoch": 100
+    }
+  ]
+}

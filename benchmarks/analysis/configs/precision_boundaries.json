@@ -1,0 +1,16 @@
+{
+  "settings": {"fp8": {"backend": "triton"}, "runtime": {"binding": "functional"}},
+  "grid": {
+    "runtime.input_dtype": ["bf16", "fp8"],
+    "runtime.output_dtype": ["bf16", "fp8"],
+    "runtime.input_scaling": ["included", "precomputed"],
+    "runtime.output_scaling": ["current", "provided"],
+    "fp8.activation_dtype": ["e4m3fn", "e5m2"],
+    "fp8.block_shapes.activation": [null, [1, 32], [32, 32]]
+  },
+  "workloads": [
+    {"name": "gelu", "op": "gelu", "shape": [4096, 768], "kwargs": {}},
+    {"name": "layer_norm", "op": "layer_norm", "shape": [4096, 768], "kwargs": {}},
+    {"name": "max_pool2d", "op": "max_pool2d", "shape": [8, 64, 56, 56], "kwargs": {"kernel_size": 2, "stride": 2}}
+  ]
+}

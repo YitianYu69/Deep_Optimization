@@ -1,0 +1,16 @@
+{
+  "settings": {
+    "fp8": {"backend": "triton", "scaling_recipe": "current", "backward_precision": "native"},
+    "compression": {"bits": 2, "group_size": 512},
+    "runtime": {"binding": "functional", "cache_enabled": false, "check_finite": false}
+  },
+  "workloads": [
+    {"name": "projection", "op": "linear", "shape": [4096, 768], "kwargs": {"out_features": 3072}},
+    {"name": "mlp", "op": "linear_pipeline", "shape": [32, 197, 768], "kwargs": {"out_features": 3072}},
+    {"name": "norm", "op": "layer_norm", "shape": [32, 197, 768], "kwargs": {}},
+    {"name": "gelu", "op": "gelu", "shape": [32, 197, 3072], "kwargs": {}},
+    {"name": "sdpa", "op": "scaled_dot_product_attention", "shape": [32, 12, 197, 64], "kwargs": {"dropout_p": 0.0}},
+    {"name": "attention_block", "op": "attention_pipeline", "shape": [32, 197, 768], "kwargs": {"num_heads": 12}}
+  ],
+  "tolerances": {"default": {"rtol": 0.05, "atol": 0.01}}
+}
