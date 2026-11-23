@@ -35,7 +35,11 @@ class BF16StorageActivationTests(unittest.TestCase):
                             if strided:
                                 x = x.t()
                             x.requires_grad_()
-                            original = x.detach().clone()
+                            # The unpacked storage policy evaluates and recomputes
+                            # from a contiguous snapshot. CPU GELU can round
+                            # differently when ATen sees a strided operand.
+                            memory_format = torch.preserve_format if packed else torch.contiguous_format
+                            original = x.detach().clone(memory_format=memory_format)
                             saved = []
                             with bf16_policy_scope("bf16_storage", "cpu"), torch.autograd.graph.saved_tensors_hooks(
                                     lambda value: saved.append(value) or value, lambda value: value):
@@ -49,7 +53,8 @@ class BF16StorageActivationTests(unittest.TestCase):
                                     coefficient.reshape(-1, original.shape[-1]), 1024, bits=bits),
                                     dtype=torch.float32).reshape(original.shape)
                             else:
-                                self.assertTrue(all(value.dtype == torch.bfloat16 for value in saved))
+                                self.assertEqual(len(saved), 1)
+                                torch.testing.assert_close(saved[0], original, rtol=0, atol=0, check_stride=True)
                                 with torch.no_grad():
                                     x.add_(1)
                             gradient = torch.randn_like(y)
