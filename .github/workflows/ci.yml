@@ -32,7 +32,7 @@ jobs:
           tests.onboarding.test_public_imports -v
   cpu-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: ${{ github.event_name == 'pull_request' && matrix.suite != 'core' && 12 || 45 }}
     strategy:
       fail-fast: false
       matrix:
@@ -74,11 +74,37 @@ jobs:
           python -m ruff check src tests examples benchmarks scripts
           python scripts/sync_configs.py --check
           python -m mypy --strict --follow-imports=skip --ignore-missing-imports src/deepopt/engine/execution/policy.py
-      - name: Compiler tests
-        if: matrix.suite == 'compiler'
+      - name: Compiler smoke tests
+        if: matrix.suite == 'compiler' && github.event_name == 'pull_request'
+        run: >-
+          python -m unittest -v
+          tests.compiler.test_backend
+          tests.compiler.test_bf16_storage_native
+          tests.compiler.test_native_autodiff
+          tests.compiler.test_native_semantic_contracts
+          tests.compiler.test_saved_activation_contracts
+          tests.compiler.test_packed_offload_lifecycle
+          tests.compiler.test_packed_offload_plan
+          tests.compiler.test_compiled_packed_offload.CompiledPrecisionFacadeCPUTests.test_same_policy_reprepare_preserves_numerical_body_and_native_backward
+          tests.compiler.test_native_vae.NativeVAETests.test_swiglu_training_then_no_grad_validation
+      - name: Full compiler suite
+        if: matrix.suite == 'compiler' && github.event_name != 'pull_request'
         run: python -m unittest discover -s tests/compiler -v
-      - name: Benchmark tests
-        if: matrix.suite == 'benchmarks'
+      - name: Benchmark smoke tests
+        if: matrix.suite == 'benchmarks' && github.event_name == 'pull_request'
+        run: >-
+          PYTHONPATH="$PWD/benchmarks" python -m unittest -v
+          tests.benchmarks.test_benchmark_exports
+          tests.benchmarks.test_compiler_benchmark
+          tests.benchmarks.test_inductor_reference_runner
+          tests.benchmarks.test_inductor_reference_store
+          tests.benchmarks.test_numerical_ipc
+          tests.benchmarks.test_packed_offload_bundle
+          tests.benchmarks.test_qualification_bundle_export
+          tests.benchmarks.test_vae_diagnostics
+          tests.benchmarks.test_vae_packed_offload_benchmark.PackedOffloadInstalledCPUTests.test_real_resident_native_cpu_envelope_forward_backward_update_and_cleanup
+      - name: Full benchmark suite
+        if: matrix.suite == 'benchmarks' && github.event_name != 'pull_request'
         run: PYTHONPATH="$PWD/benchmarks" python -m unittest discover -s tests/benchmarks -t . -v
       - name: Core CPU tests
         if: matrix.suite == 'core'
