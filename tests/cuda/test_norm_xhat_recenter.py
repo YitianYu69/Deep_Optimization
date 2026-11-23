@@ -83,9 +83,15 @@ class NormXhatRecenterCUDATests(unittest.TestCase):
                     data, step, low = (v.cpu() for v in states[1][:3])
                     packed = PackedActivation(data, step, low, tuple(matrix.shape), group, (1, group), bits)
                     decoded = dequantize_unpack_activation(packed, dtype=torch.float32)
-                    shift = states[1][-1].cpu()
+                    shift = states[1][-2 if kind == "layer" else -1].cpu()
                     corrected = decoded - shift[:, None]
-                    torch.testing.assert_close(corrected.mean(1), h.mean(1), rtol=0, atol=3e-5)
+                    if kind == "layer":
+                        corrected *= states[1][-1].cpu()[:, None]
+                        torch.testing.assert_close(corrected.mean(1), torch.zeros_like(shift), rtol=0, atol=3e-5)
+                        torch.testing.assert_close(corrected.square().mean(1), h.square().mean(1), rtol=3e-4, atol=3e-5)
+                        self.assertEqual(info["moment_state_bytes"], matrix.shape[0] * 4)
+                    else:
+                        torch.testing.assert_close(corrected.mean(1), h.mean(1), rtol=0, atol=3e-5)
                     results[1].backward(dy)
                     restored = (corrected.reshape(shape) if kind != "batch" else
                                 corrected.reshape(4, shape[0], *shape[2:]).movedim(0, 1))

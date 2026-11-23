@@ -1,0 +1,79 @@
+{
+  "settings": {
+    "runtime": {
+      "execution": "graph",
+      "scope_lifetime": "reused",
+      "timing_fill_uninitialized_memory": false
+    }
+  },
+  "workloads": [
+    {
+      "name": "projection",
+      "op": "linear",
+      "shape": [
+        4096,
+        768
+      ],
+      "kwargs": {
+        "out_features": 3072
+      }
+    },
+    {
+      "name": "mlp",
+      "op": "linear_pipeline",
+      "shape": [
+        32,
+        197,
+        768
+      ],
+      "kwargs": {
+        "out_features": 3072
+      }
+    },
+    {
+      "name": "attention_block",
+      "op": "attention_pipeline",
+      "shape": [
+        32,
+        197,
+        768
+      ],
+      "kwargs": {
+        "num_heads": 12
+      }
+    }
+  ],
+  "grid": {
+    "compression.group_size": [
+      1024
+    ],
+    "runtime.codec_num_warps": [
+      4,
+      1,
+      2,
+      "auto"
+    ],
+    "runtime.qualification_case": [
+      "group1024-slot-0",
+      "group1024-slot-1"
+    ]
+  },
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  }
+}

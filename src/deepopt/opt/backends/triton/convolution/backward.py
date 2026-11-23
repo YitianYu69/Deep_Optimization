@@ -6,7 +6,7 @@ import triton.language as tl
 
 from .common import (_load_operand, _load_scale, _scale_chunk_length, _coordinates,
                      _tile_coordinates, validate, arguments, grid)
-from .launch import weight_splits
+from .launch import weight_splits, weight_split_options
 from .weight_gradient_blockwise import _blockwise_weight_gradient_kernel
 from ..gradient import _gradient_tile
 
@@ -33,10 +33,12 @@ def _input_gradient_kernel(
     GRAD_BR: tl.constexpr = 1, GRAD_BC: tl.constexpr = 1,
     GRAD_MAXIMUM: tl.constexpr = 448.0, GRAD_OBSERVE: tl.constexpr = False,
     bias=None, HAS_BIAS: tl.constexpr = False, BIAS_STRIDE: tl.constexpr = 1,
+    CHANNEL_FAST: tl.constexpr = False,
+    TAP_MAJOR: tl.constexpr = False, GROUP_M: tl.constexpr = 1,
 ):
     volume: tl.constexpr = ID * IH * IW
     kernel_volume: tl.constexpr = KD * KH * KW
-    group, pm, pn = _tile_coordinates(BATCH * volume, CI, BLOCK_M, BLOCK_N)
+    group, pm, pn = _tile_coordinates(BATCH * volume, CI, BLOCK_M, BLOCK_N, GROUP_M)
     if INDEX64:
         group, pm, pn = group.to(tl.int64), pm.to(tl.int64), pn.to(tl.int64)
     rows = pm * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -46,14 +48,38 @@ def _input_gradient_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
 
     # Each CTA owns its destination, including all overlapping windows.
-    if TENSORWISE:
+    if TENSORWISE and TAP_MAJOR:
+        for kernel_index in range(kernel_volume):
+            if INDEX64:
+                kernel_index = kernel_index.to(tl.int64)
+            kd, kh, kw = _coordinates(kernel_index, KH, KW)
+            od_numerator = id_ + PD - kd * DD
+            oh_numerator = ih + PH - kh * DH
+            ow_numerator = iw + PW - kw * DW
+            od, oh, ow = od_numerator // SD, oh_numerator // SH, ow_numerator // SW
+            valid_rows = ((rows < BATCH * volume) & (od_numerator % SD == 0)
+                          & (oh_numerator % SH == 0) & (ow_numerator % SW == 0)
+                          & (od >= 0) & (od < OD) & (oh >= 0) & (oh < OH) & (ow >= 0) & (ow < OW))
+            source = batch * (OD * OH * OW) + (od * OH + oh) * OW + ow
+            for channel_tile in range(tl.cdiv(CO, BLOCK_K)):
+                if INDEX64:
+                    channel_tile = channel_tile.to(tl.int64)
+                co = channel_tile * BLOCK_K + tl.arange(0, BLOCK_K)
+                av = _load_operand(a, source[:, None], group * CO + co[None, :],
+                                   valid_rows[:, None] & (co[None, :] < CO), A_RS, A_CS)
+                bv = _load_operand(b, group * CO + co[:, None],
+                                   cols[None, :] * kernel_volume + kernel_index,
+                                   (co[:, None] < CO) & (cols[None, :] < CI), B_RS, B_CS)
+                acc = tl.dot(av, bv, acc, out_dtype=tl.float32)
+        acc = (acc * tl.load(a_scale)) * tl.load(b_scale)
+    elif TENSORWISE:
         for tile in range(tl.cdiv(CO * kernel_volume, BLOCK_K)):
             if INDEX64:
                 reduction = tile.to(tl.int64) * BLOCK_K + tl.arange(0, BLOCK_K)
             else:
                 reduction = tile * BLOCK_K + tl.arange(0, BLOCK_K)
-            co = reduction // kernel_volume
-            kp = reduction % kernel_volume
+            co = reduction % CO if CHANNEL_FAST else reduction // kernel_volume
+            kp = reduction // CO if CHANNEL_FAST else reduction % kernel_volume
             kd, kh, kw = _coordinates(kp, KH, KW)
             od_numerator = id_[:, None] + PD - kd[None, :] * DD
             oh_numerator = ih[:, None] + PH - kh[None, :] * DH
@@ -132,16 +158,20 @@ def _weight_gradient_kernel(
     B_SRS: tl.constexpr, B_SCS: tl.constexpr,
     TENSORWISE: tl.constexpr, INDEX64: tl.constexpr, SPLIT_K: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    CHANNEL_FAST: tl.constexpr = False,
+    GROUP_M: tl.constexpr = 1,
 ):
     volume: tl.constexpr = OD * OH * OW
     kernel_volume: tl.constexpr = KD * KH * KW
-    group, pm, pn = _tile_coordinates(CO, CI * kernel_volume, BLOCK_M, BLOCK_N)
+    group, pm, pn = _tile_coordinates(CO, CI * kernel_volume, BLOCK_M, BLOCK_N, GROUP_M)
     if INDEX64:
         group, pm, pn = group.to(tl.int64), pm.to(tl.int64), pn.to(tl.int64)
     rows = pm * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = pn * BLOCK_N + tl.arange(0, BLOCK_N)
-    ci = cols // kernel_volume
-    kd, kh, kw = _coordinates(cols % kernel_volume, KH, KW)
+    ci = cols % CI if CHANNEL_FAST else cols // kernel_volume
+    kernel_index = cols // CI if CHANNEL_FAST else cols % kernel_volume
+    weight_column = ci * kernel_volume + kernel_index
+    kd, kh, kw = _coordinates(kernel_index, KH, KW)
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
 
     for tile in range(tl.program_id(1), tl.cdiv(BATCH * volume, BLOCK_K), SPLIT_K):
@@ -171,7 +201,7 @@ def _weight_gradient_kernel(
     if TENSORWISE:
         acc = (acc * tl.load(a_scale)) * tl.load(b_scale)
     tl.store(output + tl.program_id(1) * (GROUPS * CO * CI * kernel_volume)
-             + (group * CO + rows[:, None]) * (CI * kernel_volume) + cols[None, :], acc,
+             + (group * CO + rows[:, None]) * (CI * kernel_volume) + weight_column[None, :], acc,
              mask=(rows[:, None] < CO) & (cols[None, :] < CI * kernel_volume))
 
 
@@ -186,7 +216,7 @@ def _reduce_weight_gradient(partials, output, ELEMENTS: tl.constexpr,
 
 
 @torch.no_grad()
-def input_gradient(qg, qw, geometry, *, out_dtype=torch.float32, num_stages="auto", gradient_output=None, bias=None):
+def input_gradient(qg, qw, geometry, *, out_dtype=torch.float32, num_stages="auto", gradient_output=None, bias=None, autotune=True):
     """Return ``[batch * input_volume, in_channels]`` input gradients."""
     validate(qg, qw, out_dtype)
     if tuple(qg.data.shape) != (geometry.batch_size * geometry.output_volume, geometry.out_channels):
@@ -212,19 +242,22 @@ def input_gradient(qg, qw, geometry, *, out_dtype=torch.float32, num_stages="aut
                          GRAD_MAXIMUM=torch.finfo(out.dtype).max, GRAD_OBSERVE=out.observations is not None)
         output = torch.empty((rows, geometry.in_channels), device=qg.data.device,
                               dtype=gradient_output.dtype if fused else out_dtype)
-        _input_gradient_kernel[grid(rows, geometry.in_channels_per_group, geometry.groups)](
-            qg.data, qw.data, qg.scale_inv, qw.scale_inv, output,
-            **arguments(qg, qw, geometry, num_stages, extra_tensors=() if bias is None else (bias,)),
-            bias=output if bias is None else bias, HAS_BIAS=bias is not None,
-            BIAS_STRIDE=1 if bias is None else bias.stride(0),
-            **extra,
-        )
+        base = arguments(qg, qw, geometry, num_stages, extra_tensors=() if bias is None else (bias,))
+        from ..._shared.convolution import launch_candidates, select_convolution_launch, convolution_launch_key
+        def launch(config):
+            return _input_gradient_kernel[grid(rows, geometry.in_channels_per_group, geometry.groups)](
+                qg.data, qw.data, qg.scale_inv, qw.scale_inv, output, **config,
+                bias=output if bias is None else bias, HAS_BIAS=bias is not None,
+                BIAS_STRIDE=1 if bias is None else bias.stride(0), **extra)
+        selected = select_convolution_launch(convolution_launch_key("dx",qg,qw,geometry,base,out_dtype,bias=bias),
+            launch_candidates(base,geometry,"dx",num_stages=num_stages),launch,autotune=autotune and not fused)
+        launch(selected)
     return (gradient_output.wrap(output) if fused else gradient_output.convert(output, matrix=True)
             if gradient_output is not None else output)
 
 
 @torch.no_grad()
-def weight_gradient(qx, qg, geometry, *, out_dtype=torch.float32, num_stages="auto"):
+def weight_gradient(qx, qg, geometry, *, out_dtype=torch.float32, num_stages="auto", autotune=True):
     """Return ``[out_channels, in_channels_per_group * kernel_volume]`` dW."""
     validate(qx, qg, out_dtype)
     if tuple(qx.data.shape) != (geometry.batch_size * geometry.input_volume, geometry.in_channels):
@@ -238,23 +271,45 @@ def weight_gradient(qx, qg, geometry, *, out_dtype=torch.float32, num_stages="au
         tensorwise = kernel_arguments["TENSORWISE"]
         tile_cols = cols if tensorwise else geometry.in_channels_per_group
         split_groups = geometry.groups if tensorwise else geometry.groups * geometry.kernel_volume
-        splits = weight_splits(geometry.out_channels_per_group, tile_cols,
-                               geometry.batch_size * geometry.output_volume, split_groups,
-                               block_m=kernel_arguments["BLOCK_M"], block_n=kernel_arguments["BLOCK_N"])
-        partials = (output if splits == 1 else torch.empty(
-            (splits, geometry.out_channels, cols), device=qg.data.device, dtype=torch.float32))
-        base_grid = grid(geometry.out_channels_per_group, tile_cols, split_groups)
-        if tensorwise:
-            _weight_gradient_kernel[lambda meta: (base_grid(meta)[0], splits)](
-                qg.data, qx.data, qg.scale_inv, qx.scale_inv, partials, **kernel_arguments, SPLIT_K=splits)
-        else:
-            _blockwise_weight_gradient_kernel[lambda meta: (base_grid(meta)[0], splits)](
-                qg.data, qx.data, qg.scale_inv, qx.scale_inv, partials,
-                **kernel_arguments, SPLIT_K=splits, STRIPE_W=128)
-        if splits > 1:
-            _reduce_weight_gradient[(triton.cdiv(output.numel(), 256),)](
-                partials, output, ELEMENTS=output.numel(), SPLITS=splits, BLOCK=256,
-                SPLIT_BLOCK=triton.next_power_of_2(splits),
-                num_warps=4, num_stages=1,
-            )
+        from ..._shared.convolution import (launch_candidates, select_convolution_launch,
+                                            convolution_launch_key, convolution_kernel_variant)
+        from ..._shared.cuda import device_metadata
+        sms = None if not autotune or convolution_kernel_variant() == "baseline" else device_metadata(qg.data.device.index)[1]
+        candidates = launch_candidates(kernel_arguments,geometry,"dw",num_stages=num_stages)
+        for config in candidates:
+            config["SPLIT_K"] = weight_splits(geometry.out_channels_per_group, tile_cols,
+                geometry.batch_size * geometry.output_volume,split_groups,block_m=config["BLOCK_M"],
+                block_n=config["BLOCK_N"],num_sms=sms)
+        if tensorwise and autotune and convolution_kernel_variant() == "tuned":
+            # Bound additional split trials to one representative tile. The
+            # launch callback includes the final reduction in its timed work.
+            representative = candidates[1] if len(candidates) > 1 else candidates[0]
+            for splits in weight_split_options(geometry.out_channels_per_group, tile_cols,
+                    geometry.batch_size * geometry.output_volume, split_groups,
+                    representative["SPLIT_K"], block_k=representative["BLOCK_K"]):
+                candidate = {**representative, "SPLIT_K":splits}
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        scratch = None
+        def launch(config):
+            nonlocal scratch
+            splits = config["SPLIT_K"]
+            if splits > 1 and (scratch is None or scratch.shape[0] < splits):
+                scratch = torch.empty((splits,geometry.out_channels,cols),device=qg.data.device,dtype=torch.float32)
+            partials = output if splits == 1 else scratch
+            base_grid = grid(geometry.out_channels_per_group,tile_cols,split_groups)
+            if tensorwise:
+                _weight_gradient_kernel[lambda meta:(base_grid(meta)[0],splits)](
+                    qg.data,qx.data,qg.scale_inv,qx.scale_inv,partials,**config)
+            else:
+                constants = {key:value for key,value in config.items() if key not in ("CHANNEL_FAST", "GROUP_M")}
+                _blockwise_weight_gradient_kernel[lambda meta:(base_grid(meta)[0],splits)](
+                    qg.data,qx.data,qg.scale_inv,qx.scale_inv,partials,**constants,STRIPE_W=128)
+            if splits > 1:
+                _reduce_weight_gradient[(triton.cdiv(output.numel(),256),)](partials,output,
+                    ELEMENTS=output.numel(),SPLITS=splits,BLOCK=256,SPLIT_BLOCK=triton.next_power_of_2(splits),
+                    num_warps=4,num_stages=1)
+        selected = select_convolution_launch(convolution_launch_key("dw",qg,qx,geometry,kernel_arguments,out_dtype),
+                                             candidates,launch,autotune=autotune)
+        launch(selected)
     return output

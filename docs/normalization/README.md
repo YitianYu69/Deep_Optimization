@@ -44,8 +44,12 @@ GroupNorm always uses per-sample group statistics. SyncBatchNorm is not converte
 
 Set `runtime.activation_compression.norm_xhat_recenter = true` alongside
 `enabled = true` to preserve the original normalized tensor's first moment in
-compressed backward state. It applies to BatchNorm2d, GroupNorm and LayerNorm,
-with BF16 or FP8 execution. The default is `false`; other operations ignore it.
+compressed backward state. It applies to BatchNorm2d and GroupNorm with BF16 or
+FP8 execution. The default is `false`.
+
+Compressed LayerNorm always applies mean **and second-moment correction**,
+regardless of this option. See the [LayerNorm correction contract](layer_norm.md).
+The following mean-only description applies to BatchNorm and GroupNorm.
 
 The packing kernel decodes its exact output words in registers, sums
 `decoded_xhat - original_xhat`, and records one FP32 shift per normalization

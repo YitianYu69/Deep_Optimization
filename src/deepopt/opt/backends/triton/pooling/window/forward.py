@@ -12,7 +12,54 @@ from ...quantization.activation.affine import _affine_quantize_pack, _affine_ste
 
 
 @triton.jit
-def _forward(x, x_inverse, samples, output, public, routing, factor,
+def _max_pool3x3_forward(x, x_inverse, output, public, routing, scales, inverse, observations, snapshot,
+                        SHAPE: tl.constexpr, OUT_SHAPE: tl.constexpr, X_META: tl.constexpr,
+                        CHANNELS: tl.constexpr, TOTAL: tl.constexpr, SAVE: tl.constexpr, PUBLIC: tl.constexpr,
+                        PACK: tl.constexpr, ROWS: tl.constexpr, COLS: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+                        FP8: tl.constexpr, CURRENT: tl.constexpr, OBSERVE: tl.constexpr, SNAPSHOT: tl.constexpr,
+                        MAXIMUM: tl.constexpr, BLOCK: tl.constexpr):
+    index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    valid = index < TOTAL
+    logical = _logical(index, OUT_SHAPE, CHANNELS)
+    nc = logical // (OUT_SHAPE[-2] * OUT_SHAPE[-1])
+    h = logical // OUT_SHAPE[-1] % OUT_SHAPE[-2] * 2 - 1
+    w = logical % OUT_SHAPE[-1] * 2 - 1
+    best = tl.full((BLOCK,), -float("inf"), tl.float32)
+    argument = tl.full((BLOCK,), 0, tl.int64)
+    code = tl.full((BLOCK,), 0, tl.int32)
+    seen = tl.full((BLOCK,), False, tl.int1)
+    best_nan = tl.full((BLOCK,), False, tl.int1)
+    for tap in tl.static_range(9):
+        sh, sw = h + tap // 3, w + tap % 3
+        mask = valid & (sh >= 0) & (sh < SHAPE[-2]) & (sw >= 0) & (sw < SHAPE[-1])
+        position = sh * SHAPE[-1] + sw
+        value = _load_value(x, x_inverse, nc * (SHAPE[-2] * SHAPE[-1]) + position, mask, SHAPE, X_META)
+        nan = value != value
+        replace = mask & (nan | (~best_nan & (~seen | (value > best)
+                                             | ((value == best) & (position < argument)))))
+        best = tl.where(replace, value, best)
+        argument = tl.where(replace, position, argument)
+        code = tl.where(replace, tap, code)
+        best_nan = best_nan | (mask & nan)
+        seen = seen | mask
+    if PUBLIC:
+        tl.store(public + index, argument, valid)
+    if SAVE:
+        if PACK:
+            # Nine routes use four bits. Packing eight adjacent codes avoids
+            # the generic bit-gather path while retaining its exact word order.
+            codes = tl.reshape(tl.where(valid, code, 0), (BLOCK // 8, 8))
+            words = tl.sum(codes << (tl.arange(0, 8) * 4)[None, :], 1)
+            word = tl.program_id(0).to(tl.int64) * (BLOCK // 8) + tl.arange(0, BLOCK // 8)
+            tl.store(routing + word, words, word < tl.cdiv(TOTAL, 8))
+        else:
+            tl.store(routing + index, code, valid)
+    _store_value(best, output, scales, inverse, observations, snapshot, output,
+                 index, valid, ROWS, COLS, BR, BC, FP8, CURRENT, OBSERVE, SNAPSHOT, False, MAXIMUM, BLOCK)
+
+
+@triton.jit
+def _pooling_forward(x, x_inverse, samples, output, public, routing, factor,
               scales, inverse, observations, snapshot, errors,
               SHAPE: tl.constexpr, OUT_SHAPE: tl.constexpr, X_META: tl.constexpr, GEO: tl.constexpr,
               CHANNELS: tl.constexpr, TOTAL: tl.constexpr, WINDOW: tl.constexpr,
@@ -33,8 +80,8 @@ def _forward(x, x_inverse, samples, output, public, routing, factor,
     nc = logical // spatial
     coordinates = _coordinates(logical % spatial, GEO[2])
     starts, extents = _window(nc, coordinates, samples, valid, GEO)
-    step: tl.constexpr = (1, 1, 1) if GEO[0] in (2, 3, 4) else GEO[6]
-    maximum: tl.constexpr = GEO[0] in (0, 2, 4) or GEO[0] == 5 and (GEO[9] == float("inf") or GEO[9] == -float("inf"))
+    step: tl.constexpr = (1, 1, 1) if (GEO[0] == 2 or GEO[0] == 3 or GEO[0] == 4) else GEO[6]
+    maximum: tl.constexpr = (GEO[0] == 0 or GEO[0] == 2 or GEO[0] == 4) or GEO[0] == 5 and (GEO[9] == float("inf") or GEO[9] == -float("inf"))
     initial = ()
     for axis in tl.static_range(3):
         initial += (tl.where(starts[axis] < 0, starts[axis] + ((-starts[axis] + step[axis] - 1) // step[axis]) * step[axis], starts[axis]),)
@@ -93,7 +140,14 @@ def _forward(x, x_inverse, samples, output, public, routing, factor,
             codes = best_code * 3 + best_sign if GEO[0] == 5 else best_code
             codes = tl.where(valid, codes, 0)
             if PACK:
-                _pack_codes(codes, routing, pid, BITS, WORD_BLOCK, TOTAL)
+                if BLOCK==32:
+                    _pack_codes(codes, routing, pid, BITS, WORD_BLOCK, TOTAL)
+                else:
+                    # Routing words retain their original 32-value chunks,
+                    # independently of the larger value-reduction CTA.
+                    for chunk in tl.static_range(BLOCK//32):
+                        chunk_codes=tl.gather(codes,chunk*32+tl.arange(0,32),0)
+                        _pack_codes(chunk_codes,routing,pid*(BLOCK//32)+chunk,BITS,WORD_BLOCK,TOTAL)
             else:
                 tl.store(routing + index, codes, valid)
     else:
@@ -140,3 +194,7 @@ def _forward(x, x_inverse, samples, output, public, routing, factor,
         tl.store(coefficient_minimum + pid, low_a)
     _store_value(value, output, scales, inverse, observations, snapshot, errors, index, valid,
                  ROWS, COLS, BR, BC, FP8, CURRENT, OBSERVE, SNAPSHOT, CHECK, MAXIMUM, BLOCK)
+
+
+# Preserve private launch imports; profiler names identify the actual operation.
+_forward = _pooling_forward

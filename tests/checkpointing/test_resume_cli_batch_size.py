@@ -116,15 +116,17 @@ validation_samples = 9
         self.assertIn(adjustment["reason"], resumed.stderr)
 
     def test_cli_forwards_progress_toggle_and_optional_batch_override(self):
-        cases = (([], True, None, "auto"),
-                 (["--no-progress", "--batch-size", "5", "--batch-size-mode", "manual"], False, 5, "manual"))
-        for flags, enabled, batch_size, mode in cases:
+        cases = (([], True, None, "auto", 1),
+                 (["--no-progress", "--batch-size", "5", "--batch-size-mode", "manual"], False, 5, "manual", 1),
+                 (["--progress-bar-every-steps", "50"], True, None, "auto", 50))
+        for flags, enabled, batch_size, mode, interval in cases:
             with self.subTest(flags=flags), patch("deepopt.run.train", return_value=self.root) as run:
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     main(["train", "--resume", str(self.root / "last.pt"), *flags])
                 self.assertIs(run.call_args.kwargs["progress_bar"], enabled)
                 self.assertEqual(run.call_args.kwargs["batch_size"], batch_size)
                 self.assertEqual(run.call_args.kwargs["batch_size_mode"], mode)
+                self.assertEqual(run.call_args.kwargs["progress_bar_every_steps"], interval)
 
     def test_invalid_batch_overrides_fail_before_building_components_or_creating_output(self):
         config = load_config(self.config_path)
@@ -153,6 +155,24 @@ validation_samples = 9
                   experiment_factory=factory)
         factory.assert_not_called()
         self.assertFalse((self.root / "invalid").exists())
+
+    def test_invalid_progress_interval_fails_before_run_side_effects(self):
+        for interval in (None, 0, -1, True, 1.5, "10"):
+            with self.subTest(interval=interval):
+                factory = Mock()
+                with self.assertRaisesRegex(ValueError, "progress_bar_every_steps must be a positive integer"):
+                    train(load_config(self.config_path), output=self.root / "invalid",
+                          progress_bar_every_steps=interval, experiment_factory=factory)
+                factory.assert_not_called()
+                self.assertFalse((self.root / "invalid").exists())
+
+    def test_cli_invalid_progress_interval_has_readable_error_and_no_artifacts(self):
+        output = self.root / "invalid-progress"
+        result = self.cli("train", "--config", self.config_path, "--output", output,
+                          "--progress-bar-every-steps", 0, expected_code=2)
+        self.assertIn("progress_bar_every_steps must be a positive integer", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(output.exists())
 
     def test_batch_size_mode_rejects_unknown_choices_before_building_components(self):
         factory = Mock()

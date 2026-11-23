@@ -108,7 +108,9 @@ Compression follows the established normalization policy:
   check alignment and use a documented conversion/reduction path if it fails;
   it must not silently merge normalization domains to fit an FP8 tile.
 - With compression on, save packed xhat, its codec metadata, inverse standard
-  deviation and only the affine values needed by requested gradients. Retain
+  deviation, per-row decoded mean and moment gain, and only the affine values
+  needed by requested gradients. Always center and restore the forward xhat
+  second moment before either dx or dweight uses decoded values. Retain
   neither raw input nor a dense xhat shadow in the autograd context.
 - With compression off, use the existing norm convention of retaining input
   representation/statistics and reconstructing xhat during backward. An FP8

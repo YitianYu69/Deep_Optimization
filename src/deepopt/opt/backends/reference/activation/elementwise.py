@@ -28,7 +28,8 @@ def allocate_saved(geometry, device, *, packed, bits, group_size, block_shape, m
 
 
 def forward(x, geometry, *, kind, approximate, dtype, block_shape, packed, bits, group_size,
-            save_mask, inplace, reuse=False, scale=None, observe=False, check_finite=False, capture_scale=False):
+            save_mask, inplace, reuse=False, scale=None, observe=False, check_finite=False, capture_scale=False,
+            recompute=False, output_pack=None, recompute_input=None):
     rows, cols = geometry.matrix_shape
     fp8 = dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     storage = x._data if isinstance(x, FP8Activation) else x
@@ -37,6 +38,10 @@ def forward(x, geometry, *, kind, approximate, dtype, block_shape, packed, bits,
             "coefficient_launches": 0, "backward_launches": 0,
             "scale_mode": "provided" if scale is not None else "current" if fp8 else "none",
             "saved_state": ("mask" if kind == "relu6" else "derivative") if save_mask else "none"}
+    if recompute:
+        info["saved_state"] = "input_recompute"
+        info["recompute_input_copy_bytes"] = x.numel() * x.element_size() if not x.is_contiguous() else 0
+    info["producer_pack_fused"] = output_pack is not None
     if fake or not x.numel():
         output = storage if inplace else torch.empty((rows, cols), dtype=dtype, device=x.device)
         shape = (1, 1) if block_shape is None else ((rows + block_shape[0] - 1) // block_shape[0],
@@ -45,13 +50,17 @@ def forward(x, geometry, *, kind, approximate, dtype, block_shape, packed, bits,
         saved = allocate_saved(geometry, x.device, packed=packed, bits=bits, group_size=group_size,
                                block_shape=block_shape, mask=kind == "relu6",
                                dtype=torch.float64 if x.dtype == torch.float64 else torch.float32) if save_mask else None
+        if recompute:
+            saved = SavedActivation(geometry.matrix(recompute_input if recompute_input is not None else x), recompute=(kind, approximate))
         return output, inverse, saved, None, None, info
     dense = geometry.matrix(x.dequantize(torch.float32) if isinstance(x, FP8Activation) else
                             x if x.dtype == torch.float64 else x.float())
     values, derivative = evaluate(dense, kind, approximate)
     saved = None
     if save_mask:
-        if kind == "relu6":
+        if recompute:
+            saved = SavedActivation(geometry.matrix(recompute_input if recompute_input is not None else x), recompute=(kind, approximate))
+        elif kind == "relu6":
             saved = SavedActivation(pack_boolean_mask(derivative).data if packed else derivative.flatten(),
                                     mask=True, packed=packed)
         elif packed:
@@ -80,6 +89,8 @@ def forward(x, geometry, *, kind, approximate, dtype, block_shape, packed, bits,
         observations = values.abs().amax().reshape(1) if observe else None
     else:
         output = values.to(dtype)
+    from deepopt.opt.backends._shared.producer import reference_output_pack
+    reference_output_pack(output, output_pack)
     if inplace:
         if isinstance(x, FP8Activation):
             x._data.copy_(output)
@@ -90,12 +101,14 @@ def forward(x, geometry, *, kind, approximate, dtype, block_shape, packed, bits,
     return output, inverse, saved, snapshot, observations, info
 
 
-def backward(gradient, saved, geometry, *, dtype, gradient_output=None):
+def backward(gradient, saved, geometry, *, dtype, gradient_output=None, pointwise_tile=512):
     storage = gradient._data if isinstance(gradient, FP8Activation) else gradient
     if isinstance(storage, FakeTensor) or gradient.device.type == "meta" or not gradient.numel():
         result = torch.empty(geometry.matrix_shape, device=gradient.device, dtype=dtype)
     else:
-        if saved.mask:
+        if saved.recompute is not None:
+            _, coefficient = evaluate(saved.data.float(), *saved.recompute)
+        elif saved.mask:
             coefficient = (unpack_boolean_mask(PackedBooleanMask(saved.data, geometry.matrix_shape))
                            if saved.packed else saved.data.reshape(geometry.matrix_shape))
         elif saved.packed:

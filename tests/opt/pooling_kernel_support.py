@@ -16,6 +16,7 @@ from deepopt.opt.quantization.indices import PackedIndices, empty_indices
 from deepopt.opt.quantization.activation import PackedActivation
 from deepopt.opt.quantization.quantizer import quantize_fp8
 from deepopt.opt.backends.reference.pooling import coefficient_geometry
+from deepopt.opt.backends._shared.pooling import resnet_maxpool
 
 
 class PoolLanguage(Language):
@@ -73,10 +74,12 @@ class KernelHarness:
                 node.decorator_list = []
             tree = CPUCast().visit(ast.Module(body=nodes, type_ignores=[]))
             exec(compile(ast.fix_missing_locations(tree), path, "exec"), self.kernels)
+        self.kernels["_forward"],self.kernels["_backward"]=self.kernels["_pooling_forward"],self.kernels["_pooling_backward"]
         self.host = dict(torch=torch, triton=api, prod=prod, isinf=isinf, warnings=warnings,
                          ReLUGeometry=ReLUGeometry, tensor_arguments=tensor_arguments, PoolState=PoolState,
                          PackedActivation=PackedActivation, PackedIndices=PackedIndices, empty_indices=empty_indices,
                          coefficient_geometry=coefficient_geometry, quantize_fp8=quantize_fp8)
+        self.host["resnet_maxpool"]=resnet_maxpool
         for name in self.kernels:
             if name.startswith("_") and callable(self.kernels[name]):
                 self.host[name] = Launch(self, name)

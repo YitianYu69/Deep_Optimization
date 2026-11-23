@@ -79,6 +79,39 @@ class TrainingCoreWhiteBoxTests(unittest.TestCase):
 
 
 class DDPCoreWhiteBoxTests(unittest.TestCase):
+    def test_prepared_recipe_compares_inherited_numerical_owners(self):
+        from deepopt.distributed.ddp import _prepared_offload_recipe
+        from deepopt.distributed.offload import _recipe_json
+        from deepopt.engine.execution.configuration import execution_config, runtime_signature
+        from deepopt.opt.policy import prepare_fp8_model
+
+        snapshots, recipes = [], []
+        for name in ("torch_amp", "bf16_storage"):
+            model, _ = prepare_fp8_model(nn.Linear(3, 2), False, config={"runtime": {"bf16_policy": name}})
+            snapshot = execution_config({"runtime": {"device": "cuda:0", "precision": "bf16"}}, model=model)
+            snapshots.append(runtime_signature(snapshot))
+            recipes.append(_recipe_json(_prepared_offload_recipe(model, snapshot), enabled=True))
+        # Metadata only: no CUDA execution. Default snapshots alone miss the
+        # inherited storage policy, while the effective-owner recipe sees it.
+        self.assertEqual(snapshots[0], snapshots[1])
+        self.assertNotEqual(recipes[0], recipes[1])
+
+    def test_offload_capture_requires_cold_fullgraph_owner_without_resetting_caches(self):
+        from deepopt.compiler import CompilationReport
+        from deepopt.distributed.ddp import _validate_offload_capture
+
+        model = nn.Linear(2, 2)
+        runtime = {"compile": {"enabled": True, "backend": "deepopt", "fullgraph": True}}
+        with patch("torch._dynamo.reset", side_effect=AssertionError("global reset")):
+            _validate_offload_capture(model, runtime)
+            with self.assertRaisesRegex(ValueError, "fullgraph=True"):
+                _validate_offload_capture(model, {"compile": {**runtime["compile"], "fullgraph": False}})
+            model._deepopt_compile_report = CompilationReport()
+            _validate_offload_capture(model, runtime)
+            model._deepopt_compile_report.graphs.append(object())  # Captured-owner metadata only.
+            with self.assertRaisesRegex(ValueError, "first compiled model forward"):
+                _validate_offload_capture(model, runtime)
+
     def make_core(self):
         model = nn.Linear(1, 1, bias=False)
         model.register_buffer("counter", torch.tensor(0))
@@ -86,6 +119,7 @@ class DDPCoreWhiteBoxTests(unittest.TestCase):
         with patch("deepopt.distributed.ddp.distributed.world_size", return_value=2), \
                 patch("deepopt.distributed.ddp.distributed.collective_errors", side_effect=lambda _: nullcontext()), \
                 patch("deepopt.distributed.ddp.distributed.require_equal") as agreement, \
+                patch("deepopt.distributed.offload.prepare_packed_offload", return_value={"enabled": False}), \
                 patch("deepopt.distributed.ddp.DistributedDataParallel.__new__", return_value=wrapper) as constructor:
             core = DDPCore(model, "cpu")
             self.assertEqual([call.args[1] for call in agreement.call_args_list],
@@ -115,6 +149,27 @@ class DDPCoreWhiteBoxTests(unittest.TestCase):
                 patch("deepopt.distributed.ddp.distributed.world_size", return_value=3):
             self.assertEqual(core.gradient_divisor(2), 4)
             reduce.assert_called_once_with(2 / 3)
+
+    def test_offload_capture_keeps_whole_model_graph_and_restores_torch_setting(self):
+        from torch._dynamo import config as dynamo_config
+
+        core, wrapper, _ = self.make_core()
+        core._packed_offload_enabled = True  # Compiler-control unit, no CPU transport.
+        observed = []
+
+        def forward(batch, step):
+            observed.append(dynamo_config.optimize_ddp)
+            return step(batch)
+
+        wrapper.side_effect = forward
+        with dynamo_config.patch(optimize_ddp=True):
+            core.compute(torch.ones(1, 1), lambda value: core.model(value).sum())
+            self.assertTrue(dynamo_config.optimize_ddp)
+            wrapper.side_effect = ValueError("forward failure")
+            with self.assertRaisesRegex(ValueError, "forward failure"):
+                core.compute(torch.ones(1, 1), lambda value: value)
+            self.assertTrue(dynamo_config.optimize_ddp)
+        self.assertEqual(observed, [False])
 
     def test_backward_rejects_bypassed_forward_and_higher_order_sync(self):
         core, _, _ = self.make_core()

@@ -1,5 +1,15 @@
 # DO operator and interaction analysis
 
+Use the [training stability diagnostic](diagnose_training_stability.py) to
+compare quantization, optimizer, and graph behavior on the same batch.
+
+The standalone [QuEST-inspired Linear toy](../activation_compression/toy_quest_saved_linear.py)
+compares native BF16, affine min/max, and Hadamard/RMS Gaussian saved-input
+codecs without trust-gradient estimation. It includes actual bit packing,
+matched gradient probes and synthetic MLP training, and needs only PyTorch.
+Run it with `--device cuda --bits 2 4 --steps 200`; optional `--benchmark`
+times the unfused prototype, not a production GPU codec.
+
 This suite combines per-operator PyTorch BF16 comparisons with the four-way
 FP8/compression experiment. It benchmarks the **installed** DeepOpt library.
 Copy this entire `analysis` directory to the GPU machine if the checkout is not
@@ -23,6 +33,22 @@ sweep changes one setting at a time; the explicit Cartesian grids test their
 declared interactions. Exporting requires only Python, and the generated scripts
 measure the installed DeepOpt build on the destination machine.
 
+The exported launcher now runs focused recovery cases first and resumes every
+stage by default. Add `--focused` to stop before the broad sweeps, or
+`--no-resume` to force new measurements. New code/build/environment identities
+invalidate old results; preserve snapshots and requested traces for reuse.
+
+`runtime.scope_lifetime="reused"` constructs the owned AMP/DO scope once per
+worker and enters/exits it per forward; `fresh` preserves per-call construction.
+`runtime.numerical_probe="random_upstream"` uses a seeded gradient probe only in
+the numerical pass, avoiding near-zero quadratic-loss normalization gradients.
+`runtime.norm_kernel_variant="baseline"|"auto"|"candidate"` selects explicit
+normalization controls. Candidate LayerNorm fusion additionally accepts
+`norm_row_chunk` and `norm_max_programs`; these are experimental tuning controls,
+and automatic dispatch retains the general fallback pending GPU measurements.
+Compression coverage is labeled unverified when saved state/profiling provides
+no evidence; such rows keep raw timings but no qualified speedup.
+
 ## Start with the regression
 
 Run from the repository root using the Python environment containing the build
@@ -31,14 +57,11 @@ you intend to measure:
 ```bash
 python benchmarks/analysis/benchmark_do_ops.py \
   --config benchmarks/analysis/configs/interaction.json \
-  --observed-epoch-seconds 21 27 22 47 \
   --output work/interaction
 ```
 
-Edit the shapes/settings to match your actual model. The reported epoch times
-are user-supplied context: 21 seconds BF16, 27 compression only, 22 FP8 only,
-47 combined. They imply an additive prediction of 28 seconds and a 19-second
-interaction. These numbers are never presented as measurements made by the suite.
+Set the shapes and settings for your workload. Use --observed-epoch-seconds
+to include your own epoch timings as context in the report.
 
 Each workload runs five cases, always from matched source weights and inputs:
 
@@ -261,10 +284,6 @@ silently enable your application's callbacks.
   not initialize DDP or automatically enable an application's scheduler, EMA,
   logging or checkpoint callbacks. EMA is explicit in the timm factory; other
   application work must be supplied deliberately when reconciling epoch time.
-
-The [H100 recovery guide](../../docs/activation_compression/performance_recovery.md)
-provides the real ViT configuration, grouped/copy/tiled reconstruction comparison,
-and the distinction between this model harness and the original trainer run.
 
 ## Results and restart
 

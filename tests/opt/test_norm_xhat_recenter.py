@@ -21,6 +21,7 @@ from deepopt.opt.nn.normalization.recenter import corrected_xhat
 from deepopt.opt.policy import normalization_plan, prepare_fp8_model
 from deepopt.opt.quantization.activation import dequantize_unpack_activation, quantize_pack_activation
 from deepopt.opt.quantization.activation_tensor import FP8Activation, to_fp8_activation
+from tests.opt.test_layer_norm_moments import restored_xhat
 
 
 def compression(recenter=True, **kwargs):
@@ -91,10 +92,16 @@ class NormXhatRecenterTests(unittest.TestCase):
         payload = quantize_pack_activation(h, size, (1, size), bits=bits)
         decoded = dequantize_unpack_activation(payload, dtype=torch.float32)
         shift = (decoded - h).mean(1)
-        torch.testing.assert_close(states[1][-1], shift, rtol=0, atol=0)
-        corrected = decoded - shift[:, None]
-        torch.testing.assert_close(corrected.mean(1), h.mean(1), rtol=3e-6, atol=1e-5)
-        self.assertEqual(len(states[1]), len(states[0]) + 1)
+        if kind == "layer":
+            corrected, shift, gain = restored_xhat(h, size, bits)
+            torch.testing.assert_close(states[1][-2], shift, rtol=0, atol=0)
+            torch.testing.assert_close(states[1][-1], gain, rtol=0, atol=0)
+            self.assertEqual(len(states[1]), len(states[0]))
+        else:
+            torch.testing.assert_close(states[1][-1], shift, rtol=0, atol=0)
+            corrected = decoded - shift[:, None]
+            torch.testing.assert_close(corrected.mean(1), h.mean(1), rtol=3e-6, atol=1e-5)
+            self.assertEqual(len(states[1]), len(states[0]) + 1)
         self.assertFalse(any(t is source for t in states[1]))
         dy = torch.randn_like(source)
         outputs[1].backward(dy)
@@ -135,11 +142,10 @@ class NormXhatRecenterTests(unittest.TestCase):
                 with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append(t) or t, lambda t: t):
                     y = DF.layer_norm(x, (19,), weight, bias, plan=plan(recenter))
                 if need_w:
-                    self.assertEqual(len(saved), 5 if recenter else 3)
-                    if recenter:
-                        self.assertEqual(tuple(saved[-2].shape), (2,))  # rstd snapshot
+                    self.assertEqual(len(saved), 6)
+                    self.assertEqual(tuple(saved[-3].shape), (2,))  # rstd snapshot
                 elif need_x:
-                    self.assertEqual(len(saved), 6 if recenter else 5)
+                    self.assertEqual(len(saved), 7)
                 else:
                     self.assertEqual(saved, [])
                 y.sum().backward()

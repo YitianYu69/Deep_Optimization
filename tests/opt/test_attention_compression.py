@@ -13,7 +13,7 @@ from deepopt.opt.policy import linear_plan
 from deepopt.opt.quantization.activation import quantize_pack_activation, dequantize_unpack_activation
 
 
-def compression_plan(bits=2, attention_bits=None, enabled=True, group_size=17):
+def compression_plan(bits=2, attention_bits=None, enabled=True, group_size=1024):
     return linear_plan(False, activation_compression={
         "enabled": enabled, "group_size": group_size,
         "bits": bits, "attention_bits": attention_bits,
@@ -26,11 +26,12 @@ def record_attention_packs():
     records = []
 
     def record(value, *args, **kwargs):
-        packed = quantize_pack_activation(value, *args, **kwargs)
+        from deepopt.opt.quantization.activation import _quantize_pack_strided_activation
+        packed = _quantize_pack_strided_activation(value, *args, **kwargs)
         records.append(packed)
         return packed
 
-    with patch("deepopt.opt.quantization.attention.quantize_pack_activation", side_effect=record):
+    with patch("deepopt.opt.quantization.attention._quantize_pack_strided_activation", side_effect=record):
         yield records
 
 
@@ -82,7 +83,7 @@ class AttentionCompressionTests(unittest.TestCase):
                 reference_inputs = tuple(value.detach().clone().requires_grad_() for value in inputs)
                 mask = torch.randn(3, 5) * .05
                 gradient = torch.randn(1, 2, 3, 11)
-                with _oracle_hooks(reference_inputs, bits=expected_bits, group_size=17):
+                with _oracle_hooks(reference_inputs, bits=expected_bits, group_size=1024):
                     expected = F.scaled_dot_product_attention(*reference_inputs, attn_mask=mask, scale=.31)
                 with record_attention_packs() as records:
                     actual = doF.do_scaled_dot_product_attention(
@@ -108,6 +109,159 @@ class AttentionCompressionTests(unittest.TestCase):
                 self.assertTrue(records)
                 self.assertEqual({packed.bits for packed in records}, {expected})
 
+    def test_public_flash_style_padding_saves_logical_qkv_and_exact_other_state(self):
+        from deepopt.opt.quantization.attention import AttentionCompression
+
+        for dim in (2, 6, 10):
+            for bits, dtype in ((bits, dtype) for bits in (1, 2, 4, 8)
+                                for dtype in (torch.float32, torch.bfloat16)):
+                with self.subTest(dim=dim, bits=bits, dtype=dtype):
+                    values = tuple(torch.randn(1, 2, 3, dim, dtype=dtype, requires_grad=True) for _ in range(3))
+                    right = -dim % 8
+                    restored = []
+
+                    class PrivateSavedState(torch.autograd.Function):
+                        @staticmethod
+                        def forward(ctx, q, k, v):
+                            output, probability = q * k + v, q.softmax(-1)
+                            ctx.save_for_backward(q, k, v, output, probability)
+                            return output
+
+                        @staticmethod
+                        def backward(ctx, gradient):
+                            q, k, v, output, probability = ctx.saved_tensors
+                            restored.extend((q, k, v, output, probability))
+                            return gradient * k, gradient * q, gradient
+
+                    with AttentionCompression(*values, group_size=1024, bits=bits), record_attention_packs() as records:
+                        padded = tuple(F.pad(value, (0, right)) for value in values)
+                        output = PrivateSavedState.apply(*padded)[..., :dim]
+                    expected = values[0] * values[1] + values[2]
+                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    output.sum().backward()
+                    self.assertEqual(len(records), 3)
+                    self.assertEqual([packed.shape for packed in records], [(6, dim)] * 3)
+                    oracles = tuple(dequantize_unpack_activation(quantize_pack_activation(
+                        value.detach().reshape(6, dim), group_size=1024, bits=bits), dtype=value.dtype).reshape(value.shape)
+                        for value in values)
+                    for actual, oracle in zip(restored[:3], oracles):
+                        torch.testing.assert_close(actual[..., :dim], oracle, rtol=0, atol=0)
+                        self.assertEqual(actual.shape[-1], dim + right)
+                        self.assertEqual(torch.count_nonzero(actual[..., dim:]).item(), 0)
+                    torch.testing.assert_close(restored[3], padded[0] * padded[1] + padded[2], rtol=0, atol=0)
+                    torch.testing.assert_close(restored[4], padded[0].softmax(-1), rtol=0, atol=0)
+                    torch.testing.assert_close(values[0].grad, oracles[1], rtol=0, atol=0)
+                    torch.testing.assert_close(values[1].grad, oracles[0], rtol=0, atol=0)
+
+    def test_padded_descriptor_preserves_only_proven_last_axis_views_and_casts(self):
+        from deepopt.opt.quantization.attention import AttentionCompression, _SavedQKV
+
+        value = torch.randn(2, 3, 5, 6)
+        with AttentionCompression(value, value, value, group_size=1024, bits=2) as scope:
+            padded = F.pad(value, (0, 2))
+            supported = (padded.detach(), padded.clone(), padded.to(torch.bfloat16),
+                padded.transpose(0, 1), padded.permute(2, 0, 1, 3), padded.reshape(6, 5, 8),
+                padded.unsqueeze(1), padded[:, 1:], padded.select(0, 1),
+                F.pad(padded, (0, 8)))
+            for tensor in supported:
+                with self.subTest(shape=tensor.shape, dtype=tensor.dtype):
+                    saved = scope._quantize_pack(tensor)
+                    self.assertIsInstance(saved, _SavedQKV)
+                    oracle = dequantize_unpack_activation(quantize_pack_activation(
+                        tensor[..., :6].reshape(-1, 6), group_size=1024, bits=2), dtype=tensor.dtype).reshape(*tensor.shape[:-1], 6)
+                    actual = scope._dequantize_unpack(saved)
+                    torch.testing.assert_close(actual[..., :6], oracle, rtol=0, atol=0)
+                    self.assertEqual(torch.count_nonzero(actual[..., 6:]).item(), 0)
+            unsupported = (padded.transpose(-2, -1), padded[..., :6], padded[..., ::2],
+                           padded.flatten(-2), padded * float("inf"), padded / 0,
+                           padded.as_strided((1, 3, 5, 8), padded.stride(), 1))
+            for tensor in unsupported:
+                with self.subTest(shape=tensor.shape):
+                    self.assertNotIsInstance(scope._quantize_pack(tensor), _SavedQKV)
+
+    def test_nonzero_left_or_other_axis_padding_is_not_tagged_as_qkv(self):
+        from deepopt.opt.quantization.attention import AttentionCompression, _SavedQKV
+
+        value = torch.randn(1, 2, 3, 6)
+        mask = value.clone()
+        with AttentionCompression(value, value, value, group_size=1024, bits=2, attn_mask=mask) as scope:
+            tensors = (F.pad(value, (0, 2), value=1), F.pad(value, (0, 2), value=-0.), F.pad(value, (1, 1)),
+                       F.pad(value, (0, 0, 0, 2)), F.pad(value, (0, -1)),
+                       F.pad(mask, (0, 2)), F.pad(value.softmax(-1), (0, 2)),
+                       F.pad(value + value, (0, 2)))
+            for tensor in tensors:
+                self.assertNotIsInstance(scope._quantize_pack(tensor), _SavedQKV)
+
+    def test_mutating_a_padded_alias_invalidates_future_saves_but_not_snapshots(self):
+        from deepopt.opt.quantization.attention import AttentionCompression, _SavedQKV
+
+        for operation in ("alias_write", "out_write"):
+            with self.subTest(operation=operation):
+                value = torch.randn(2, 3, 6)
+                with AttentionCompression(value, value, value, group_size=1024, bits=2) as scope:
+                    padded = F.pad(value, (0, 2))
+                    alias = padded.detach()
+                    snapshot = scope._quantize_pack(padded)
+                    before = scope._dequantize_unpack(snapshot).clone()
+                    if operation == "alias_write":
+                        alias[..., 6:].fill_(3)
+                    else:
+                        torch.mul(torch.ones_like(padded), 3, out=padded)
+                    for current in (padded, alias, padded.clone()):
+                        exact = scope._quantize_pack(current)
+                        self.assertNotIsInstance(exact, _SavedQKV)
+                        torch.testing.assert_close(exact, current, rtol=0, atol=0)
+                torch.testing.assert_close(scope._dequantize_unpack(snapshot), before, rtol=0, atol=0)
+                self.assertEqual(torch.count_nonzero(before[..., 6:]).item(), 0)
+
+    def test_equal_sized_axis_swaps_and_empty_logical_prefix_are_not_misidentified(self):
+        from deepopt.opt.quantization.attention import AttentionCompression, _SavedQKV
+
+        value = torch.randn(2, 8, 6)
+        with AttentionCompression(value, value, value, group_size=1024, bits=2) as scope:
+            padded = F.pad(value, (0, 2))
+            swapped = padded.transpose(1, 2)
+            self.assertEqual(swapped.shape, padded.shape)
+            self.assertNotIsInstance(scope._quantize_pack(swapped), _SavedQKV)
+            reinterpreted = padded.view(torch.int32)
+            self.assertNotIsInstance(scope._quantize_pack(reinterpreted), _SavedQKV)
+        empty = torch.empty(2, 3, 0)
+        with AttentionCompression(empty, empty, empty, group_size=1024, bits=2) as scope:
+            padded = F.pad(empty, (0, 8))
+            self.assertNotIsInstance(scope._quantize_pack(padded), _SavedQKV)
+
+    def test_padded_tags_and_saved_descriptors_do_not_retain_dense_bases(self):
+        from torch.multiprocessing.reductions import StorageWeakRef
+        from deepopt.opt.quantization.attention import AttentionCompression, _SavedQKV
+
+        leaves = tuple(torch.randn(2, 3, 6, requires_grad=True) for _ in range(3))
+        values = tuple(value + 0 for value in leaves)
+        refs = [StorageWeakRef(value.untyped_storage()) for value in values]
+
+        class PrivateSavedState(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, q, k, v):
+                ctx.save_for_backward(q, k, v)
+                return q * k + v
+
+            @staticmethod
+            def backward(ctx, gradient):
+                q, k, _ = ctx.saved_tensors
+                return gradient * k, gradient * q, gradient
+
+        with AttentionCompression(*values, group_size=1024, bits=2) as scope:
+            padded = tuple(F.pad(value, (0, 2)) for value in values)
+            refs.extend(StorageWeakRef(value.untyped_storage()) for value in padded)
+            saved = tuple(scope._quantize_pack(value) for value in padded)
+            self.assertTrue(all(isinstance(value, _SavedQKV) for value in saved))
+            output = PrivateSavedState.apply(*padded)[..., :6]
+        del values, padded
+        gc.collect()
+        self.assertTrue(all(reference.expired() for reference in refs))
+        self.assertTrue(all(scope._dequantize_unpack(value).shape == (2, 3, 8) for value in saved))
+        output.sum().backward()
+        self.assertTrue(all(torch.isfinite(value.grad).all() for value in leaves))
+
     def test_cpu_flash_backend_and_gradients_match_storage_selected_reference(self):
         from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -124,7 +278,7 @@ class AttentionCompressionTests(unittest.TestCase):
                     # distinguishes it from Q without involving DeepOpt tags.
                     if value.untyped_storage()._cdata in source_storages:
                         packed = quantize_pack_activation(value.detach().reshape(-1, value.shape[-1]),
-                                                 group_size=17, bits=bits)
+                                                 group_size=1024, bits=bits)
                         oracle_payloads.append(packed)
                         return packed, value.shape, value.dtype
                     return value
@@ -181,11 +335,11 @@ class AttentionCompressionTests(unittest.TestCase):
             query = torch.empty(1, 2, 3, 8, device="cuda", dtype=torch.bfloat16)
             key = torch.empty(1, 2, 5, 8, device="cuda", dtype=torch.bfloat16)
             value = torch.empty_like(key)
-            with AttentionCompression(query, key, value, group_size=17, bits=4) as scope:
+            with AttentionCompression(query, key, value, group_size=1024, bits=4) as scope:
                 saved = scope._quantize_pack(query)
             restored = scope._dequantize_unpack(saved)
             self.assertEqual(saved.packed.bits, 4)
-            self.assertEqual(saved.packed.data.shape, (3, 3))
+            self.assertEqual(saved.packed.data.shape, (1, 128))
             self.assertIsInstance(restored, FakeTensor)
             self.assertEqual(restored.shape, query.shape)
             self.assertEqual(restored.device.type, "cuda")
@@ -243,7 +397,7 @@ class AttentionCompressionTests(unittest.TestCase):
         mask = torch.randn(3, 5, requires_grad=True)
         reference_mask = mask.detach().clone().requires_grad_()
         with _math_backend():
-            with _oracle_hooks(values, bits=4, group_size=17):
+            with _oracle_hooks(values, bits=4, group_size=1024):
                 expected = F.scaled_dot_product_attention(*values, attn_mask=reference_mask)
             with record_attention_packs() as records:
                 actual = doF.do_scaled_dot_product_attention(
@@ -276,7 +430,7 @@ class AttentionCompressionTests(unittest.TestCase):
         inputs = self.inputs()
         with record_attention_packs() as records:
             with deepopt.autocast("cpu", enabled=False, fp8=settings,
-                                 activation_compression={"enabled": True, "bits": 1, "attention_bits": 2}):
+                                 activation_compression={"enabled": True, "bits": 1, "attention_bits": 2, "group_size": 1024}):
                 actual = F.scaled_dot_product_attention(*inputs)
             actual.sum().backward()
         self.assertTrue(records)
@@ -321,7 +475,7 @@ class AttentionCompressionTests(unittest.TestCase):
                     with record_attention_packs() as records:
                         with deepopt.autocast(
                             "cpu", enabled=False, fp8=False,
-                            activation_compression={"enabled": True, "bits": 2, "attention_bits": 1},
+                            activation_compression={"enabled": True, "bits": 2, "attention_bits": 1, "group_size": 1024},
                         ):
                             actual, weights = adapter(query, query, query, need_weights=need_weights)
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -354,7 +508,7 @@ class AttentionCompressionTests(unittest.TestCase):
                 with record_attention_packs() as records:
                     with deepopt.autocast(
                         "cpu", enabled=False, fp8=False,
-                        activation_compression={"enabled": True, "bits": 1},
+                        activation_compression={"enabled": True, "bits": 1, "group_size": 1024},
                     ):
                         actual, weights = adapter(query, key, value, need_weights=need_weights,
                                                   attn_mask=mask)

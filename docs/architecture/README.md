@@ -6,6 +6,9 @@ This guide is for changing DeepOpt. Training recipes can use the public APIs
 without knowing the implementation layers below.
 The [backend organization guide](backends.md) explains executor families,
 operation directories, GEMM operands, and optional GPU imports.
+See [choosing a custom kernel backend](kernel_backends.md) for configuration
+and Mixed routing, and the [compiler guide](../execution/compiler.md) for
+compile options and backward ownership.
 
 ## Responsibility boundaries
 

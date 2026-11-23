@@ -16,6 +16,7 @@ from dataclasses import asdict
 
 from deepopt._config_resolution import _UNSET, ResolvedConfig
 from deepopt.engine.execution.configuration import execution_config
+from deepopt._memory_policy import allocation_fill_scope, resolve_fill
 
 from deepopt.observers import CheckObservers, FiniteCheck, TensorStatistics
 from deepopt.engine.execution.policy import DiagnosticPolicy, ExecutionMode, ModeController
@@ -66,12 +67,13 @@ class TrainingRuntime:
     def __init__(self, model, optimizer=None, *, device=_UNSET, precision=_UNSET, grad_clip_norm=_UNSET,
                  gradient_strategy: GradientStrategy | None = None, checks=_UNSET, ddp_options=_UNSET,
                  execution_mode=_UNSET, diagnostics=_UNSET, mode_schedule=_UNSET, non_blocking=_UNSET,
-                 fp8=_UNSET, config=None):
+                 fill_uninitialized_memory=_UNSET, fp8=_UNSET, config=None):
         with distributed_ops.collective_errors("runtime configuration"):
             self._config_snapshot = execution_config(
                 config, device=device, precision=precision, checks=checks, grad_clip_norm=grad_clip_norm,
                 execution_mode=execution_mode, diagnostics=diagnostics, mode_schedule=mode_schedule,
-                non_blocking=non_blocking, fp8=fp8, model=model, ddp_options=ddp_options)
+                non_blocking=non_blocking, fill_uninitialized_memory=fill_uninitialized_memory,
+                fp8=fp8, model=model, ddp_options=ddp_options)
             runtime = self._config_snapshot.get("runtime", {})
             training = self._config_snapshot.get("training", {})
             device = runtime.get("device", "cpu")
@@ -84,6 +86,7 @@ class TrainingRuntime:
             mode_schedule = ({int(step): mode for step, mode in configured_modes.items()}
                              if configured_modes is not None else None)
             non_blocking = runtime.get("non_blocking", False)
+            self._fill_uninitialized_memory = runtime.get("fill_uninitialized_memory")
             if precision not in ("fp32", "bf16"):
                 raise ValueError("precision must be fp32 or bf16; fp16 is unsupported")
         with distributed_ops.collective_errors("runtime device"):
@@ -92,6 +95,19 @@ class TrainingRuntime:
             if self.device.type == "cuda" and self.device.index is None:
                 self.device = torch.device("cuda", torch.cuda.current_device())
         self.model, self.optimizer = model, optimizer
+        self._packed_offload_policy = None
+        with distributed_ops.collective_errors("packed offload runtime policy"):
+            from deepopt._packed_offload import resolve_owned_packed_offload
+
+            policy = resolve_owned_packed_offload(
+                getattr(model, "_deepopt_packed_activation_offload_policy", None),
+                runtime.get("packed_activation_offload"))
+            if policy.enabled:
+                if self.device.type != "cuda":
+                    raise ValueError("Packed activation offload requires native compiled CUDA execution")
+                self._packed_offload_policy = policy
+            if policy.enabled or hasattr(model, "_deepopt_packed_activation_offload_policy"):
+                runtime["packed_activation_offload"] = policy.as_config()
         with distributed_ops.collective_errors("diagnostic configuration"):
             self.checks = CheckObservers(checks)
             self._checks_spec = checks if type(checks) is bool else self.checks._observers
@@ -123,6 +139,12 @@ class TrainingRuntime:
                 raise ValueError("ddp_options requires an initialized multi-rank process group")
             self.core = TrainingCore(model, self.device, fp8=fp8, config=self._config_snapshot)
         self.model = self.core.model
+        # Rank/device admission is performed by DDPCore before model preparation.
+        # Keep its receipt outside the serialized numerical/configuration schema.
+        self._packed_offload_preparation = getattr(self.core, "_packed_offload_preparation", None)
+        memory = getattr(self.model, "_deepopt_activation_memory_plan", None)
+        if memory is not None:
+            self._config_snapshot.setdefault("runtime", {})["activation_memory"] = memory.as_config()
         compilation = getattr(self.model, "_deepopt_compile_config", None)
         if compilation is not None:
             self._config_snapshot.setdefault("runtime", {})["compile"] = deepcopy(compilation)
@@ -182,16 +204,17 @@ class TrainingRuntime:
 
     @contextmanager
     def diagnostic_scope(self, name, *, phase="forward"):
-        """Apply the current passive-check policy without changing AMP or FP8 formats."""
+        """Apply check/allocation policy without changing AMP or FP8 formats."""
         self._diagnostic_depth += 1
         try:
-            with self.mode_controller.scope(name, phase=phase, legacy_checks=self._checks_spec is not False):
+            with allocation_fill_scope(resolve_fill(self.execution_mode, self._fill_uninitialized_memory)), \
+                    self.mode_controller.scope(name, phase=phase, legacy_checks=self._checks_spec is not False):
                 yield
         finally:
             self._diagnostic_depth -= 1
 
     def set_execution_mode(self, mode):
-        """Change passive diagnostics only at a completed update/epoch boundary."""
+        """Change execution preset at a completed update/epoch boundary."""
         self._require_healthy()
         with self.core.check_errors("execution mode transition"):
             if (self._in_compute or self._diagnostic_depth or self._forward_pending or self._pending_gradients
@@ -235,15 +258,32 @@ class TrainingRuntime:
             raise RuntimeError("TrainingRuntime operations cannot be CUDA-captured; use "
                                "cuda_graph_core.capture_model before constructing the runtime")
 
-    def _mark_failed(self) -> None:
+    def _mark_failed(self, primary_error=None) -> None:
         from deepopt.opt.scaling.delayed import finish_runtime_scaling
 
-        finish_runtime_scaling(self, commit=False)
         self._failed = True
         self._forward_pending = self._pending_gradients = False
+        cleanup_errors = []
+        try:
+            finish_runtime_scaling(self, commit=False)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if self._packed_offload_policy is not None:
+            from deepopt.compiler.runtime.manager import invalidate_packed_offload_runtime
+
+            try:
+                invalidate_packed_offload_runtime(self)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        self.core.forward_pending = False
         parameters = self._stepper.parameters() if self._stepper is not None else self.model.parameters()
         for parameter in parameters:
             parameter.grad = None
+        if primary_error is not None:
+            for error in cleanup_errors:
+                primary_error.add_note(f"Runtime failure cleanup also failed: {type(error).__name__}: {error}")
+        elif cleanup_errors:
+            raise cleanup_errors[0]
 
     def invalidate(self) -> None:
         """Discard owned gradients and block updates during unsafe state changes.
@@ -264,7 +304,9 @@ class TrainingRuntime:
         self._failed = False
 
     def prepare_batch(self, batch):
-        return move_to_device(batch, self.device, non_blocking=self.non_blocking)
+        self._prepare_mode()
+        with allocation_fill_scope(resolve_fill(self.execution_mode, self._fill_uninitialized_memory)):
+            return move_to_device(batch, self.device, non_blocking=self.non_blocking)
 
     @property
     def gradient_strategy(self):
@@ -272,6 +314,19 @@ class TrainingRuntime:
 
     def autocast(self):
         return _RuntimeAutocast(self)
+
+    def _packed_offload_scope(self):
+        if self._packed_offload_policy is None:
+            return nullcontext()
+        from deepopt.compiler.runtime.manager import compiled_runtime_scope
+
+        return compiled_runtime_scope(self._packed_offload_policy, self)
+
+    def _quiesce_packed_offload(self):
+        if self._packed_offload_policy is not None:
+            from deepopt.compiler.runtime.manager import quiesce_packed_offload_runtime
+
+            quiesce_packed_offload_runtime(self)
 
     @contextmanager
     def _autocast(self):
@@ -283,7 +338,7 @@ class TrainingRuntime:
             from deepopt.opt.scaling.delayed import runtime_scaling_scope
 
             scaling = runtime_scaling_scope(self)
-        with scaling, self.diagnostic_scope("deepopt.compute"), self._precision.autocast() as context:
+        with self._packed_offload_scope(), scaling, self.diagnostic_scope("deepopt.compute"), self._precision.autocast() as context:
             yield context
 
     def compute(self, batch: Any, step: Callable[[Any], Result]) -> Result:
@@ -294,13 +349,26 @@ class TrainingRuntime:
         """
         self._require_eager()
         self._in_compute = True
+        coordinate = (self.core.distributed and self._packed_offload_policy is not None
+                      and self.model.training and torch.is_grad_enabled()
+                      and not distributed_ops.collective_error_boundary_active())
         try:
-            batch = self.prepare_batch(batch)
-            with self.autocast():
-                result = self.core.compute(batch, step)
+            # Trainer already provides a shared training-step boundary. Direct
+            # runtime loops need the same boundary so a local admission error
+            # cannot leave a peer entering DDP backward alone. No collective is
+            # inserted into transfer callbacks or unequal validation shards.
+            guard = self.core.check_errors("packed offload forward") if coordinate else nullcontext()
+            with guard:
+                batch = self.prepare_batch(batch)
+                with self.autocast():
+                    result = self.core.compute(batch, step)
             if self.model.training and torch.is_grad_enabled():
                 self._forward_pending = True
             return result
+        except BaseException as error:
+            if self._packed_offload_policy is not None:
+                self._mark_failed(primary_error=error)
+            raise
         finally:
             self._in_compute = False
 
@@ -315,8 +383,8 @@ class TrainingRuntime:
             if not isinstance(kind, str) or not kind or not isinstance(name, str):
                 raise ValueError("Observations require a nonempty kind and a string name")
             self._observe(kind, tensors, name=name)
-        except BaseException:
-            self._mark_failed()
+        except BaseException as error:
+            self._mark_failed(primary_error=error)
             raise
 
     def backward(self, loss, **kwargs):
@@ -324,7 +392,7 @@ class TrainingRuntime:
         self._require_healthy()
         try:
             self._prepare_mode()
-            with self.diagnostic_scope("deepopt.backward", phase="backward"):
+            with self._packed_offload_scope(), self.diagnostic_scope("deepopt.backward", phase="backward"):
                 self._observe("loss", loss, name="backward loss")
                 if self.fp8.enabled and self.fp8.scaling_recipe == "delayed":
                     from deepopt.opt.scaling.delayed import runtime_scaling_scope
@@ -335,8 +403,8 @@ class TrainingRuntime:
                     self.core.backward(loss, **kwargs)
             self._forward_pending = bool(kwargs.get("retain_graph", False))
             self._pending_gradients = True
-        except BaseException:
-            self._mark_failed()
+        except BaseException as error:
+            self._mark_failed(primary_error=error)
             raise
 
     def zero_grad(self):
@@ -397,8 +465,8 @@ class TrainingRuntime:
                 finish_runtime_scaling(self, commit=True)
             self._forward_pending = self._pending_gradients = False
             self.mode_controller.completed_updates += 1
-        except BaseException:
-            self._mark_failed()
+        except BaseException as error:
+            self._mark_failed(primary_error=error)
             raise
 
     def synchronize(self):

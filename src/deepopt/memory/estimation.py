@@ -14,8 +14,9 @@ from types import BuiltinFunctionType, FunctionType, MethodType, ModuleType
 import torch
 from torch import Tensor
 from torch._subclasses.fake_tensor import FakeCopyMode, FakeTensor, FakeTensorMode, unset_fake_temporarily
-from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._python_dispatch import TorchDispatchMode
+
+from .ledger import StorageLedger, tensor_components
 
 from deepopt.engine.execution.optimization import OptimizationWindow
 from deepopt.engine.core import TrainingCore
@@ -101,33 +102,29 @@ class _StorageTrace(TorchDispatchMode):
 
     def __init__(self):
         super().__init__()
-        self.storages = {}
+        # Estimation needs counters, not a second detailed invocation artifact.
+        self.ledger = StorageLedger(max_records=1)
         self.peak = {}
 
     def track(self, values, *, scalar_factory=False):
-        for key, (reference, _) in tuple(self.storages.items()):
-            if reference.expired():
-                del self.storages[key]
+        observed = []
         for value in _objects(values):
             if isinstance(value, Tensor):
-                if not isinstance(value, FakeTensor):
-                    if scalar_factory and value.device.type == "cpu" and value.ndim == 0:
-                        # torch.tensor(0.) lifts a tiny literal before FakeTensor
-                        # dispatch; Adam uses this for its lazy step counter.
-                        continue
-                    raise MemoryEstimationError("A real tensor escaped the fake execution")
-                key, storage, size = _storage(value)
-                previous = self.storages.get(key)
-                # In-place resize can change storage size without a new key.
-                self.storages[key] = (previous[0] if previous is not None else StorageWeakRef(storage), size)
-        totals = {}
-        for (device, _), (_, size) in self.storages.items():
-            totals[device] = totals.get(device, 0) + size
-        for device, size in totals.items():
-            self.peak[device] = max(self.peak.get(device, 0), size)
+                for _, component in tensor_components(value):
+                    if not isinstance(component, FakeTensor):
+                        if scalar_factory and component.device.type == "cpu" and component.ndim == 0:
+                            # torch.tensor(0.) lifts a tiny literal before FakeTensor
+                            # dispatch; Adam uses this for its lazy step counter.
+                            continue
+                        raise MemoryEstimationError("A real tensor escaped the fake execution")
+                    _storage(component)  # Preserve the strict strided-layout guard.
+                    observed.append(component)
+        self.ledger.observe(observed)
+        self.peak.update(self.ledger.peak_bytes_by_device)
 
     def __torch_dispatch__(self, function, types, args=(), kwargs=None):
         kwargs = {} if kwargs is None else kwargs
+        self.ledger.advance(str(function))
         scalar_factory = function in (torch.ops.aten.lift_fresh.default, torch.ops.aten.lift_fresh_copy.default)
         self.track((args, kwargs), scalar_factory=scalar_factory)
         result = function(*args, **kwargs)

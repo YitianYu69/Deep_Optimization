@@ -105,6 +105,10 @@ Optional `block_shapes` maps `activation`, `weight` and `grad` to positive
 two-dimensional shapes; roles without inherited settings use tensorwise scaling.
 Partial overrides preserve unspecified inherited roles. `num_stages`
 defaults to `"auto"` (search stages 1–5); an integer from 1–5 pins the depth.
+`autotune=False` disables GEMM and delayed-conversion candidate searches in
+forward and backward. It uses fixed compatible launches; `num_stages="auto"`
+then selects depth 3. First-use Triton JIT compilation still occurs. See
+[CUDA execution and autotuning](cuda.md) for distributed-startup guidance.
 `out_dtype=None` uses the active AMP/input dtype.
 The weight-gradient GEMM uses that same output dtype: BF16 projections emit BF16
 dW directly, FP16 projections emit FP16 dW, and explicit FP32 projections retain

@@ -5,6 +5,38 @@ from dataclasses import asdict
 from deepopt.config import (ActivationCompressionConfig, FP8Config,
                             activation_compression_config_from_dict, fp8_config_from_dict)
 from deepopt._config_resolution import _UNSET, ResolvedConfig, resolve_config
+from deepopt._bf16_policy import resolve_bf16_policy
+from deepopt._activation_memory import resolve_activation_memory, validate_activation_memory_execution
+
+
+def normalize_bf16_policy(value=_UNSET, *, config=None):
+    snapshot = resolve_config(config)
+    return resolve_bf16_policy(snapshot.get("runtime", {}).get("bf16_policy")
+                               if value is _UNSET else value)
+
+
+def resolve_model_bf16_policy(model, *, config=None):
+    snapshot = resolve_config(config)
+    previous = getattr(model, "_deepopt_bf16_policy", None)
+    selected = snapshot.get("runtime", {}).get("bf16_policy", previous)
+    policy = resolve_bf16_policy(selected)
+    if previous is not None and resolve_bf16_policy(previous) != policy:
+        raise ValueError("BF16 policy differs from the prepared model; reconstruct the original model first")
+    return policy
+
+
+def resolve_model_activation_memory(model, *, config=None):
+    """Keep a prepared model's owned recipe when ambient settings are absent."""
+    snapshot = resolve_config(config)
+    runtime = snapshot.get("runtime", {})
+    previous = getattr(model, "_deepopt_activation_memory_plan", None)
+    selected = runtime.get("activation_memory", previous)
+    options = runtime.get("compile", {})
+    plan = resolve_activation_memory(selected, compiler_options=(
+        options.get("options") if options.get("backend") == "deepopt" else None))
+    if previous is not None and resolve_activation_memory(previous) != plan:
+        raise ValueError("Activation memory differs from the prepared model; reconstruct the original model first")
+    return plan
 
 
 def normalize_fp8_config(value=_UNSET, *, config=None) -> FP8Config:
@@ -58,7 +90,18 @@ def resolve_activation_compression_config(model, settings=_UNSET, *, config=None
 def fp8_plan(settings=_UNSET, *, config=None, activation_compression=_UNSET) -> dict:
     """Resolve dtype names only when an FP8 computation plan is requested."""
     settings = normalize_fp8_config(settings, config=config)
+    # An owned ResolvedConfig is already validated; re-resolving it here would
+    # repeat schema work in autocast's hot path.
+    snapshot = config if isinstance(config, ResolvedConfig) else resolve_config(config)
+    if resolve_bf16_policy(snapshot.get("runtime", {}).get("bf16_policy")).storage_enabled:
+        raise ValueError("bf16_storage requires FP8 disabled")
     compression = normalize_activation_compression_config(activation_compression, config=config)
+    from deepopt.kernel_policy import resolve_kernel_policy
+    kernel_options = snapshot.get("runtime", {}).get("kernels")
+    kernels = resolve_kernel_policy(kernel_options, fp8_backend=settings.backend)
+    backend = settings.backend if settings.backend == "reference" else kernels.backend
+    extra = ({"kernel_policy": kernels.as_dict()} if kernel_options is not None
+             or settings.backend in ("inherit", "tilelang") else {})
     import torch
 
     fp8_types = {"e4m3fn": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
@@ -69,16 +112,21 @@ def fp8_plan(settings=_UNSET, *, config=None, activation_compression=_UNSET) -> 
         "fp8_training": {
             "fp8_dtypes": {role: fp8_types[getattr(settings, f"{role}_dtype")]
                            for role in ("activation", "weight", "grad")},
-            "backend": settings.backend,
+            "backend": backend,
+            **extra,
             "num_stages": settings.num_stages,
+            "autotune": settings.autotune,
             "out_dtype": output_types[settings.out_dtype],
             "scaling_recipe": settings.scaling_recipe,
             "delayed_scaling": asdict(settings.delayed_scaling),
             "backward_backend": settings.backward_backend,
             "backward_precision": settings.backward_precision,
+            "convolution_policy": settings.convolution_policy,
             "activation_compression": asdict(compression),
         },
         "block_shapes": dict(settings.block_shapes),
+        **({"activation_memory": resolve_activation_memory(snapshot["runtime"]["activation_memory"]).as_dict()}
+           if "activation_memory" in snapshot.get("runtime", {}) else {}),
     })
 
 
@@ -95,7 +143,14 @@ def linear_plan(fp8=_UNSET, *, activation_compression=_UNSET, config=None) -> di
 
     if settings.enabled:
         return _prepare_linear_plan(fp8_plan(settings, config=snapshot, activation_compression=compression))
-    return _prepare_linear_plan({"fp8": False, "activation_compression": asdict(compression)})
+    values = {"fp8": False, "activation_compression": asdict(compression),
+              "bf16_policy": normalize_bf16_policy(config=snapshot).as_dict()}
+    if "activation_memory" in snapshot.get("runtime", {}):
+        values["activation_memory"] = resolve_activation_memory(snapshot["runtime"]["activation_memory"]).as_dict()
+    if "kernels" in snapshot.get("runtime", {}):
+        from deepopt.kernel_policy import resolve_kernel_policy
+        values["kernel_policy"] = resolve_kernel_policy(snapshot["runtime"]["kernels"]).as_dict()
+    return _prepare_linear_plan(values)
 
 
 def conv_plan(fp8=_UNSET, *, activation_compression=_UNSET, config=None) -> dict:
@@ -153,24 +208,93 @@ def prepare_fp8_model(model, settings=_UNSET, *, config=None, activation_compres
     """
     settings = resolve_fp8_config(model, settings, config=config)
     compression = resolve_activation_compression_config(model, activation_compression, config=config)
+    bf16_policy = resolve_model_bf16_policy(model, config=config)
+    activation_memory = resolve_model_activation_memory(model, config=config)
+    snapshot = resolve_config(config)
+    runtime = snapshot.get("runtime", {})
+    # A fully disabled policy stays a no-op: no precision, storage, memory,
+    # attention, or kernel policy is selected and the model carries no marker
+    # from an earlier preparation. Preserve that contract so callers can supply
+    # an eager model (or a placeholder) without inspection or mutation.
+    if (not settings.enabled and not compression.enabled and not bf16_policy.storage_enabled
+            and activation_memory.is_default
+            and runtime.get("attention", {}).get("backend", "native") == "native"
+            and runtime.get("kernels") is None
+            and getattr(model, "_deepopt_attention_config", None) is None
+            and getattr(model, "_deepopt_bf16_policy", None) is None
+            and getattr(model, "_deepopt_kernel_policy", None) is None):
+        return model, None
+    from deepopt._bf16_policy import STORAGE_PRIMITIVE_RECIPE_VERSION
+
+    if (bf16_policy.storage_enabled and getattr(model, "_deepopt_bf16_primitive_recipe", STORAGE_PRIMITIVE_RECIPE_VERSION)
+            != STORAGE_PRIMITIVE_RECIPE_VERSION):
+        raise ValueError("BF16 primitive recipe differs from the prepared model; reconstruct the original model first")
+    if any(getattr(module, "_deepopt_attention_recipe_version", 2) != 2 for module in model.modules()):
+        raise ValueError("Attention preparation recipe changed; reconstruct the original model first")
+    if bf16_policy.storage_enabled and settings.enabled:
+        raise ValueError("bf16_storage requires FP8 disabled")
+    from deepopt.kernel_policy import resolve_kernel_policy
+    kernel_options = runtime.get("kernels")
+    previous_kernel_policy = getattr(model, "_deepopt_kernel_policy", None)
+    if previous_kernel_policy is not None and (kernel_options is None or kernel_options.get("backend", "inherit") == "inherit"):
+        kernel_options = previous_kernel_policy
+    kernel_policy = resolve_kernel_policy(kernel_options, fp8_backend=settings.backend if settings.enabled else None)
+    if previous_kernel_policy is not None and previous_kernel_policy != kernel_policy.as_dict():
+        raise ValueError("Kernel policy differs from the prepared model; reconstruct the original model first")
+    validate_activation_memory_execution(activation_memory, kernel_policy=kernel_policy, model=model)
+    def attention(prepared):
+        from .precision.bf16 import bind_bf16_model_policy
+        if not activation_memory.is_default:
+            from .nn.functional import _prepare_linear_plan
+
+            for module in prepared.modules():
+                plan = getattr(module, "plan", None)
+                if isinstance(plan, dict) and ("fp8_training" in plan or plan.get("fp8") is False):
+                    module.plan = _prepare_linear_plan({**plan, "activation_memory": activation_memory.as_dict()})
+        if kernel_options is not None or kernel_policy.backend != "triton":
+            from .nn.functional import _prepare_linear_plan
+            prepared._deepopt_kernel_policy = kernel_policy.as_dict()
+            for module in prepared.modules():
+                from .scaling.delayed import DelayedScalingState
+                if isinstance(module, DelayedScalingState):
+                    module.kernel_policy = kernel_policy
+                plan = getattr(module, "plan", None)
+                if isinstance(plan, dict):
+                    if "fp8_training" in plan:
+                        plan = {**plan, "fp8_training": {**plan["fp8_training"], "kernel_policy": kernel_policy.as_dict()}}
+                    elif plan.get("fp8") is False:
+                        plan = {**plan, "kernel_policy": kernel_policy.as_dict()}
+                    else:
+                        continue
+                    module.plan = _prepare_linear_plan(plan)
+        snapshot = resolve_config(config)
+        backend = snapshot.get("runtime", {}).get("attention", {}).get("backend", "native")
+        if backend == "native" and getattr(prepared, "_deepopt_attention_config", None) is None:
+            return bind_bf16_model_policy(prepared, bf16_policy, activation_memory=activation_memory)
+        from .nn.attention_backend import prepare_attention_model
+        return bind_bf16_model_policy(
+            prepare_attention_model(prepared, config=config, compression=compression), bf16_policy,
+            activation_memory=activation_memory)
+
     if not settings.enabled:
-        if compression.enabled:
+        if compression.enabled or bf16_policy.storage_enabled:
             from .nn.prepare import prepare_native_operations
 
             previous = getattr(model, "_deepopt_native_normalization_report", None)
             if previous is not None:
-                return model, previous
-            model, report = prepare_native_operations(model, compression, settings.exclude_modules)
+                return attention(model), previous
+            model, report = prepare_native_operations(model, compression, settings.exclude_modules,
+                                                       bf16_policy=bf16_policy)
             if report is not None:
                 model._deepopt_activation_compression_config = compression
                 model._deepopt_fp8_config = settings
                 model._deepopt_native_normalization_report = report
-            return model, report
-        return model, None
+            return attention(model), report
+        return attention(model), None
 
     previous = getattr(model, "_deepopt_fp8_config", None)
     if previous is not None:
-        return model, model._deepopt_fp8_report
+        return attention(model), model._deepopt_fp8_report
 
     for module in model.modules():
         if (getattr(module, "_compiled_call_impl", None) is not None
@@ -208,5 +332,7 @@ def prepare_fp8_model(model, settings=_UNSET, *, config=None, activation_compres
     prepared._deepopt_fp8_report = report
     from .precision import prepare_precision_plan
 
-    prepare_precision_plan(prepared, settings)
-    return prepared, report
+    from deepopt.kernel_policy import kernel_policy_scope
+    with kernel_policy_scope(kernel_policy):
+        prepare_precision_plan(prepared, settings)
+    return attention(prepared), report

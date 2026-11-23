@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 
 from .common import _coordinates, _load_input, _load_xhat, _load_xhat_rstd
+from .activation import _adjust_spatial_gradient
 
 
 @triton.jit
@@ -12,12 +13,19 @@ def _partial_backward(dy, dy_scale, data, step, minimum, x, x_scale, mean, inver
                       DOMAINS: tl.constexpr, ELEMENTS: tl.constexpr, PARTS: tl.constexpr,
                       COMPRESSED: tl.constexpr, GROUP: tl.constexpr, WORDS: tl.constexpr, BITS: tl.constexpr,
                       HAS_WEIGHT: tl.constexpr, DY_META: tl.constexpr, X_META: tl.constexpr, BLOCK: tl.constexpr,
-                      center_shift=None, RECENTER: tl.constexpr = False):
+                      center_shift=None, RECENTER: tl.constexpr = False,
+                      derivative_input=None, DERIVATIVE_META: tl.constexpr = (),
+                      ACTIVATION: tl.constexpr = "", APPROXIMATE: tl.constexpr = "none",
+                      derivative_saved=None, derivative_step=None, derivative_minimum=None,
+                      PACKED_DERIVATIVE: tl.constexpr = False):
     domain, part = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     position = part * BLOCK + tl.arange(0, BLOCK)
     valid = position < ELEMENTS
     n, c, s = _coordinates(domain, position, C, S, G, BATCH)
     gradient = _load_input(dy, dy_scale, n, c, s, valid, C, S, DY_META)
+    gradient = _adjust_spatial_gradient(gradient, derivative_input, n, c, s, valid, C, S,
+                                        DERIVATIVE_META, ACTIVATION, APPROXIMATE,
+                                        derivative_saved, derivative_step, derivative_minimum, PACKED_DERIVATIVE)
     h = _load_xhat(data, step, minimum, x, x_scale, mean, inverse, domain, position, n, c, s, valid,
                    C, S, ELEMENTS, COMPRESSED, GROUP, WORDS, BITS, X_META, center_shift, RECENTER)
     if HAS_WEIGHT:
@@ -45,20 +53,33 @@ def _input_gradient(dy, dy_scale, data, step, minimum, x, x_scale, mean, inverse
                      DOMAINS: tl.constexpr, ELEMENTS: tl.constexpr, BATCH_STATS: tl.constexpr,
                      COMPRESSED: tl.constexpr, GROUP: tl.constexpr, WORDS: tl.constexpr, BITS: tl.constexpr,
                      HAS_WEIGHT: tl.constexpr, DY_META: tl.constexpr, X_META: tl.constexpr, BLOCK: tl.constexpr,
-                     center_shift=None, RECENTER: tl.constexpr = False):
+                     center_shift=None, RECENTER: tl.constexpr = False, SHARED_BN: tl.constexpr = False,
+                     derivative_input=None, DERIVATIVE_META: tl.constexpr = (),
+                     ACTIVATION: tl.constexpr = "", APPROXIMATE: tl.constexpr = "none",
+                     derivative_saved=None, derivative_step=None, derivative_minimum=None,
+                     PACKED_DERIVATIVE: tl.constexpr = False):
     domain, part = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     position = part * BLOCK + tl.arange(0, BLOCK)
     valid = position < ELEMENTS
     n, c, s = _coordinates(domain, position, C, S, G, BATCH)
     gradient = _load_input(dy, dy_scale, n, c, s, valid, C, S, DY_META)
-    if HAS_WEIGHT:
+    gradient = _adjust_spatial_gradient(gradient, derivative_input, n, c, s, valid, C, S,
+                                        DERIVATIVE_META, ACTIVATION, APPROXIMATE,
+                                        derivative_saved, derivative_step, derivative_minimum, PACKED_DERIVATIVE)
+    if HAS_WEIGHT and not SHARED_BN:
         gradient = gradient * tl.load(weight + c, valid, other=1).to(tl.float32)
     if BATCH_STATS:
         h, rstd = _load_xhat_rstd(data, step, minimum, x, x_scale, mean, inverse, domain, position, n, c, s, valid,
                        C, S, ELEMENTS, COMPRESSED, GROUP, WORDS, BITS, X_META, center_shift, RECENTER)
-        gradient = gradient - tl.load(sums + domain) / ELEMENTS - h * tl.load(sums + DOMAINS + domain) / ELEMENTS
+        if SHARED_BN:
+            # Shared affine storage is [sum(dy*h), sum(dy)], unweighted.
+            gradient = gradient - tl.load(sums + DOMAINS + domain) / ELEMENTS - h * tl.load(sums + domain) / ELEMENTS
+        else:
+            gradient = gradient - tl.load(sums + domain) / ELEMENTS - h * tl.load(sums + DOMAINS + domain) / ELEMENTS
     else:
         rstd = tl.load(inverse + domain)
+    if HAS_WEIGHT and SHARED_BN:
+        gradient = gradient * tl.load(weight + c, valid, other=1).to(tl.float32)
     value = gradient * rstd
     tl.store(dx + (n * C + c) * S + s, value, valid)
 
@@ -70,12 +91,19 @@ def _partial_affine(dy, dy_scale, data, step, minimum, x, x_scale, mean, inverse
                      GROUP: tl.constexpr, WORDS: tl.constexpr, BITS: tl.constexpr,
                      NEED_DW: tl.constexpr, NEED_DB: tl.constexpr,
                      DY_META: tl.constexpr, X_META: tl.constexpr, BLOCK: tl.constexpr,
-                     center_shift=None, RECENTER: tl.constexpr = False):
+                     center_shift=None, RECENTER: tl.constexpr = False,
+                      derivative_input=None, DERIVATIVE_META: tl.constexpr = (),
+                      ACTIVATION: tl.constexpr = "", APPROXIMATE: tl.constexpr = "none",
+                      derivative_saved=None, derivative_step=None, derivative_minimum=None,
+                      PACKED_DERIVATIVE: tl.constexpr = False):
     c, part = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     offset = part * BLOCK + tl.arange(0, BLOCK)
     valid = offset < N * S
     n, s = offset // S, offset % S
     gradient = _load_input(dy, dy_scale, n, c, s, valid, C, S, DY_META)
+    gradient = _adjust_spatial_gradient(gradient, derivative_input, n, c, s, valid, C, S,
+                                        DERIVATIVE_META, ACTIVATION, APPROXIMATE,
+                                        derivative_saved, derivative_step, derivative_minimum, PACKED_DERIVATIVE)
     if NEED_DW:
         if BATCH:
             domain, position = c, offset

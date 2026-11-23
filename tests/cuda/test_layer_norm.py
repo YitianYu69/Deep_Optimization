@@ -12,9 +12,9 @@ import deepopt
 from deepopt.opt.nn import functional as doF
 from deepopt.opt.policy import normalization_plan, prepare_fp8_model
 from deepopt.opt.precision import precision_report
-from deepopt.opt.quantization.activation import quantize_pack_activation, dequantize_unpack_activation
 from deepopt.opt.quantization.activation_tensor import FP8Activation, to_fp8_activation, dequantize_activation
 from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
+from tests.opt.test_layer_norm_moments import restored_xhat
 
 
 if FP8_CUDA_SKIP_REASON and os.getenv("DEEPOPT_REQUIRE_CUDA_LAYER_NORM") == "1":
@@ -29,6 +29,31 @@ def policy(compressed=True, *, bits=2, group=512, block=None, recenter=False):
 
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
 class LayerNormCUDATests(unittest.TestCase):
+    def test_candidate_fused_backward_matches_decoded_baseline_with_bounded_scratch(self):
+        from deepopt.opt.backends._shared.normalization import normalization_kernel_scope
+
+        for bits in (1, 2, 4, 8):
+            raw = torch.randn(257, 65, device="cuda", dtype=torch.bfloat16)
+            weight = torch.randn(65, device="cuda")
+            gradient = torch.randn_like(raw)
+            results = []
+            for variant in ("baseline", "candidate", "layer_fused", "layer_tiled"):
+                x, w = raw.clone().requires_grad_(), weight.clone().requires_grad_()
+                b = torch.zeros_like(w, requires_grad=True)
+                info = {}
+                with normalization_kernel_scope(variant):
+                    y = doF.layer_norm(x, (65,), w, b, plan=policy(bits=bits, group=17, recenter=True), _execution_info=info)
+                y.backward(gradient)
+                results.append((y.detach(), x.grad, w.grad, b.grad))
+                if variant == "candidate":
+                    self.assertEqual(info["backward_variant"], "fused_rows")
+                    self.assertLessEqual(info["backward_scratch_bytes"], 2 * 4 * 65 * 4)
+                elif variant in ("layer_fused", "layer_tiled"):
+                    self.assertLessEqual(info["backward_scratch_bytes"], 8 * 2**20)
+            for result in results[1:]:
+                for actual, expected in zip(result, results[0]):
+                    torch.testing.assert_close(actual, expected, rtol=.02, atol=.02)
+
     def test_native_amp_and_affine_dtype_behavior(self):
         for dtype in (torch.float32, torch.bfloat16, torch.float16):
             for affine_dtype in (dtype, torch.float32):
@@ -62,8 +87,7 @@ class LayerNormCUDATests(unittest.TestCase):
                         inverse = torch.rsqrt(variance + 1e-5)
                         h = (matrix - mean[:, None]) * inverse[:, None]
                         group = min(17, w.numel())
-                        packed = quantize_pack_activation(h, group, (1, group), bits=4)
-                        decoded = dequantize_unpack_activation(packed, dtype=torch.float32)
+                        decoded, _, _ = restored_xhat(h, group, 4)
                         with deepopt.autocast("cuda", enabled=False, check_finite=False):
                             y = doF.layer_norm(source, norm, w, b, plan=policy(bits=4, group=17, block=block),
                                                output_dtype=output_dtype, output_layout="channels")

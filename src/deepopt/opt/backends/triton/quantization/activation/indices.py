@@ -1,6 +1,8 @@
 """Exact routing packing and tile-local extraction; no quantization."""
 
 import triton
+
+from ...._shared.operand_device import operand_device_guard
 import triton.language as tl
 
 
@@ -55,12 +57,14 @@ def _unpack(data, output, N: tl.constexpr, BITS: tl.constexpr, BLOCK: tl.constex
     tl.store(output + index, value, index < N)
 
 
+@operand_device_guard
 def pack(value, result):
     if result.bits and value.numel():
         _pack[(triton.cdiv(value.numel(), 32),)](value, result.data, value.numel(), tuple(value.shape), value.stride(),
                                                 result.bits, triton.next_power_of_2(min(result.bits, 32)))
 
 
+@operand_device_guard
 def unpack(value, result):
     if result.numel():
         _unpack[(triton.cdiv(result.numel(), 256),)](value.data, result, result.numel(), value.bits, 256)

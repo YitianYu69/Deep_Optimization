@@ -32,7 +32,7 @@ class ConfigTemplateWhiteBoxTests(unittest.TestCase):
             "bucket_cap_mb", "static_graph", "validation_sync_buffers",
         })
         self.assertEqual(set(template["runtime"]["cuda_graph"]), {
-            "device", "warmup", "allow_unused_input", "autograd", "capture_error_mode",
+            "enabled", "device", "warmup", "allow_unused_input", "autograd", "capture_error_mode",
         })
         self.assertEqual(set(template["loader"]), {
             "num_workers", "pin_memory", "persistent_workers", "prefetch_factor", "drop_last",

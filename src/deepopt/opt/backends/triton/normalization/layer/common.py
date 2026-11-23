@@ -4,9 +4,18 @@ import triton
 import triton.language as tl
 
 from ..recenter import _correct_xhat, _record_error
+from .moments import _record_layer_moments
 
 from ...activation.common import _load
 from ...quantization.activation.affine import _affine_step, _affine_quantize_pack_with_metadata
+
+
+@triton.jit
+def _statistics_from_values(value, valid, K: tl.constexpr, EPS: tl.constexpr):
+    mean = tl.sum(tl.where(valid, value / K, 0.0), 0)
+    delta = tl.where(valid, value - mean, 0.0)
+    inverse = tl.rsqrt(tl.sum(delta * delta, 0) / K + EPS)
+    return mean, inverse
 
 
 @triton.jit
@@ -15,10 +24,7 @@ def _row_statistics(x, x_inverse, row, K: tl.constexpr, SHAPE: tl.constexpr,
     position = tl.arange(0, BLOCK)
     valid = position < K
     _, value = _load(x, x_inverse, row, position, valid, K, SHAPE, False, META)
-    mean = tl.sum(tl.where(valid, value / K, 0.0), 0)
-    delta = tl.where(valid, value - mean, 0.0)
-    inverse = tl.rsqrt(tl.sum(delta * delta, 0) / K + EPS)
-    return mean, inverse
+    return _statistics_from_values(value, valid, K, EPS)
 
 
 @triton.jit
@@ -49,7 +55,8 @@ def _parameter(pointer, position, valid, NORM: tl.constexpr, STRIDES: tl.constex
 def _xhat(data, step, minimum, x, x_inverse, mean, inverse, row, position, valid,
            K: tl.constexpr, SHAPE: tl.constexpr, X_META: tl.constexpr,
            COMPRESSED: tl.constexpr, GROUP: tl.constexpr, WORDS: tl.constexpr, BITS: tl.constexpr,
-               center_shift=None, RECENTER: tl.constexpr = False):
+               center_shift=None, RECENTER: tl.constexpr = False,
+               moment_gain=None, MOMENTS: tl.constexpr = False):
     if COMPRESSED:
         group = row * triton.cdiv(K, GROUP) + position // GROUP
         offset = position % GROUP
@@ -60,7 +67,11 @@ def _xhat(data, step, minimum, x, x_inverse, mean, inverse, row, position, valid
         if BITS == 1:
             result = tl.where(scale < 0, (low * 0.5 + code * -scale) * 2, result)
         if RECENTER:
-            result, _ = _correct_xhat(result, inverse, center_shift, row, valid, True)
+            result, rstd = _correct_xhat(result, inverse, center_shift, row, valid, True)
+            if MOMENTS:
+                index = row + valid.to(tl.int64) * 0
+                gain = tl.load(moment_gain + index, valid, other=0)
+                result = tl.where((tl.abs(rstd) < float("inf")) & (rstd > 0), result * gain, result)
         return result
     else:
         _, value = _load(x, x_inverse, row, position, valid, K, SHAPE, False, X_META)
@@ -72,7 +83,8 @@ def _xhat(data, step, minimum, x, x_inverse, mean, inverse, row, position, valid
 def _quantize_pack_xhat_rows(values, valid, data, steps, minima, row,
                     GROUPS: tl.constexpr, PAD_GROUPS: tl.constexpr, PAD: tl.constexpr,
                     WORDS: tl.constexpr, BITS: tl.constexpr,
-                    center_shift=None, RECENTER: tl.constexpr = False):
+                    center_shift=None, RECENTER: tl.constexpr = False,
+                    moment_gain=None, MOMENTS: tl.constexpr = False):
     low = tl.min(tl.where(valid, values, float("inf")), 1)
     high = tl.max(tl.where(valid, values, float("-inf")), 1)
     step = _affine_step(low, high, BITS)
@@ -81,7 +93,11 @@ def _quantize_pack_xhat_rows(values, valid, data, steps, minima, row,
     words = _affine_quantize_pack_with_metadata(tl.reshape(values, (PAD_GROUPS * PAD,)),
                                                tl.reshape(valid, (PAD_GROUPS * PAD,)), flat_step, flat_low,
                                                BITS, PAD_GROUPS * PAD)
-    if RECENTER:
+    if MOMENTS:
+        _record_layer_moments(words, flat_step, flat_low, tl.reshape(values, (PAD_GROUPS * PAD,)),
+            tl.reshape(valid, (PAD_GROUPS * PAD,)), center_shift, center_shift, moment_gain,
+            row, 0, 1, 1, BITS, PAD_GROUPS * PAD)
+    elif RECENTER:
         _record_error(words, flat_step, flat_low, tl.reshape(values, (PAD_GROUPS * PAD,)),
                       tl.reshape(valid, (PAD_GROUPS * PAD,)), center_shift, center_shift,
                       row, 0, 1, 1, BITS, PAD_GROUPS * PAD)
@@ -108,7 +124,13 @@ def _provided_scale(scales, logical, valid, COLS: tl.constexpr, CHANNELS: tl.con
 def _xhat_rstd(data, step, minimum, x, x_inverse, mean, inverse, row, position, valid,
                 K: tl.constexpr, SHAPE: tl.constexpr, X_META: tl.constexpr,
                 COMPRESSED: tl.constexpr, GROUP: tl.constexpr, WORDS: tl.constexpr, BITS: tl.constexpr,
-                center_shift=None, RECENTER: tl.constexpr = False):
+                center_shift=None, RECENTER: tl.constexpr = False,
+                moment_gain=None, MOMENTS: tl.constexpr = False):
     h = _xhat(data, step, minimum, x, x_inverse, mean, inverse, row, position, valid,
               K, SHAPE, X_META, COMPRESSED, GROUP, WORDS, BITS)
-    return _correct_xhat(h, inverse, center_shift, row, valid, RECENTER)
+    h, rstd = _correct_xhat(h, inverse, center_shift, row, valid, RECENTER)
+    if MOMENTS:
+        index = row + valid.to(tl.int64) * 0
+        gain = tl.load(moment_gain + index, valid, other=0)
+        h = tl.where((tl.abs(rstd) < float("inf")) & (rstd > 0), h * gain, h)
+    return h, rstd

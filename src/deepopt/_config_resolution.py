@@ -8,6 +8,10 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 
+from ._bf16_policy import resolve_bf16_policy
+from ._packed_offload import resolve_packed_offload
+from ._memory_units import normalize_packed_offload_units
+
 from .config import (
     ConfigError, ExperimentConfig, TrainingConfig, _read_config,
     config_from_dict, get_config, training_config_from_dict,
@@ -32,6 +36,27 @@ def _merge(base, values):
             continue
         if isinstance(value, Mapping):
             previous = result.get(key)
+            if key == "packed_activation_offload":
+                # Normalize the explicit table before inheriting canonical byte
+                # defaults. Conflicts in one table still fail; GB overrides of
+                # an inherited byte budget replace that quantity as intended.
+                try:
+                    normalized = normalize_packed_offload_units(value)
+                except ValueError as error:
+                    raise ConfigError(f"packed_activation_offload: {error}") from error
+                if ("host_pinned_gb" not in value and "host_pinned_bytes" not in value
+                        and isinstance(previous, Mapping)
+                        and type(previous.get("host_pinned_bytes")) is int
+                        and previous["host_pinned_bytes"] > 0):
+                    # A default for a newly enabled GB route cannot replace an
+                    # inherited, explicitly configured positive host budget.
+                    normalized.pop("host_pinned_bytes", None)
+                value = normalized
+            if (key == "kernels" and value.get("backend") in ("inherit", "triton", "tilelang")
+                    and isinstance(previous, Mapping) and previous.get("backend") == "mixed"):
+                # An explicit mode switch replaces inherited Mixed routes.
+                # Partial changes within Mixed retain the normal deep merge.
+                previous = {}
             result[key] = _merge(previous if isinstance(previous, Mapping) else {}, value)
         else:
             result[key] = deepcopy(value)
@@ -64,7 +89,29 @@ def _validate_snapshot(raw, require_complete):
     # validation, then remove the scaffold's required values from the snapshot.
     scaffold = {"name": "_partial", "seed": 0,
                 "training": {"epochs": 1, "batch_size": 1, "learning_rate": 1.0}}
-    normalized = asdict(config_from_dict(_merge(scaffold, raw)))
+    validation_raw = raw
+    runtime = raw.get("runtime", {})
+    # Partial policy snapshots need not choose a device or AMP dtype yet.  The
+    # autocast/execution consumer checks the effective dtype before entering.
+    # Explicit fields still use the complete schema's cross-field validation.
+    try:
+        policy = resolve_bf16_policy(runtime.get("bf16_policy")) if isinstance(runtime, Mapping) else None
+    except ValueError as exc:
+        raise ConfigError(f"runtime.bf16_policy: {exc}") from exc
+    scaffold_runtime = {}
+    if policy is not None and policy.storage_enabled and not require_complete:
+        if "precision" not in runtime:
+            scaffold_runtime["precision"] = "bf16"
+        if "device" not in runtime:
+            scaffold_runtime["device"] = "cuda"
+        validation_raw = _merge({"runtime": scaffold_runtime}, raw)
+    normalized = asdict(config_from_dict(_merge(scaffold, validation_raw)))
+    # Descriptor-v1 snapshots retain their historical config wire shape;
+    # descriptor-v2 must carry its explicit physical-budget accounting version.
+    normalized["runtime"]["packed_activation_offload"] = resolve_packed_offload(
+        normalized["runtime"]["packed_activation_offload"]).as_config()
+    for field in scaffold_runtime:
+        normalized["runtime"].pop(field, None)
     for key in ("name", "seed"):
         if key not in raw:
             normalized.pop(key)
@@ -77,9 +124,11 @@ def _validate_snapshot(raw, require_complete):
         if section not in raw:
             normalized.pop(section)
     if "runtime" in normalized:
-        for policy in ("fp8", "activation_compression", "compile", "ddp", "cuda_graph", "precision"):
+        for policy in ("fp8", "activation_compression", "activation_memory", "packed_activation_offload", "compile", "ddp", "cuda_graph", "precision", "attention", "kernels", "bf16_policy"):
             if policy not in raw["runtime"]:
-                normalized["runtime"].pop(policy)
+                if policy == "packed_activation_offload" and policy in raw["runtime"].get("compile", {}).get("options", {}):
+                    continue
+                normalized["runtime"].pop(policy, None)
     # JSON round-trip gives snapshots independent mutable containers and turns
     # schema tuples into their portable checkpoint representation.
     return ResolvedConfig(json.loads(json.dumps(normalized, allow_nan=False)))

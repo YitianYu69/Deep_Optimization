@@ -31,43 +31,52 @@ def parser():
     result.add_argument("--outputs", nargs="+", choices=("bf16", "fp8"), default=["bf16", "fp8"])
     result.add_argument("--compression", nargs="+", choices=("off", "on"), default=["off", "on"])
     result.add_argument("--bits", type=int, choices=(1, 2, 4, 8), default=2)
-    result.add_argument("--group-size", type=int, default=512)
+    result.add_argument("--group-size", type=int, default=1024)
     result.add_argument("--fp8-block", type=shape)
     result.add_argument("--output-scaling", choices=("current", "provided"), default="current")
     result.add_argument("--execution", choices=("eager", "graph", "both"), default="eager")
     result.add_argument("--pipeline", choices=("none", "linear", "conv"), default="none")
+    result.add_argument("--deepopt-backend", choices=("triton", "tilelang", "mixed"), default="triton")
+    result.add_argument("--deepopt-kernel-policy", type=json.loads, default={},
+                        help="JSON runtime.kernels policy; its backend must match --deepopt-backend")
     result.add_argument("--device", default="cuda:0")
     result.add_argument("--warmup", type=int, default=10)
     result.add_argument("--iterations", type=int, default=100)
     result.add_argument("--repeats", type=int, default=5)
+    result.add_argument("--autotune", action=argparse.BooleanOptionalAction, default=False)
+    result.add_argument("--time-budget", type=float, default=2.0, help="Warm timing target per variant in seconds; 0 uses exhaustive counts")
     result.add_argument("--output", type=Path)
     return result
 
 
 def measure(step, args, torch, device):
-    for _ in range(args.warmup):
+    from deepopt._benchmarking import plan_timing
+    began = perf_counter()
+    plan = plan_timing(step, args, synchronize=lambda: torch.cuda.synchronize(device) if device.type == "cuda" else None)
+    for _ in range(plan.warmup):
         step()
     gc.collect()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
     walls, intervals = [], []
-    for _ in range(args.repeats):
+    for _ in range(plan.repeats):
         if device.type == "cuda":
             first, last = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             torch.cuda.synchronize(device)
             first.record()
         start = perf_counter()
-        for _ in range(args.iterations):
+        for _ in range(plan.iterations):
             step()
         if device.type == "cuda":
             last.record()
             last.synchronize()
-            intervals.append(first.elapsed_time(last) / args.iterations)
-        walls.append((perf_counter() - start) * 1000 / args.iterations)
+            intervals.append(first.elapsed_time(last) / plan.iterations)
+        walls.append((perf_counter() - start) * 1000 / plan.iterations)
     return {"wall_ms": walls, "wall_ms_median": median(walls), "cuda_stream_ms": intervals,
             "cuda_stream_ms_median": median(intervals) if intervals else None,
-            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None}
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+            "sampling": plan.sampling(perf_counter() - began)}
 
 
 def measurements(step, args, torch, device):
@@ -75,16 +84,19 @@ def measurements(step, args, torch, device):
     if args.execution in ("eager", "both"):
         report["eager"] = measure(step, args, torch, device)
     if args.execution in ("graph", "both"):
+        from deepopt._benchmarking import capture_warmup_steps
+        capture_steps = capture_warmup_steps(args)
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
-            for _ in range(max(3, args.warmup)):
+            for _ in range(capture_steps):
                 step()
         torch.cuda.current_stream(device).wait_stream(stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             captured_output = step()
         report["graph"] = measure(graph.replay, args, torch, device)
+        report["graph"]["capture_warmup_steps"] = capture_steps
         # Keep outputs and captured autograd buffers live through the measurement.
         del captured_output, graph
     return report
@@ -102,6 +114,18 @@ def main():
     if args.execution != "eager" and not args.device.startswith("cuda"):
         arguments.error("CUDA Graph measurement requires a CUDA device")
 
+    from deepopt._benchmarking import BenchmarkBackend, timing_plan_from_cost
+    try:
+        selection = BenchmarkBackend.from_args(args)
+        timing_plan_from_cost(args, 0.0)
+    except (TypeError, ValueError) as error:
+        arguments.error(str(error))
+    with selection.scope():
+        return run(args, arguments, selection)
+
+
+def run(args, arguments, selection):
+    kernel_config = selection.config
     import torch
     from torch import nn
     from torch.nn import functional as F
@@ -120,9 +144,9 @@ def main():
             raise SystemExit("An NVIDIA CUDA device is required")
         torch.cuda.set_device(device)
     torch.manual_seed(137)
-    backend = "triton" if device.type == "cuda" else "reference"
+    backend = selection.fp8_backend(device)
     report = {"deepopt": {"version": version("deep-optimization"), "path": str(Path(deepopt.__file__).resolve())},
-              "torch": torch.__version__, "device": str(device),
+              "torch": torch.__version__, "device": str(device), "kernel_backend": selection.metadata(device),
               "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "notes": ["Timing includes derivative preprocessing/packing, output scale preparation, backward decoding/casts and gradient clearing.",
                         "Operation input FP8 preparation is outside timing and uses leaf wrappers; pipeline input casting stays inside timing.",
@@ -159,15 +183,16 @@ def main():
             del native_model, native_x, native_dy
             for compressed in args.compression:
                 source = deepcopy(original)
-                cfg = deepopt.FP8Config(enabled=True, backend=backend, backward_precision="auto", grad_dtype="e5m2",
+                cfg = deepopt.FP8Config(enabled=True, backend=backend, autotune=args.autotune, backward_precision="auto", grad_dtype="e5m2",
                                        block_shapes={"activation": args.fp8_block, "weight": None, "grad": None})
-                model, _ = prepare_fp8_model(source, cfg, activation_compression={"enabled": compressed == "on", "bits": args.bits, "group_size": args.group_size})
+                model, _ = prepare_fp8_model(source, cfg, config=kernel_config,
+                    activation_compression={"enabled": compressed == "on", "bits": args.bits, "group_size": args.group_size})
                 x = data.clone().requires_grad_()
                 dy = torch.ones_like(x)
                 def pipeline_step():
                     clear((x, *model.parameters()))
                     with deepopt.autocast(device.type, enabled=device.type == "cuda", dtype=torch.bfloat16,
-                                          fp8=cfg, check_finite=False):
+                                          fp8=cfg, check_finite=False, config=kernel_config):
                         y = model(x)
                     y.backward(dy)
                     return y
@@ -197,8 +222,10 @@ def main():
                                       "timing": measurements(native_step, args, torch, device)})
             for output_type in args.outputs:
                 for compressed in args.compression:
-                    plan = activation_plan(fp8={"enabled": True, "backend": backend, "block_shapes": {"activation": args.fp8_block}},
-                                           activation_compression={"enabled": compressed == "on", "bits": args.bits, "group_size": args.group_size})
+                    plan = activation_plan(fp8={"enabled": True, "backend": backend, "autotune": args.autotune,
+                                               "block_shapes": {"activation": args.fp8_block}},
+                                           activation_compression={"enabled": compressed == "on", "bits": args.bits, "group_size": args.group_size},
+                                           config=kernel_config)
                     info = {}
                     dtype = torch.float8_e4m3fn if output_type == "fp8" else torch.bfloat16
                     rows, cols = data.numel() // args.shape[-1], args.shape[-1]
@@ -206,7 +233,7 @@ def main():
                     scale = torch.ones(scale_shape, device=device) if output_type == "fp8" and args.output_scaling == "provided" else None
                     def step():
                         clear((x,))
-                        with deepopt.autocast(device.type, enabled=False, check_finite=False):
+                        with deepopt.autocast(device.type, enabled=False, check_finite=False, config=kernel_config):
                             y = getattr(doF, kind)(x, plan=plan, output_dtype=dtype, output_scale=scale,
                                                   _execution_info=info, **native_options)
                         y.backward(dy)

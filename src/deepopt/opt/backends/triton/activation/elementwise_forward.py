@@ -14,8 +14,9 @@ def _statistics(data, inverse, partial_min, partial_max,
                 ROWS: tl.constexpr, COLS: tl.constexpr, SHAPE: tl.constexpr,
                 CHANNELS: tl.constexpr, META: tl.constexpr, KIND: tl.constexpr, APPROXIMATE: tl.constexpr,
                 GROUP: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr, PARTS: tl.constexpr,
-                DERIVATIVE: tl.constexpr, BLOCK: tl.constexpr):
-    group, part = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+                DERIVATIVE: tl.constexpr, BLOCK: tl.constexpr, FLAT_GRID: tl.constexpr = False):
+    pid = tl.program_id(0).to(tl.int64)
+    group, part = (pid // PARTS, pid % PARTS) if FLAT_GRID else (pid, tl.program_id(1).to(tl.int64))
     offset = part * BLOCK + tl.arange(0, BLOCK)
     row, col, valid = _coordinates(group, offset, ROWS, COLS, GROUP, BR, BC)
     _, x = _load(data, inverse, row, col, valid, COLS, SHAPE, CHANNELS, META)
@@ -29,8 +30,9 @@ def _statistics(data, inverse, partial_min, partial_max,
 
 @triton.jit
 def _reduce_ranges(minimum, maximum, out_min, out_max, PARTS: tl.constexpr,
-                   NEXT: tl.constexpr, BLOCK: tl.constexpr):
-    group, part = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+                   NEXT: tl.constexpr, BLOCK: tl.constexpr, FLAT_GRID: tl.constexpr = False):
+    pid = tl.program_id(0).to(tl.int64)
+    group, part = (pid // NEXT, pid % NEXT) if FLAT_GRID else (pid, tl.program_id(1).to(tl.int64))
     offset = part * BLOCK + tl.arange(0, BLOCK)
     lo = tl.load(minimum + group * PARTS + offset, offset < PARTS, other=float("inf"))
     hi = tl.load(maximum + group * PARTS + offset, offset < PARTS, other=float("-inf"))
@@ -48,8 +50,11 @@ def _activation_forward(data, inverse, output, saved, steps, minima, scales, out
                         FP8: tl.constexpr, REUSE: tl.constexpr, CURRENT: tl.constexpr, OBR: tl.constexpr, OBC: tl.constexpr,
                         SCALE_COLS: tl.constexpr, MAXIMUM: tl.constexpr, INPLACE: tl.constexpr,
                         OBSERVE: tl.constexpr, SNAPSHOT: tl.constexpr, CHECK: tl.constexpr,
-                        PARTS: tl.constexpr, BLOCK: tl.constexpr):
-    group, part = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+                        PARTS: tl.constexpr, BLOCK: tl.constexpr, FLAT_GRID: tl.constexpr = False,
+                        SAVE_INPUT: tl.constexpr = False, output_words=None, output_steps=None, output_minima=None,
+                        OUTPUT_PACK: tl.constexpr = False):
+    pid = tl.program_id(0).to(tl.int64)
+    group, part = (pid // PARTS, pid % PARTS) if FLAT_GRID else (pid, tl.program_id(1).to(tl.int64))
     offset = part * BLOCK + tl.arange(0, BLOCK)
     row, col, valid = _coordinates(group, offset, ROWS, COLS, GROUP, BR, BC)
     _, x = _load(data, inverse, row, col, valid, COLS, SHAPE, CHANNELS, META)
@@ -74,9 +79,25 @@ def _activation_forward(data, inverse, output, saved, steps, minima, scales, out
     if INPLACE:
         destination, _, _ = _address(row, col, COLS, SHAPE, CHANNELS, META)
     if FP8:
-        tl.store(output + destination, result.to(output.dtype.element_ty, fp_downcast_rounding="rtne"), valid)
+        rounded_output = result.to(output.dtype.element_ty, fp_downcast_rounding="rtne")
+        tl.store(output + destination, rounded_output, valid)
+        if OUTPUT_PACK:
+            out_words, out_step, out_minimum = _affine_quantize_pack(rounded_output.to(tl.float32), valid, BITS, BLOCK)
+            out_offsets = tl.arange(0, BLOCK // (32 // BITS))
+            tl.store(output_words + group * WORDS + out_offsets, out_words, out_offsets < WORDS)
+            tl.store(output_steps + group, out_step)
+            tl.store(output_minima + group, out_minimum)
     else:
-        tl.store(output + destination, result.to(output.dtype.element_ty), valid)
+        rounded_output = result.to(output.dtype.element_ty)
+        tl.store(output + destination, rounded_output, valid)
+        if OUTPUT_PACK:
+            tl.static_assert(SAVE and PACKED and not PRECOMPUTED and PARTS == 1,
+                             "BF16 rounded output packing requires one complete saved-derivative group")
+            out_words, out_step, out_minimum = _affine_quantize_pack(rounded_output.to(tl.float32), valid, BITS, BLOCK)
+            out_offsets = tl.arange(0, BLOCK // (32 // BITS))
+            tl.store(output_words + group * WORDS + out_offsets, out_words, out_offsets < WORDS)
+            tl.store(output_steps + group, out_step)
+            tl.store(output_minima + group, out_minimum)
     if SAVE:
         if KIND == "relu6":
             if PACKED:
@@ -95,7 +116,7 @@ def _activation_forward(data, inverse, output, saved, steps, minima, scales, out
                 tl.store(minima + group, minimum)
             word_offset = part * (BLOCK // (32 // BITS)) + tl.arange(0, BLOCK // (32 // BITS))
             tl.store(saved + group * WORDS + word_offset, words, word_offset < WORDS)
-        else:
+        elif not SAVE_INPUT:
             tl.store(saved + row * COLS + col, derivative, valid)
     if OBSERVE:
         tl.store(observations + group * PARTS + part, tl.max(tl.where(valid, tl.abs(y), 0.0), 0))

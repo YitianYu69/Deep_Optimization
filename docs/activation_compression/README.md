@@ -1,10 +1,10 @@
 # Saved-activation compression
 
-[Documentation index](../README.md) · [FP8 guide](../fp8/README.md) · [Benchmark catalog](../../benchmarks/README.md)
+See [FlashAttention-2 and attention alignment](flash_attention_2.md) for the
+optional installed attention kernels, gradient-direction comparisons and ViT
+stability runner.
 
-See [performance recovery](performance_recovery.md) for the H100 bottleneck,
-tiled unpack/transpose implementation, compatibility fixes and target-GPU
-validation commands.
+[Documentation index](../README.md) · [FP8 guide](../fp8/README.md) · [Benchmark catalog](../../benchmarks/README.md)
 
 Affine compression reduces the activations retained for linear weight
 gradients. Forward still computes with the original FP8 or BF16 activation.
@@ -39,6 +39,17 @@ The FP8 and activation-compression sections are independent:
 The native compression row assumes BF16 compute, selected by native AMP or
 BF16 inputs. The Trainer and autocast scope apply this configuration directly;
 standalone functional calls use `linear_plan(config=...)` to resolve it once.
+
+Use the [training stability diagnostic](../../benchmarks/analysis/diagnose_training_stability.py)
+to investigate gradient and optimizer differences on a matched batch.
+
+Compressed [LayerNorm](../normalization/layer_norm.md) always centers decoded
+normalized activations and restores their forward second moment before input
+and affine-weight gradients use them. This is mandatory whenever compression
+is enabled, including when `norm_xhat_recenter = false`. The recenter option
+controls BatchNorm and GroupNorm. Compression-enabled exact checkpoints record
+this numerical recipe; old checkpoints require their original library or a
+new run initialized from model weights.
 
 It is disabled by default. The default group size is 512 for BF16 and for
 tensorwise FP8. A positive `group_size` explicitly selects a different group

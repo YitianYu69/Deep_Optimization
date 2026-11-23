@@ -9,24 +9,29 @@ from .activation.elementwise_modules import CONVERSIONS
 from .normalization.modules import DOBatchNorm2d, DOGroupNorm, DOLayerNorm
 from .pooling.modules import CONVERSIONS as POOL_CONVERSIONS
 from .convolution_transpose.modules import CONVERSIONS as TRANSPOSE_CONVERSIONS
+from .linear import DOLinear
 
 
-def prepare_native_operations(model, compression, exclusions=()):
+def prepare_native_operations(model, compression, exclusions=(), *, bf16_policy=None):
     from ..transform import TransformReport, excluded_module_ids
 
     excluded, names = excluded_module_ids(model, exclusions)
     replacements, visited, converted = {}, set(), []
-    plan = {"fp8": False, "activation_compression": asdict(compression)}
+    from deepopt._bf16_policy import resolve_bf16_policy
+    from .attention import DOMultiheadAttention
+    plan = {"fp8": False, "activation_compression": asdict(compression),
+            "bf16_policy": resolve_bf16_policy(bf16_policy).as_dict()}
 
     def convert(module, path):
         if id(module) in excluded:
             return module
         if id(module) in replacements:
             return replacements[id(module)]
-        target = {nn.BatchNorm2d: DOBatchNorm2d, nn.GroupNorm: DOGroupNorm, nn.LayerNorm: DOLayerNorm, nn.ReLU: DOReLU,
+        target = {nn.Linear: DOLinear, nn.BatchNorm2d: DOBatchNorm2d, nn.GroupNorm: DOGroupNorm, nn.LayerNorm: DOLayerNorm, nn.ReLU: DOReLU,
+                  nn.MultiheadAttention: DOMultiheadAttention,
                   **CONVERSIONS, **POOL_CONVERSIONS, **TRANSPOSE_CONVERSIONS}.get(type(module))
         if target is not None:
-            replacement = target(module, plan=plan)
+            replacement = target(module, plan=plan, native_bf16_only=True) if target is DOLinear else target(module, plan=plan)
             replacements[id(module)] = replacement
             converted.append(path or "<root>")
             return replacement

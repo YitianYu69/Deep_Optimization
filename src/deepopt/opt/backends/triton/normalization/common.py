@@ -26,7 +26,9 @@ def input_arguments(x):
 @triton.jit
 def _coordinates(domain, position, C: tl.constexpr, S: tl.constexpr, G: tl.constexpr, BATCH: tl.constexpr):
     if BATCH:
-        n, c = position // S, domain
+        # Affine parameter loads use the element mask. Keep their pointers at
+        # that block rank even though every lane belongs to the same channel.
+        n, c = position // S, domain + position * 0
     else:
         n, c = domain // G, domain % G * (C // G) + position // S
     return n, c, position % S
@@ -38,15 +40,15 @@ def _load_input(data, scales, n, c, s, valid, C: tl.constexpr, S: tl.constexpr, 
         address = n * META[1][0] + c * META[1][1]
         for axis in tl.static_range(len(META[2])):
             address += (s // META[3][axis] % META[2][axis]) * META[1][axis + 2]
-        return tl.load(data + address, valid, other=0).to(tl.float32)
+        return tl.load(data + address, valid, other=0.0).to(tl.float32)
     else:
         if META[0] == 1:
             row, col = n * S + s, c
         else:
             logical = (n * C + c) * S + s
             row, col = logical // META[10], logical % META[10]
-        q = tl.load(data + row * META[4] + col * META[5], valid, other=0).to(tl.float32)
-        inverse = tl.load(scales + row // META[6] * META[8] + col // META[7] * META[9], valid, other=0)
+        q = tl.load(data + row * META[4] + col * META[5], valid, other=0.0).to(tl.float32)
+        inverse = tl.load(scales + row // META[6] * META[8] + col // META[7] * META[9], valid, other=0.0)
         return q * inverse
 
 

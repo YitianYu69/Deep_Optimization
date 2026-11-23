@@ -48,6 +48,18 @@ def build_source(spec, device):
         def forward(self, q, k, v):
             return F.scaled_dot_product_attention(q, k, v, **self.options)
 
+    class Multiply(nn.Module):
+        def forward(self, left, right):
+            return torch.mul(left, right)
+
+    class Padding(nn.Module):
+        def __init__(self, settings):
+            super().__init__()
+            self.options = settings
+
+        def forward(self, value):
+            return F.pad(value, **self.options)
+
     class MHA(nn.Module):
         def __init__(self, width, settings):
             super().__init__()
@@ -94,7 +106,17 @@ def build_source(spec, device):
             return value + self.mlp(value)
 
     inputs = (x,)
-    if op in ("linear", "hf_conv1d"):
+    if op == "mul":
+        other_shape = options.pop("other_shape", shape)
+        if (not isinstance(other_shape, (list, tuple))
+                or any(type(n) is not int or n < 1 for n in other_shape) or options):
+            raise ValueError("mul accepts only a positive other_shape")
+        torch.broadcast_shapes(shape, tuple(other_shape))
+        inputs = (x, torch.randn(tuple(other_shape), device=device, dtype=x.dtype))
+        model = Multiply()
+    elif op == "pad":
+        model = Padding(options)
+    elif op in ("linear", "hf_conv1d"):
         width = options.pop("out_features", shape[-1])
         if op == "hf_conv1d":
             try:
@@ -196,6 +218,14 @@ def functional_call(source, op, inputs, plan, runtime, scaling_state=None, info=
     from deepopt.opt.quantization.activation_tensor import FP8Activation
 
     x = inputs[0]
+    if op in ("mul", "pad"):
+        if any(isinstance(value, FP8Activation) for value in inputs):
+            raise UnsupportedWorkload("mul/pad require native inputs; FP8 input storage is unsupported")
+        if runtime["output_dtype"] != "auto" or runtime["output_scaling"] != "current":
+            raise UnsupportedWorkload("mul/pad preserve native output dtype without explicit output scaling")
+        if op == "mul":
+            return doF.do_mul(*inputs, plan=plan, _execution_info=info)
+        return doF.do_pad(x, **source.options)
     training = plan.get("fp8_training")
     controls = {"plan": plan, "_execution_info": info}
     if training and runtime["output_dtype"] != "auto":

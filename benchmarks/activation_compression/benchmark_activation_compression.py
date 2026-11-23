@@ -42,7 +42,7 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--shape", type=parse_shape, default=(4096, 768, 3072), metavar="MxKxN")
     result.add_argument("--paths", choices=("fp8", "bf16"), nargs="+", default=["fp8", "bf16"])
-    result.add_argument("--group-size", type=int, default=512)
+    result.add_argument("--group-size", type=int, default=1024)
     result.add_argument("--fp8-block", type=parse_block, help="activation scale rectangle; overrides compression group size")
     result.add_argument("--scaling-recipe", choices=("current", "delayed"), default="current")
     result.add_argument("--backward-backend", choices=("inherit", "native_fast", "native_precise"), default="inherit")

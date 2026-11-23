@@ -3,7 +3,8 @@
 from importlib import import_module
 
 __all__ = ["MemoryEstimationError", "TrainingMemoryEstimate", "estimate_training_memory",
-           "ModelMemorySummary", "summarize_model_memory", "log_model_memory", "prepare_batch_size"]
+           "ModelMemorySummary", "summarize_model_memory", "log_model_memory", "prepare_batch_size",
+           "admit_cuda_capacity", "cuda_capacity_admission"]
 
 _EXPORTS = {
     "MemoryEstimationError": ".estimation",
@@ -13,6 +14,8 @@ _EXPORTS = {
     "summarize_model_memory": ".statistics",
     "log_model_memory": ".statistics",
     "prepare_batch_size": ".planning",
+    "admit_cuda_capacity": ".capacity",
+    "cuda_capacity_admission": ".capacity",
 }
 
 

@@ -1,0 +1,39 @@
+{
+  "settings": {
+    "runtime": {
+      "execution": "graph",
+      "scope_lifetime": "reused",
+      "timing_fill_uninitialized_memory": false
+    }
+  },
+  "grid": {
+    "runtime.activation_pointwise_tile": [
+      512,
+      1024,
+      2048,
+      4096
+    ]
+  },
+  "workloads": [
+    {
+      "name": "vit_gelu",
+      "op": "gelu",
+      "shape": [
+        100864,
+        3072
+      ]
+    },
+    {
+      "name": "mlp",
+      "op": "linear_pipeline",
+      "shape": [
+        32,
+        197,
+        768
+      ],
+      "kwargs": {
+        "out_features": 3072
+      }
+    }
+  ]
+}

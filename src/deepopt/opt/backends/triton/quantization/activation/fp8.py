@@ -130,7 +130,8 @@ def _cast_quantize_pack_chunks(x, output, scales, packed, step, minimum, M, N, S
     tl.store(packed + group * WORDS + word_offsets, words, mask=word_offsets < WORDS)
 
 
-def _quantize_pack(x, scale, dtype, block_shape, group_size, *, observe=False, check_finite=False, snapshot=False, bits=2):
+def _quantize_pack(x, scale, dtype, block_shape, group_size, *, observe=False, check_finite=False, snapshot=False, bits=2,
+                   row_alignment=16):
     _validate_bits(bits)
     m, n = x.shape
     bm, bn = block_shape or (1, group_size)
@@ -138,7 +139,9 @@ def _quantize_pack(x, scale, dtype, block_shape, group_size, *, observe=False, c
     groups = (triton.cdiv(m, bm) * triton.cdiv(n, bn) if block_shape else
               triton.cdiv(m * n, group_size))
     words = triton.cdiv(elements, 32 // bits)
-    padded_n = triton.cdiv(n, 16) * 16
+    if type(row_alignment) is not int or row_alignment not in (1, 16):
+        raise ValueError("row_alignment must be 1 or 16")
+    padded_n = triton.cdiv(n, row_alignment) * row_alignment
     normal = torch.empty((m, padded_n), device=x.device, dtype=dtype)
     packed = torch.empty((groups, words), device=x.device, dtype=torch.int32)
     step = torch.empty(groups, device=x.device, dtype=torch.float32)
@@ -184,16 +187,17 @@ def _quantize_pack(x, scale, dtype, block_shape, group_size, *, observe=False, c
     return normal[:, :n], codec, saved_scale, observations if observe else None
 
 
-def quantize_pack_fp8_activation(x, dtype, block_shape, group_size, check_finite, *, bits=2):
+def quantize_pack_fp8_activation(x, dtype, block_shape, group_size, check_finite, *, bits=2, row_alignment=16):
     """Retain current scaling reductions; fuse FP8 casting and affine quantize/pack."""
     with torch.cuda.device(x.device):
         scale, inverse = _run_scaling(x, torch.finfo(dtype).max, block_shape, check_finite)
-        values, codec, _, _ = _quantize_pack(x, scale, dtype, block_shape, group_size, bits=bits)
+        values, codec, _, _ = _quantize_pack(x, scale, dtype, block_shape, group_size,
+                                           bits=bits, row_alignment=row_alignment)
     return values, inverse, codec
 
 
-def quantize_pack_delayed_fp8_activation(x, scale, dtype, group_size, *, observe, check_finite, bits=2):
+def quantize_pack_delayed_fp8_activation(x, scale, dtype, group_size, *, observe, check_finite, bits=2, row_alignment=16):
     """Fuse FP8 casting and affine quantize/pack with a snapshot of the scale."""
     with torch.cuda.device(x.device):
         return _quantize_pack(x, scale, dtype, None, group_size, observe=observe,
-                              check_finite=check_finite, snapshot=True, bits=bits)
+                              check_finite=check_finite, snapshot=True, bits=bits, row_alignment=row_alignment)

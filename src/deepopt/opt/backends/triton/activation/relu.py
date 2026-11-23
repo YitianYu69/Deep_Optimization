@@ -35,6 +35,31 @@ def _run_forward(x, geometry, *, dtype, block_shape, packed, save_mask, inplace,
             "mask": ("packed" if packed else "bool") if save_mask else "none"}
     if not count:
         return output, out_inverse, saved, None, None, info
+    if (not fp8 and not inplace and meta[0] == 0 and geometry.layout == "last"
+            and not observe and not capture_scale):
+        from deepopt.opt.backends._shared.activation_codec import channels_last_activation_plan
+        selection = channels_last_activation_plan(tuple(x.shape), tuple(x.stride()), 1024, x.device)
+        if selection is not None:
+            from .channels_last import _channels_last_activation, _channels_last_group_activation
+            from math import prod
+            spatial = prod(geometry.shape[2:])
+            period, channels = selection["period"], selection["channel_tile"]
+            output = output.reshape(geometry.shape[0], *geometry.shape[2:], geometry.shape[1]).movedim(-1, 1)
+            if selection["variant"] == "group_owned":
+                _channels_last_group_activation[(triton.cdiv(count, 1024),)](
+                    data, output, saved if saved is not None else output, output, output, output,
+                    geometry.shape[1], spatial, count, 1024, 32, "relu", "none", save_mask, packed, 1, False,
+                    selection["spatial_tile"], channels, 1024, num_warps=4, enable_fp_fusion=False)
+            else:
+                programs = triton.cdiv(geometry.shape[1], period * channels)
+                _channels_last_activation[(geometry.shape[0] * period * programs, triton.cdiv(spatial, 1024))](
+                    data, output, saved if saved is not None else output, output, output, output,
+                    geometry.shape[0], geometry.shape[1], spatial, 1024, triton.cdiv(count, 1024), 32,
+                    period, programs, "relu", "none", save_mask, packed, 1, False, 1024, channels,
+                    num_warps=4, enable_fp_fusion=False)
+            info.update(forward_variant="channels_last_group_owned" if selection["variant"] == "group_owned"
+                        else "channels_last_grouped", channel_phase=period, channel_tile=channels)
+            return output, None, saved, None, None, info
     current = fp8 and not reuse and scale is None
     small = current and block_shape is None and count <= 4096
     width = max(32, bc) if cols % 32 == 0 and br * max(32, bc) <= 16384 else bc
@@ -118,6 +143,18 @@ def backward(gradient, mask, geometry, *, packed, dtype, reuse=False, gradient_o
         data, inverse, meta = tensor_arguments(gradient)
         rows, cols = geometry.matrix_shape
         output = torch.empty((rows, cols), dtype=dtype, device=gradient.device)
+        if (geometry.layout == "last" and meta[0] == 0
+                and dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)):
+            from deepopt.opt.backends._shared.activation_codec import channels_last_activation_plan
+            selection = channels_last_activation_plan(tuple(gradient.shape), tuple(gradient.stride()), 1024, gradient.device)
+            if selection is not None:
+                from .channels_last import _channels_last_activation_dx
+                from math import prod
+                output = output.reshape(geometry.shape[0], *geometry.shape[2:], geometry.shape[1]).movedim(-1, 1)
+                _channels_last_activation_dx[(triton.cdiv(gradient.numel(), 1024),)](data, mask, output, output, output,
+                    geometry.shape[1], prod(geometry.shape[2:]), gradient.numel(), cols, 1024, 32, 1, True, packed,
+                    1024, num_warps=4, enable_fp_fusion=False)
+                return output
         if rows * cols:
             _backward[(triton.cdiv(rows * cols, 1024),)](
                 data, inverse, mask, output, rows, cols, geometry.shape, geometry.layout == "channels", meta,

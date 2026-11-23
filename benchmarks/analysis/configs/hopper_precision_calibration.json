@@ -1,0 +1,124 @@
+{
+  "settings": {
+    "compression": {
+      "bits": 8,
+      "group_size": 1024
+    },
+    "runtime": {
+      "scope_lifetime": "reused",
+      "numerical_probe": "random_upstream",
+      "optimizer": "adamw",
+      "lr": 0.0001,
+      "optimizer_warmup_steps": 10
+    }
+  },
+  "workloads": [
+    {
+      "name": "projection",
+      "op": "linear",
+      "shape": [
+        4096,
+        768
+      ],
+      "kwargs": {
+        "out_features": 3072
+      }
+    },
+    {
+      "name": "mlp",
+      "op": "linear_pipeline",
+      "shape": [
+        32,
+        197,
+        768
+      ],
+      "kwargs": {
+        "out_features": 3072
+      }
+    },
+    {
+      "name": "attention_block",
+      "op": "attention_pipeline",
+      "shape": [
+        32,
+        197,
+        768
+      ],
+      "kwargs": {
+        "num_heads": 12
+      }
+    },
+    {
+      "name": "ln_small",
+      "op": "layer_norm",
+      "shape": [
+        32,
+        197,
+        768
+      ],
+      "kwargs": {}
+    },
+    {
+      "name": "ln_vit",
+      "op": "layer_norm",
+      "shape": [
+        512,
+        197,
+        768
+      ],
+      "kwargs": {}
+    },
+    {
+      "name": "ln_wide",
+      "op": "layer_norm",
+      "shape": [
+        32,
+        197,
+        3072
+      ],
+      "kwargs": {}
+    },
+    {
+      "name": "bn_large",
+      "op": "batch_norm",
+      "shape": [
+        16,
+        64,
+        56,
+        56
+      ],
+      "kwargs": {}
+    },
+    {
+      "name": "gn_small",
+      "op": "group_norm",
+      "shape": [
+        16,
+        128,
+        7,
+        7
+      ],
+      "kwargs": {
+        "num_groups": 32
+      }
+    }
+  ],
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  }
+}

@@ -116,6 +116,7 @@ def analyze_backward(model, graph, settings, default_plan, mode):
         parent = node.args[0] if node.args else node.kwargs.get("input", node.kwargs.get("x"))
         original_parent = parent
         reason, selected = "unsupported or leaf backward boundary", None
+        autotune = default_plan["fp8_training"]["autotune"]
         if isinstance(parent, fx.Node):
             relay_fanout = len(_data_users(parent)) > 1
             while value_projection(parent) or global_pool_flatten(parent, graph):
@@ -135,6 +136,7 @@ def analyze_backward(model, graph, settings, default_plan, mode):
                 reason = cap.reason or "producer cannot emit FP8 with selected backend"
             elif target_cap is not None and target_cap.accepts_fp8:
                 target_training = target_plan["fp8_training"]
+                autotune = target_training["autotune"]
                 layout = target_cap.layout if target_cap.kind in ("linear", "convolution") else cap.layout
                 selected = GradientEdgePlan("fp8", str(target_training["fp8_dtypes"]["grad"]).removeprefix("torch.float8_"),
                                             layout, target_plan["block_shapes"]["grad"], target_training["scaling_recipe"],
@@ -151,7 +153,7 @@ def analyze_backward(model, graph, settings, default_plan, mode):
         if opaque:
             edge = GradientEdgePlan(reason="opaque Python call prevents reliable backward call-site analysis")
         name = f"{'train' if mode else 'eval'}_{node.name}"
-        slot = GradientSlot(edge, options, device=device)
+        slot = GradientSlot(edge, options, device=device, autotune=autotune)
         slot.train(mode)
         model._deepopt_gradient_edges[name] = slot
         path = "_deepopt_gradient_edges." + name

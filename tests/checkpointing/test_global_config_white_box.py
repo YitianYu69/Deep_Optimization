@@ -39,7 +39,7 @@ class GlobalCheckpointWhiteBoxTests(unittest.TestCase):
         trainer = self.trainer(ddp={"find_unused_parameters": False, "broadcast_buffers": True,
                                     "gradient_as_bucket_view": True, "static_graph": False,
                                     "validation_sync_buffers": True},
-                               cuda_graph={"warmup": 3, "autograd": True})
+                               cuda_graph={"enabled": True, "warmup": 3, "autograd": True})
         save_checkpoint(self.path, trainer, generators={}, history=[])
         for version in (4, 5):
             with self.subTest(version=version):
@@ -48,6 +48,14 @@ class GlobalCheckpointWhiteBoxTests(unittest.TestCase):
                 payload["config"]["runtime"].pop("ddp")
                 payload["config"]["runtime"].pop("cuda_graph")
                 self.assertEqual(restore_checkpoint(payload, trainer, trainer.config, generators={}), [])
+
+    def test_disabled_cuda_graph_switch_is_preserved_on_checkpoint_restore(self):
+        trainer = self.trainer(cuda_graph={"enabled": False})
+        save_checkpoint(self.path, trainer, generators={}, history=[])
+        payload = read_checkpoint(self.path)
+        self.assertFalse(payload["config"]["runtime"]["cuda_graph"]["enabled"])
+        resumed = self.trainer(cuda_graph={"enabled": False})
+        self.assertEqual(restore_checkpoint(payload, resumed, resumed.config, generators={}), [])
 
     def test_saved_compile_policy_is_checked_against_actual_trainer_on_default_resume(self):
         trainer = self.trainer(compile={"enabled": True, "backend": "eager"})

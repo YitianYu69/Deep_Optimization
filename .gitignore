@@ -26,6 +26,14 @@ wandb/
 
 # Local inspection and verification artifacts
 work/
+torch_compile_debug/
+
+# Saved TorchInductor runs, imports, and indexes are local development evidence.
+/compiler_references/*
+!/compiler_references/inductor/
+/compiler_references/inductor/*
+!/compiler_references/inductor/README.md
+/examples/vae/inductor_vae_v2_b16_224_*/
 
 # Configuration-named diagnostic logs
 logs/

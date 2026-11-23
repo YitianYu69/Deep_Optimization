@@ -20,7 +20,7 @@ SCRIPT = ROOT / "benchmarks/analysis/benchmark_do_ops.py"
 SPEC = importlib.util.spec_from_file_location("do_analysis_cli", SCRIPT)
 cli = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cli)
-from analysis.catalog import default_workload, normalize_workload
+from analysis.catalog import default_workload, normalize_workload, family, inventory
 from analysis.engine import Session
 from analysis.matrix import DEFAULT_SETTINGS, fingerprint, incompatibility, merge, variants
 from analysis.measurement import errors, snapshot
@@ -50,6 +50,19 @@ class AnalysisMatrixTests(unittest.TestCase):
         public = {node.name.removeprefix("do_") for node in module.body
                   if isinstance(node, ast.FunctionDef) and node.name.startswith("do_")}
         self.assertFalse(public - set(cli.OPS))
+
+    def test_pad_mul_plans_have_real_references_and_positive_group1024_shapes(self):
+        args = cli.parser().parse_args(["--device", "cpu", "--backend", "reference", "--small", "--ops", "pad", "mul"])
+        plan = cli.make_plan(args)
+        self.assertEqual(len(plan["tasks"]), 10)
+        references = {row["op"]: row["torch"] for row in inventory()}
+        self.assertEqual(references["mul"], "torch.mul")
+        self.assertEqual(references["pad"], "torch.nn.functional.pad")
+        self.assertEqual((family("mul"), family("pad")), ("binary", "padding"))
+        for task in plan["tasks"]:
+            self.assertIsNone(task["skip_reason"])
+            self.assertEqual(task["settings"]["compression"]["group_size"], 1024)
+            self.assertGreater(__import__("math").prod(task["workload"]["shape"]), 1024)
 
     def test_declared_cartesian_grid_is_exhaustive_and_sensitivity_is_deduplicated(self):
         grid = {"compression.bits": [2, 4], "fp8.backward_precision": ["native", "auto"]}
@@ -90,24 +103,42 @@ class AnalysisMatrixTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertGreater(result["tensors"]["parameter_grad.weight"]["relative_l2"], .23)
 
-    def test_report_recovers_known_19_second_interaction_and_gates_bad_accuracy(self):
+    def test_report_recovers_synthetic_interaction_and_gates_bad_accuracy(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = []
-            for case, seconds in (("torch_bf16", 21), ("do_bf16", 21), ("compression", 27), ("fp8", 22), ("fp8_compression", 47)):
+            for case, seconds in (("torch_bf16", 10), ("do_bf16", 10), ("compression", 12),
+                                  ("fp8", 13), ("fp8_compression", 20)):
                 path = Path(directory) / f"{case}.pt"
                 torch.save({"output.0": torch.tensor([2.0 if case == "fp8_compression" else 1.0])}, path)
                 rows.append({"status": "ok", "task": {"case": case, "variant_id": "same", "workload": default_workload("linear", True)},
                              "snapshot": str(path), "initial_state_sha256": "same",
                              "timing": {"wall_ms": {"median": seconds * 1000, "stdev": 0, "samples": [seconds * 1000]}, "cuda_stream_ms": None}})
-            report = summarize(rows, {"default": {"rtol": 0, "atol": 0}}, {"bf16": 21, "compression": 27, "fp8": 22, "combined": 47})
-            self.assertEqual(report["interactions"][0]["interaction_wall_ms"], 19000)
-            self.assertEqual(report["observed_epoch_context"]["interaction_seconds"], 19)
+            report = summarize(rows, {"default": {"rtol": 0, "atol": 0}},
+                               {"bf16": 10, "compression": 12, "fp8": 13, "combined": 20})
+            self.assertEqual(report["interactions"][0]["interaction_wall_ms"], 5000)
+            self.assertEqual(report["observed_epoch_context"]["interaction_seconds"], 5)
             last = next(row for row in report["comparisons"] if row["case"] == "fp8_compression")
             self.assertIsNone(last["qualified_wall_speedup_vs_torch"])
             self.assertIsNotNone(last["raw_wall_speedup_vs_torch"])
 
 
 class AnalysisExecutionTests(unittest.TestCase):
+    def test_reused_scope_avoids_constructor_and_random_probe_is_repeatable(self):
+        task, options = self.task(case="fp8_compression", update={"runtime": {"scope_lifetime": "reused", "numerical_probe": "random_upstream"}})
+        session = Session(task, options)
+        try:
+            first = snapshot(session)
+            with patch.object(session.deepopt, "autocast", side_effect=AssertionError("constructed again")):
+                second = snapshot(session)
+                session.step()
+            self.assertEqual(first.keys(), second.keys())
+            for key in first:
+                if first[key] is not None:
+                    self.assertTrue(torch.equal(first[key], second[key]), key)
+            self.assertEqual(session.snapshot_metadata["numerical_probe"], "random_upstream")
+        finally:
+            session.close()
+
     def task(self, op="linear", case="fp8_compression", update=None):
         settings = deepcopy(DEFAULT_SETTINGS)
         settings["fp8"]["backend"] = "reference"
@@ -118,6 +149,102 @@ class AnalysisExecutionTests(unittest.TestCase):
         task = {"id": fingerprint(settings), "settings": settings, "case": case,
                 "workload": normalize_workload(default_workload(op, True)), "variant_id": "test", "skip_reason": None}
         return task, options
+
+    def test_mul_workloads_execute_matching_codec_backward_for_all_bindings(self):
+        from deepopt.opt.nn import functional as doF
+        from deepopt.opt.quantization.activation import quantize_pack_activation, dequantize_unpack_activation
+
+        for binding in ("functional", "prepared", "intercept"):
+            for case in ("torch_bf16", "do_bf16", "compression", "fp8", "fp8_compression"):
+                with self.subTest(binding=binding, case=case):
+                    task, options = self.task("mul", case, {"runtime": {"binding": binding}})
+                    task["workload"].update(layout="strided", kwargs={"other_shape": [1, 1031]})
+                    session = Session(task, options)
+                    try:
+                        self.assertEqual(session.compression.group_size, 1024)
+                        left, right = session.inputs
+                        self.assertGreater(min(left.numel(), right.numel()), 1024)
+                        self.assertFalse(left.is_contiguous())
+                        with patch.object(doF, "do_mul", wraps=doF.do_mul) as called:
+                            output, _ = session.forward()
+                        self.assertEqual(called.call_count, int(case != "torch_bf16"))
+                        torch.testing.assert_close(output, left * right, rtol=0, atol=0)
+                        upstream = torch.randn_like(output)
+
+                        def coefficient(value):
+                            if case not in ("compression", "fp8_compression"):
+                                return value.detach()
+                            packed = quantize_pack_activation(value.detach(), 1024, bits=2)
+                            return dequantize_unpack_activation(packed, dtype=value.dtype, row_alignment=1)
+
+                        expected_left = (upstream * coefficient(right)).sum_to_size(left.shape)
+                        expected_right = (upstream * coefficient(left)).sum_to_size(right.shape)
+                        if case in ("compression", "fp8_compression"):
+                            self.assertEqual(output.grad_fn.descriptors[0][0], "packed")
+                            self.assertEqual(output.grad_fn.descriptors[0][5], 1024)
+                            self.assertGreater(session.info["saved_state_bytes"], 0)
+                        output.backward(upstream)
+                        torch.testing.assert_close(left.grad, expected_left, rtol=0, atol=0)
+                        torch.testing.assert_close(right.grad, expected_right, rtol=0, atol=0)
+                        # Execute the actual benchmark step as well as its oracle.
+                        session.clear()
+                        session.step()
+                        self.assertTrue(all(bool(torch.isfinite(value.grad).all()) for value in session.inputs))
+                    finally:
+                        session.close()
+
+    def test_pad_workloads_execute_exact_geometry_backward_with_compression_enabled(self):
+        from deepopt.opt.nn import functional as doF
+        from torch.nn import functional as F
+
+        for mode in ("constant", "reflect", "replicate", "circular"):
+            for case in ("torch_bf16", "do_bf16", "compression", "fp8", "fp8_compression"):
+                with self.subTest(mode=mode, case=case):
+                    task, options = self.task("pad", case, {"runtime": {"binding": "prepared"}})
+                    settings = {"pad": [-1, 2], "mode": mode}
+                    if mode == "constant":
+                        settings["value"] = .25
+                    task["workload"].update(layout="strided", kwargs=settings)
+                    session = Session(task, options)
+                    try:
+                        self.assertEqual(session.compression.group_size, 1024)
+                        value = session.inputs[0]
+                        self.assertGreater(value.numel(), 1024)
+                        reference = value.detach().clone().requires_grad_()
+                        with torch.autocast("cpu", dtype=torch.bfloat16):
+                            expected = F.pad(reference, **settings)
+                        with patch.object(doF, "do_pad", wraps=doF.do_pad) as called:
+                            output, _ = session.forward()
+                        self.assertEqual(called.call_count, int(case != "torch_bf16"))
+                        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                        upstream = torch.randn_like(output)
+                        expected.backward(upstream)
+                        # Padding's exact adjoint stores geometry, no value codec.
+                        with session.context():
+                            if case == "torch_bf16":
+                                actual = session.call(value)
+                            else:
+                                with torch.autograd.graph.saved_tensors_hooks(
+                                        lambda tensor: self.fail("Padding retained a tensor"), lambda tensor: tensor):
+                                    actual = session.call(value)
+                        actual.backward(upstream)
+                        torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
+                        session.clear()
+                        session.step()
+                        self.assertTrue(bool(torch.isfinite(value.grad).all()))
+                    finally:
+                        session.close()
+
+    def test_binary_family_ablation_disables_actual_multiplication_packing(self):
+        for families, enabled in (([], False), (["binary"], True)):
+            task, options = self.task("mul", "compression", {"runtime": {"compression_families": families}})
+            session = Session(task, options)
+            try:
+                output, _ = session.forward()
+                self.assertEqual(any(value.dtype == torch.int32 for value in output.grad_fn.saved_tensors), enabled)
+                session.backward(output.float().square().mean())
+            finally:
+                session.close()
 
     def test_snapshot_restores_optimizer_and_model_and_emits_real_gradients(self):
         task, options = self.task(update={"runtime": {"optimizer": "sgd"}})

@@ -10,6 +10,11 @@ from .tensor import QuantizedTensor
 from .._execution import finite_checks_enabled
 
 
+# Immutable, tensor-free strategy. Tensorwise training invokes this several
+# times per projection; payload validation and scale computation remain per call.
+_TENSORWISE_SCALING = AmaxScaling()
+
+
 @torch.no_grad()
 def quantize_fp8(
     x: torch.Tensor,
@@ -23,7 +28,7 @@ def quantize_fp8(
     """
 
     check_finite = finite_checks_enabled() if check_finite is None else check_finite
-    strategy = AmaxScaling(block_shape=block_shape)
+    strategy = _TENSORWISE_SCALING if block_shape is None else AmaxScaling(block_shape=block_shape)
     if x.device.type == "cuda":
         strategy._validate_input(x, fp8_dtype, check_finite)
         if isinstance(x, FakeTensor):
@@ -36,7 +41,8 @@ def quantize_fp8(
             data = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
             scale_inv = torch.empty(shape, device=x.device, dtype=torch.float32)
         else:
-            from deepopt.opt.backends.triton.quantization.fp8 import quantize
+            from deepopt.opt.backends.dispatch import backend_module
+            quantize = backend_module('quantization', 'quantization.fp8').quantize
 
             data, scale_inv = quantize(x, fp8_dtype, block_shape, check_finite)
         return QuantizedTensor(data=data, scale_inv=scale_inv, block_shape=block_shape)
@@ -57,7 +63,7 @@ def quantize_fp8(
         )
 
         scaled = x_fp32 * expanded_scales[:rows, :cols]
-    
+
     fp8_max = torch.finfo(fp8_dtype).max
     data = (
         scaled
@@ -74,25 +80,45 @@ def quantize_fp8(
 
 
 @torch.no_grad()
-def _quantize_tensorwise_pair(x, *, fp8_dtype=torch.float8_e4m3fn, block_shape=None, check_finite=None):
+def _quantize_tensorwise_pair(x, *, fp8_dtype=torch.float8_e4m3fn, block_shape=None, check_finite=None,
+                             autotune=True):
     """Internal training layout pair; neither output changes the scaling recipe."""
-    return _tensorwise_layouts(x, fp8_dtype, block_shape, check_finite, transpose_only=False)
+    return _tensorwise_layouts(x, fp8_dtype, block_shape, check_finite, transpose_only=False, autotune=autotune)
 
 
 @torch.no_grad()
-def _quantize_tensorwise_transpose(x, *, fp8_dtype, check_finite=None):
+def _quantize_tensorwise_transpose(x, *, fp8_dtype, check_finite=None, autotune=True):
     """Emit only the aligned orientation consumed by a weight-only backward."""
-    return _tensorwise_layouts(x, fp8_dtype, None, check_finite, transpose_only=True)[1]
+    return _tensorwise_layouts(x, fp8_dtype, None, check_finite, transpose_only=True, autotune=autotune)[1]
 
 
-def _tensorwise_layouts(x, fp8_dtype, block_shape, check_finite, *, transpose_only):
+@torch.no_grad()
+def _quantize_gradient_pair_and_bias(x, *, fp8_dtype, check_finite=None, transpose_only=False, autotune=True):
+    if type(autotune) is not bool:
+        raise ValueError("autotune must be a boolean")
+    check_finite=finite_checks_enabled() if check_finite is None else check_finite
+    _TENSORWISE_SCALING._validate_input(x,fp8_dtype,check_finite)
+    if x.device.type!="cuda" or isinstance(x,FakeTensor):
+        normal,transpose=_tensorwise_layouts(x,fp8_dtype,None,check_finite,transpose_only=transpose_only,
+                                             autotune=autotune)
+        return normal,transpose,x.sum(0,dtype=torch.float32)
+    from deepopt.opt.backends.dispatch import backend_module
+    quantize_gradient_pair_and_bias = backend_module('quantization', 'quantization.fp8').quantize_gradient_pair_and_bias
+    normal,inverse,transpose,bias=quantize_gradient_pair_and_bias(x,fp8_dtype,check_finite,
+                                                              transpose_only=transpose_only,autotune=autotune)
+    return (None if normal is None else QuantizedTensor(normal,inverse)),QuantizedTensor(transpose,inverse),bias
+
+
+def _tensorwise_layouts(x, fp8_dtype, block_shape, check_finite, *, transpose_only, autotune=True):
+    if type(autotune) is not bool:
+        raise ValueError("autotune must be a boolean")
     if block_shape is not None:
         raise ValueError("Paired quantization requires tensorwise scaling")
     check_finite = finite_checks_enabled() if check_finite is None else check_finite
     if x.device.type != "cuda":
         normal = quantize_fp8(x, fp8_dtype=fp8_dtype, check_finite=check_finite)
         return None if transpose_only else normal, normal.transpose()
-    AmaxScaling()._validate_input(x, fp8_dtype, check_finite)
+    _TENSORWISE_SCALING._validate_input(x, fp8_dtype, check_finite)
     if isinstance(x, FakeTensor):
         m, n = x.shape
         normal = (None if transpose_only else
@@ -100,8 +126,9 @@ def _tensorwise_layouts(x, fp8_dtype, block_shape, check_finite, *, transpose_on
         transposed = torch.empty_strided((n, m), (((m + 15) // 16) * 16, 1), device=x.device, dtype=fp8_dtype)
         inverse = torch.empty((1, 1), device=x.device, dtype=torch.float32)
     else:
-        from deepopt.opt.backends.triton.quantization.fp8 import quantize_tensorwise_pair
+        from deepopt.opt.backends.dispatch import backend_module
+        quantize_tensorwise_pair = backend_module('quantization', 'quantization.fp8').quantize_tensorwise_pair
 
-        options = {"transpose_only": True} if transpose_only else {}
+        options = {"autotune": autotune, **({"transpose_only": True} if transpose_only else {})}
         normal, inverse, transposed = quantize_tensorwise_pair(x, fp8_dtype, check_finite, **options)
     return None if transpose_only else QuantizedTensor(normal, inverse), QuantizedTensor(transposed, inverse)

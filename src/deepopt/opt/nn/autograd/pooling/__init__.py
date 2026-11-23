@@ -1,5 +1,7 @@
 """First-order pooling autograd; no raw-input activation shadows."""
 
+from deepopt.kernel_policy import kernel_forward, kernel_backward
+
 from contextlib import nullcontext
 
 import torch
@@ -13,6 +15,8 @@ from ....quantization.activation_tensor import FP8Activation
 from ....quantization.activation import PackedActivation
 from ....quantization.indices import PackedIndices
 from ...._execution import backward_finite_check_policy
+from .._output import restore_fresh_output
+from ....backends._shared.pooling import pooling_kernel_variant,saved_pooling_kernel
 
 
 def storage_bytes(tensors):
@@ -22,7 +26,9 @@ def storage_bytes(tensors):
 
 class PoolFunction(Function):
     @staticmethod
+    @kernel_forward
     def forward(ctx, x, g, settings, scaling_state, state_training, execution_info):
+        ctx.pooling_variant=pooling_kernel_variant()
         ctx.gradient_slot, ctx.gradient_check = capture_gradient(x), backward_finite_check_policy()
         ctx.geometry, ctx.backend, ctx.input_dtype = g, settings["backend"], x.dtype
         ctx.execution_info = execution_info
@@ -63,7 +69,7 @@ class PoolFunction(Function):
                                   saved_state_bytes=sum(t.numel() * t.element_size() for t in saved if t is not None),
                                   retained_storage_bytes=storage_bytes(saved), saved_raw_input_bytes=0)
         value = (FP8Activation(output, inverse, g.output_shape, settings["block_shape"], g.layout, settings["logical_dtype"])
-                 if inverse is not None else g.transport.restore(output))
+                 if inverse is not None else restore_fresh_output(output, g.transport.restore))
         if public is not None:
             ctx.mark_non_differentiable(public)
             return value, public
@@ -71,6 +77,8 @@ class PoolFunction(Function):
 
     @staticmethod
     @once_differentiable
+    @saved_pooling_kernel
+    @kernel_backward
     def backward(ctx, gradient, index_gradient=None):
         data, coefficient, step, minimum, factor, _, _, samples = ctx.saved_tensors
         routing = PackedIndices(data, *ctx.route_meta) if ctx.route_meta is not None else data

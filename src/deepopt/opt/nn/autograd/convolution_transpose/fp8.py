@@ -1,5 +1,7 @@
 """FP8 transposed convolution with unique-source activation compression."""
 
+from deepopt.kernel_policy import kernel_forward, kernel_backward
+
 import torch
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
@@ -20,6 +22,7 @@ from .native import _memory_format
 
 class _FP8ConvTransposeFunction(Function):
     @staticmethod
+    @kernel_forward
     def forward(ctx, x, weight, bias, geometry, plan, out_dtype, backward_enabled,
                 weight_cache, scaling_state, state_training, output_slot):
         settings, blocks = dict(plan["fp8_training"]), dict(plan["block_shapes"])
@@ -46,9 +49,10 @@ class _FP8ConvTransposeFunction(Function):
             if compress:
                 qx, packed = scaling_state.quantize_pack_activation(
                     matrix, group_size=compression["group_size"], bits=compression.get("bits", 2),
-                    training=state_training)
+                    training=state_training, autotune=settings["autotune"])
             else:
-                qx, _, _ = scaling_state.quantize(matrix, "activation", training=state_training)
+                qx, _, _ = scaling_state.quantize(matrix, "activation", training=state_training,
+                                                 autotune=settings["autotune"])
         elif compress:
             qx, packed = quantize_pack_fp8_activation(
                 matrix, fp8_dtype=types["activation"], block_shape=blocks["activation"],
@@ -61,7 +65,7 @@ class _FP8ConvTransposeFunction(Function):
         def quantizer(value, *, fp8_dtype, block_shape):
             matrix = value.reshape(geometry.weight_matrix_shape)
             if scaling_state is not None:
-                return scaling_state.quantize(matrix, "weight", training=state_training)[0]
+                return scaling_state.quantize(matrix, "weight", training=state_training, autotune=settings["autotune"])[0]
             return quantize_fp8(matrix, fp8_dtype=fp8_dtype, block_shape=block_shape)
 
         if scaling_state is not None:
@@ -84,7 +88,7 @@ class _FP8ConvTransposeFunction(Function):
         with output_scope as planned_output:
             output = executor.forward(qx, qw, geometry, backend=settings["backend"], bias=bias,
                                       out_dtype=torch.float32 if planned_output is not None else out_dtype,
-                                      num_stages=settings["num_stages"], output=planned_output)
+                                      num_stages=settings["num_stages"], autotune=settings["autotune"], output=planned_output)
         if not backward_enabled:
             return output if isinstance(output, FP8Activation) else restore_matrix(output, geometry.output_shape, _memory_format(x))
         ctx.save_for_backward(
@@ -106,6 +110,7 @@ class _FP8ConvTransposeFunction(Function):
 
     @staticmethod
     @once_differentiable
+    @kernel_backward
     def backward(ctx, grad_output):
         if ctx.scaling_state is None:
             return _FP8ConvTransposeFunction._backward(ctx, grad_output)
@@ -129,7 +134,8 @@ class _FP8ConvTransposeFunction(Function):
                 qg = supplied
             elif ctx.scaling_state is not None:
                 qg, _, db = ctx.scaling_state.quantize(
-                    matrix, "grad", bias=False, training=ctx.state_training, check_finite=ctx.check_finite)
+                    matrix, "grad", bias=False, training=ctx.state_training, check_finite=ctx.check_finite,
+                    autotune=settings["autotune"])
             else:
                 qg = quantize_fp8(matrix, fp8_dtype=settings["fp8_dtypes"]["grad"],
                                   block_shape=blocks["grad"], check_finite=ctx.check_finite)
@@ -139,11 +145,11 @@ class _FP8ConvTransposeFunction(Function):
                 if enabled(ctx.gradient_slot):
                     with ctx.gradient_slot.output(geometry.input_shape, ctx.input_dtype, check_finite=ctx.check_finite) as output:
                         dx = executor.input_gradient(qg, qw, geometry, backend=backend,
-                                                     out_dtype=torch.float32, num_stages=settings["num_stages"],
+                                                     out_dtype=torch.float32, num_stages=settings["num_stages"], autotune=settings["autotune"],
                                                      gradient_output=output)
                 else:
                     values = executor.input_gradient(qg, qw, geometry, backend=backend,
-                                                     out_dtype=ctx.input_dtype, num_stages=settings["num_stages"])
+                                                     out_dtype=ctx.input_dtype, num_stages=settings["num_stages"], autotune=settings["autotune"])
                     dx = restore_matrix(values, geometry.input_shape, ctx.input_format)
             if need_dw:
                 if ctx.compress:
@@ -153,7 +159,7 @@ class _FP8ConvTransposeFunction(Function):
                     x_data = dequantize_unpack_activation(packed, dtype=settings["fp8_dtypes"]["activation"])
                 qx = QuantizedTensor(x_data, x_scale, blocks["activation"])
                 values = executor.weight_gradient(qx, qg, geometry, backend=backend,
-                                                  out_dtype=ctx.compute_dtype, num_stages=settings["num_stages"])
+                                                  out_dtype=ctx.compute_dtype, num_stages=settings["num_stages"], autotune=settings["autotune"])
                 # Like linear FP8, accumulate compute-precision dW into the
                 # caller's master-parameter dtype through autograd promotion.
                 dw = values.reshape(geometry.weight_shape).to(ctx.weight_dtype)

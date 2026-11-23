@@ -1,0 +1,38 @@
+{
+  "settings": {
+    "compression": {
+      "bits": 2,
+      "group_size": 1024,
+      "norm_xhat_recenter": true
+    },
+    "runtime": {
+      "execution": "graph",
+      "binding": "prepared",
+      "scope_lifetime": "reused",
+      "timing_fill_uninitialized_memory": false,
+      "norm_row_chunk": 1,
+      "norm_max_programs": 528,
+      "numerical_probe": "random_upstream"
+    }
+  },
+  "grid": {
+    "runtime.norm_kernel_variant": [
+      "baseline",
+      "auto",
+      "layer_fused",
+      "layer_tiled"
+    ]
+  },
+  "workloads": [
+    {
+      "name": "norm_fp32_fp8_edge",
+      "op": "model",
+      "shape": [
+        512,
+        197,
+        768
+      ],
+      "factory": "analysis.example_model:build_norm_boundary"
+    }
+  ]
+}

@@ -10,6 +10,7 @@ from deepopt.opt.backends.triton.gemm.launch import selected_config, launch_sele
 
 
 _cache = {"cache_results": True} if "cache_results" in inspect.signature(triton.autotune).parameters else {}
+_fixed_config = triton.Config({"BM": 32, "BN": 32}, num_warps=4)
 
 
 @triton.autotune(configs=[triton.Config({"BM": 32, "BN": 32}, num_warps=4),
@@ -70,13 +71,15 @@ def _finish_bias(partials, rows, n):
     return partials[:1].view(n)
 
 
-def convert(x, scale, dtype, *, normal, transposed, bias, observe, check_finite):
+def convert(x, scale, dtype, *, normal, transposed, bias, observe, check_finite, autotune=True):
+    if type(autotune) is not bool:
+        raise ValueError("autotune must be a boolean")
     m, n = x.shape
     pm, pn = triton.cdiv(m, 16) * 16, triton.cdiv(n, 16) * 16
     with torch.cuda.device(x.device):
         key = conversion_cache_key(x, scale, dtype, normal=normal, transposed=transposed, bias=bias,
                                    observe=observe, check_finite=check_finite)
-        bm, bn = scratch_tile(_convert, key)
+        bm, bn = scratch_tile(_convert, key) if autotune else (32, 32)
         snapshot = torch.empty(2, device=x.device, dtype=torch.float32)
         values = torch.empty((m, pn), device=x.device, dtype=dtype) if normal else None
         transpose = torch.empty((n, pm), device=x.device, dtype=dtype) if transposed else None
@@ -87,7 +90,7 @@ def convert(x, scale, dtype, *, normal, transposed, bias, observe, check_finite)
         args = (x, scale, dummy, transpose if transposed else dummy, snapshot, amax, db, errors, m, n, *x.stride())
         kwargs = dict(PAD_M=pm, PAD_N=pn, NORMAL=normal, TRANSPOSE=transposed, BIAS=bias,
                       OBSERVE=observe, CHECK=check_finite, DEVICE=x.device.index, MAXIMUM=torch.finfo(dtype).max)
-        selected = selected_config(_convert, key)
+        selected = selected_config(_convert, key) if autotune else _fixed_config
         if selected is None:
             _convert[lambda meta: (triton.cdiv(m, meta["BM"]), triton.cdiv(n, meta["BN"]))](*args, **kwargs)
             selected = selected_config(_convert, key)

@@ -167,16 +167,31 @@ class GlobalConfigResolutionTests(unittest.TestCase):
 
     def test_framework_sections_validate_without_native_objects_or_cuda(self):
         raw = {**settings(), "runtime": {"ddp": {"broadcast_buffers": False, "bucket_cap_mb": 12},
-                                          "cuda_graph": {"device": "cuda:1", "warmup": 2, "autograd": False}},
+                                          "cuda_graph": {"enabled": False, "device": "cuda:1", "warmup": 2, "autograd": False}},
                "loader": {"num_workers": 2, "prefetch_factor": 3, "persistent_workers": True},
                "logging": {"level": "warning", "file_level": "DEBUG"}}
         resolved = resolve_config(config_from_dict(raw))
         self.assertEqual(resolved["runtime"]["ddp"]["bucket_cap_mb"], 12.)
         self.assertEqual(resolved["runtime"]["cuda_graph"]["device"], "cuda:1")
+        self.assertFalse(resolved["runtime"]["cuda_graph"]["enabled"])
         self.assertEqual(resolved["logging"]["level"], "WARNING")
         self.assertEqual(json.loads(json.dumps(resolved)), resolved)
         with self.assertRaisesRegex(ConfigError, "requires num_workers"):
             resolve_config(resolved, overrides={"loader": {"num_workers": 0}})
+
+    def test_cuda_graph_enabled_switch_roundtrips_through_toml_and_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "graphs.toml"
+            for enabled in (False, True):
+                with self.subTest(enabled=enabled):
+                    path.write_text('name = "graphs"\nseed = 7\n'
+                                    '[training]\nepochs = 1\nbatch_size = 2\nlearning_rate = 0.01\n'
+                                    f'[runtime.cuda_graph]\nenabled = {str(enabled).lower()}\n')
+                    parsed = load_config(path)
+                    self.assertIs(parsed.runtime.cuda_graph["enabled"], enabled)
+                    self.assertEqual(config_from_dict(asdict(parsed)), parsed)
+                    snapshot = resolve_config(path)
+                    self.assertIs(snapshot["runtime"]["cuda_graph"]["enabled"], enabled)
 
     def test_section_extraction_returns_owned_data_and_honors_absent_default(self):
         self.assertEqual(resolve_section(None, "runtime.ddp", default={}), {})
@@ -200,6 +215,9 @@ class GlobalConfigResolutionTests(unittest.TestCase):
             {"runtime": {"ddp": {"static_graph": 1}}},
             {"runtime": {"ddp": {"bucket_cap_mb": 0}}},
             {"runtime": {"cuda_graph": {"device": "cpu"}}},
+            {"runtime": {"cuda_graph": {"enabled": 1}}},
+            {"runtime": {"cuda_graph": {"enabled": "false"}}},
+            {"runtime": {"cuda_graph": {"enabled": None}}},
             {"runtime": {"cuda_graph": {"warmup": 0}}},
             {"runtime": {"cuda_graph": {"capture_error_mode": "unknown"}}},
             {"loader": {"num_workers": True}},

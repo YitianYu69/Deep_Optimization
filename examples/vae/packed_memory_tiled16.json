@@ -1,0 +1,13 @@
+{
+  "fuse_norm_cat_body": false,
+  "donate_fresh_backward_add": false,
+  "native_conv_backward_order": "source",
+  "cuda_conv_dx_geometry": false,
+  "fuse_norm_activation_residuals": false,
+  "norm_activation_fusion_stage": "off",
+  "fuse_swiglu_residuals": false,
+  "swiglu_fusion_stage": "off",
+  "native_conv_workspace_reuse": "tiled_dx",
+  "native_conv_dx_batch_size": 16,
+  "packed_offload_selection_mode": "peak"
+}

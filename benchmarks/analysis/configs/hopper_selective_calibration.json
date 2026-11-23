@@ -1,0 +1,76 @@
+{
+  "settings": {
+    "compression": {
+      "bits": 8,
+      "group_size": 1024
+    },
+    "runtime": {
+      "scope_lifetime": "reused",
+      "numerical_probe": "random_upstream",
+      "optimizer": "adamw",
+      "lr": 0.0001,
+      "optimizer_warmup_steps": 10
+    }
+  },
+  "workloads": [
+    {
+      "name": "mlp",
+      "op": "linear_pipeline",
+      "shape": [
+        32,
+        197,
+        768
+      ],
+      "kwargs": {
+        "out_features": 3072
+      }
+    },
+    {
+      "name": "attention_block",
+      "op": "attention_pipeline",
+      "shape": [
+        32,
+        197,
+        768
+      ],
+      "kwargs": {
+        "num_heads": 12
+      }
+    }
+  ],
+  "grid": {
+    "runtime.compression_bits_by_family": [
+      {},
+      {
+        "linear": 8,
+        "activation": 8,
+        "normalization": null,
+        "attention": 8
+      },
+      {
+        "linear": 4,
+        "activation": 8,
+        "normalization": 8,
+        "attention": 8
+      }
+    ]
+  },
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  }
+}

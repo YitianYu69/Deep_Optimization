@@ -229,7 +229,12 @@ the logging recipe demonstrates persistent capture explicitly.
 
 Tqdm remains a terminal display. Diagnostic messages cooperate with its progress
 bars. File logs contain completed-epoch metrics instead of carriage-return
-redraws. `progress_bar=False` / CLI `--no-progress` hides the bar; the console
+redraws. The default bar tracks optimizer updates within each epoch;
+`progress_bar="epoch"` selects a completed-epoch bar.
+Use `progress_bar_every_steps=N` to report running loss and every training
+metric every `N` optimizer updates. This terminal display is independent of
+recipe-owned step log callbacks; validation metrics are shown after evaluation.
+`progress_bar=False` / CLI `--no-progress` hides the bar; the console
 level controls ordinary diagnostic messages separately.
 
 ## Ownership and limits

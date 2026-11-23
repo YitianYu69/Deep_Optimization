@@ -1,0 +1,82 @@
+# BF16-only speed benchmark. Batch size is PER GPU; use the same value for every mode.
+# 8 fits the uncompressed baseline in the supplied H100 result. Override explicitly
+# with --batch-size when testing another matched workload.
+name = "mbconv_vae_v2_imagenet_benchmark"
+seed = 42
+
+[training]
+epochs = 80
+batch_size = 8
+learning_rate = 0.001
+accumulation_steps = 1
+optimizer = "custom"
+weight_decay = 0.00001
+momentum = 0.9
+lr_gamma = 1.0
+monitor = "loss"
+monitor_mode = "min"
+checkpoint_every_steps = 200
+scheduler_interval = "epoch"
+
+[training.ema]
+enabled = false
+decay = 0.95
+
+[application.model]
+base_channels = 32
+max_channels = 512
+latent_channels = 4
+blocks_per_stage = 2
+
+[application.data]
+train_dir = "data/imagenet/train"
+val_dir = "data/imagenet/val"
+image_size = 128
+resize_size = 148
+
+[schedules.beta]
+type = "linear_warmup"
+start = 0.0
+end = 0.000001
+duration = 10000
+interval = "update"
+
+[runtime]
+bf16_policy = "torch_amp"
+device = "cuda"
+precision = "bf16"
+deterministic = false
+execution_mode = "max_speed"
+checks = false
+fill_uninitialized_memory = false
+non_blocking = true
+
+[runtime.fp8]
+enabled = false
+
+[runtime.activation_compression]
+enabled = true # The benchmark overrides enabled separately for each mode.
+group_size = 1024
+bits = 2
+norm_xhat_recenter = true
+
+[runtime.compile]
+enabled = false # Only the separate torch-bf16-compiled case enables Inductor.
+
+[runtime.ddp]
+find_unused_parameters = false
+broadcast_buffers = true
+gradient_as_bucket_view = true
+bucket_cap_mb = 25.0
+static_graph = false
+validation_sync_buffers = true
+
+[loader]
+num_workers = 10
+pin_memory = true
+persistent_workers = true
+drop_last = true
+
+[logging]
+level = "WARNING"
+file_level = "WARNING"

@@ -7,14 +7,17 @@ __all__ = ["Trainer", "TrainingRuntime", "TrainingModule", "MultiOptimizer", "Fi
            "LossResult", "LossReport", "Checkpoint", "EveryNSteps",
            "initialize_distributed", "shutdown_distributed", "is_main_process", "DistributedContext", "TrainingCore", "DDPCore",
            "DiagnosticPolicy", "ExecutionMode", "CUDAGraphCore", "cuda_graph_core", "ScheduleController",
-           "autocast", "FP8Config", "DelayedScalingConfig", "ActivationCompressionConfig", "fp8_scaling_scope", "fp8_checkpoint", "ConfigError", "ExperimentConfig", "TrainingConfig", "RuntimeConfig", "CompileConfig",
+           "autocast", "FP8Config", "DelayedScalingConfig", "ActivationCompressionConfig", "ActivationMemoryConfig", "AttentionConfig", "fp8_scaling_scope", "fp8_checkpoint", "ConfigError", "ExperimentConfig", "TrainingConfig", "RuntimeConfig", "CompileConfig",
            "load_config", "get_config", "reset_config", "config_from_dict", "load_preset", "list_presets",
-           "load_config_template", "write_config_template"]
+           "load_config_template", "write_config_template", "KernelConfig", "kernel_policy_scope",
+           "register_operation", "SavedUse", "OperationState", "TensorMeta"]
 
 _MODULES = {"Trainer": ".engine", "TrainingRuntime": ".engine",
+            "register_operation": ".operations", "SavedUse": ".operations", "OperationState": ".operations", "TensorMeta": ".operations",
+            "KernelConfig": ".kernel_policy", "kernel_policy_scope": ".kernel_policy",
             "autocast": ".opt._autocast", "FP8Config": ".config",
             "DelayedScalingConfig": ".config", "fp8_scaling_scope": ".opt.scaling.delayed",
-            "ActivationCompressionConfig": ".config",
+            "ActivationCompressionConfig": ".config", "ActivationMemoryConfig": ".config", "AttentionConfig": ".config",
             "fp8_checkpoint": ".opt.scaling.delayed",
             "ConfigError": ".config", "ExperimentConfig": ".config", "TrainingConfig": ".config",
             "RuntimeConfig": ".config", "CompileConfig": ".config",

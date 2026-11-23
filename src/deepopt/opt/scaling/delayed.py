@@ -10,6 +10,7 @@ from torch import nn
 from torch._subclasses.fake_tensor import FakeTensor
 
 from deepopt.config import delayed_scaling_config_from_dict
+from deepopt.kernel_policy import current_kernel_policy, kernel_policy_scope, resolve_kernel_policy, owned_kernel_policy
 from .._execution import finite_checks_enabled
 from ..quantization.tensor import QuantizedTensor
 
@@ -22,8 +23,12 @@ _recomputation = ContextVar("deepopt_delayed_recomputation", default=None)
 class DelayedScalingState(nn.Module):
     """Numerical buffers belong to one projection, independently of its weight."""
 
-    def __init__(self, options, dtypes, *, device):
+    def __init__(self, options, dtypes, *, device, autotune=True, kernel_policy=None):
         super().__init__()
+        if type(autotune) is not bool:
+            raise ValueError("autotune must be a boolean")
+        self.autotune = autotune
+        self.kernel_policy = resolve_kernel_policy(kernel_policy)
         self.options = delayed_scaling_config_from_dict(options)
         self.dtypes = dict(dtypes)
         self.recipe_signature = (tuple(self.dtypes[role] for role in ROLES),
@@ -52,6 +57,8 @@ class DelayedScalingState(nn.Module):
 
     def __setstate__(self, values):
         super().__setstate__(values)
+        if not hasattr(self, "kernel_policy"):
+            self.kernel_policy = current_kernel_policy()
         self._lock = RLock()
         self._stream = self._current_stream()
 
@@ -110,22 +117,22 @@ class DelayedScalingState(nn.Module):
     @property
     def metadata_cache(self):
         if self._metadata_cache is None:
-            from deepopt.opt.backends.triton.quantization.launch import MetadataCache
+            from deepopt.opt.backends._shared.delayed_launch import MetadataCache
 
             self._metadata_cache = MetadataCache()
         return self._metadata_cache
 
     @torch.no_grad()
-    def quantize(self, x, role, *, normal=True, transposed=False, bias=False, training=True, check_finite=None):
+    def quantize(self, x, role, *, normal=True, transposed=False, bias=False, training=True, check_finite=None, autotune=None):
         return self._quantize(x, role, normal=normal, transposed=transposed, bias=bias,
-                              training=training, check_finite=check_finite)[:3]
+                              training=training, check_finite=check_finite, autotune=autotune)[:3]
 
     @torch.no_grad()
-    def quantize_pack_activation(self, x, *, group_size=512, training=True, check_finite=None, bits=2):
+    def quantize_pack_activation(self, x, *, group_size=512, training=True, check_finite=None, bits=2, row_alignment=16, autotune=None):
         """Use the same owned scale snapshot/observations with fused affine saving."""
         normal, _, _, packed = self._quantize(x, "activation", training=training,
                                               check_finite=check_finite, compression_group_size=group_size,
-                                              compression_bits=bits)
+                                              compression_bits=bits, row_alignment=row_alignment, autotune=autotune)
         return normal, packed
 
     @torch.no_grad()
@@ -133,6 +140,7 @@ class DelayedScalingState(nn.Module):
         return self.activation_forward(x, geometry, compute, arguments, training=training)
 
     @torch.no_grad()
+    @owned_kernel_policy
     def activation_forward(self, x, geometry, compute, arguments, *, training=True):
         """Use owned delayed scales in fused activation execution without dense intermediates."""
         if x.device != self.scales.device:
@@ -169,11 +177,17 @@ class DelayedScalingState(nn.Module):
                 _batch.get().record(self, 0, observations)
             return result
 
+    @owned_kernel_policy
     def _quantize(self, x, role, *, normal=True, transposed=False, bias=False, training=True,
-                  check_finite=None, compression_group_size=None, compression_bits=2):
+                  check_finite=None, compression_group_size=None, compression_bits=2, row_alignment=16, autotune=None):
         from .amax import AmaxScaling
 
+        autotune = self.autotune if autotune is None else autotune
+        if type(autotune) is not bool:
+            raise ValueError("autotune must be a boolean")
         checked = finite_checks_enabled() if check_finite is None else check_finite
+        if type(row_alignment) is not int or row_alignment not in (1, 16):
+            raise ValueError("row_alignment must be 1 or 16")
         if compression_group_size is not None:
             from ..quantization.activation import _validate_bits
 
@@ -187,7 +201,7 @@ class DelayedScalingState(nn.Module):
         if isinstance(x, FakeTensor):
             m, n = x.shape
             inverse = torch.empty((1, 1), device=x.device, dtype=torch.float32)
-            values = (torch.empty_strided((m, n), (((n + 15) // 16) * 16, 1), device=x.device, dtype=dtype)
+            values = (torch.empty_strided((m, n), (((n + row_alignment - 1) // row_alignment) * row_alignment, 1), device=x.device, dtype=dtype)
                       if normal else None)
             transpose = (torch.empty_strided((n, m), (((m + 15) // 16) * 16, 1), device=x.device, dtype=dtype)
                          if transposed else None)
@@ -220,18 +234,20 @@ class DelayedScalingState(nn.Module):
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("Delayed scaling requires eager preprocessing; full training CUDA capture is unsupported")
                 if compression_group_size is not None:
-                    from deepopt.opt.backends.triton.quantization.activation.fp8 import quantize_pack_delayed_fp8_activation
+                    from deepopt.opt.backends.dispatch import backend_module
+                    quantize_pack_delayed_fp8_activation = backend_module('activation_codec', 'quantization.activation.fp8').quantize_pack_delayed_fp8_activation
 
                     values, packed, snapshot, observations = quantize_pack_delayed_fp8_activation(
                         x, scale, dtype, compression_group_size, observe=observe, check_finite=checked,
-                        bits=compression_bits)
+                        bits=compression_bits, row_alignment=row_alignment)
                     transpose, db = None, None
                 else:
-                    from deepopt.opt.backends.triton.quantization.delayed import convert
+                    from deepopt.opt.backends.dispatch import backend_module
+                    convert = backend_module('quantization', 'quantization.delayed').convert
 
                     values, transpose, snapshot, observations, db = convert(
                         x, scale, dtype, normal=normal, transposed=transposed, bias=bias,
-                        observe=observe, check_finite=checked)
+                        observe=observe, check_finite=checked, autotune=autotune)
             else:
                 values32 = x.float()
                 if checked and not torch.isfinite(values32).all():
@@ -280,7 +296,7 @@ class _UpdateBatch:
             state._pending_owner = self
             self.claimed.add(state)
             self.observations.append((state, role, value))
-            from deepopt.opt.backends.triton.quantization.launch import storage_key
+            from deepopt.opt.backends._shared.delayed_launch import storage_key
 
             storage = storage_key(value)
             if storage not in self._storages:
@@ -297,9 +313,9 @@ class _UpdateBatch:
         if device.type == "cuda":
             for state in states:
                 state.ordered()
-            from deepopt.opt.backends.triton.quantization.delayed import reduce_observations
-
-            with torch.cuda.device(device):
+            from deepopt.opt.backends.dispatch import backend_module
+            with kernel_policy_scope(states[0].kernel_policy), torch.cuda.device(device):
+                reduce_observations = backend_module('scaling', 'quantization.delayed').reduce_observations
                 packed = reduce_observations(values, len(groups), device, states[0].metadata_cache)
         else:
             packed = torch.zeros((3, len(groups)), dtype=torch.float32, device=device)
@@ -312,8 +328,11 @@ class _UpdateBatch:
         return packed
 
     def devices(self):
-        return {device: [state for state in self.states if state.scales.device == device]
-                for device in dict.fromkeys(state.scales.device for state in self.states)}
+        groups = {}
+        for state in self.states:
+            key = state.scales.device, state.kernel_policy
+            groups.setdefault(key, []).append(state)
+        return groups
 
     def compact(self):
         observations = []
@@ -327,7 +346,7 @@ class _UpdateBatch:
                         index = states.index(state) * 3 + role
                         observations.append((state, role, values[index:index + 1]))
         self.observations = observations
-        from deepopt.opt.backends.triton.quantization.launch import storage_key
+        from deepopt.opt.backends._shared.delayed_launch import storage_key
 
         self._storages = {storage_key(value) for _, _, value in observations}
         self.bytes = sum(key[2] for key in self._storages)
@@ -348,9 +367,9 @@ class _UpdateBatch:
                 elif synchronized and any(state.options.reduce_amax for state in states):
                     raise ValueError("A delayed boundary cannot mix local and synchronized amax policies")
                 if packed.device.type == "cuda":
-                    from deepopt.opt.backends.triton.quantization.delayed import update_states
-
-                    with torch.cuda.device(packed.device):
+                    from deepopt.opt.backends.dispatch import backend_module
+                    with kernel_policy_scope(states[0].kernel_policy), torch.cuda.device(packed.device):
+                        update_states = backend_module('scaling', 'quantization.delayed').update_states
                         update_states(states, packed, states[0].metadata_cache)
                     for state in states:
                         state._epoch += 1
@@ -501,14 +520,36 @@ def fp8_checkpoint(function, *args, **kwargs):
                              _active_normalization_interception, _active_compression, _FP8LinearMode)
     from ..precision.planner import _frame, _Frame
     from .._execution import finite_check_scope
+    from ..backends._shared.normalization import normalization_variant, normalization_tuning, normalization_kernel_scope
+    from ..backends._shared.activation_codec import activation_packing, activation_codec_scope, spatial_activation_layout
     from contextlib import nullcontext
 
     plans, interception = dict(_active_fp8.get()), dict(_active_interception.get())
+    kernel_policy = current_kernel_policy()
     convolution, normalization = dict(_active_convolution_interception.get()), dict(_active_normalization_interception.get())
     compression = dict(_active_compression.get())
     frame = _frame.get()
     frame_positions = dict(frame.positions) if frame is not None else None
     checked = finite_checks_enabled()
+    kernel_variant, kernel_tuning = normalization_variant(), normalization_tuning()
+    codec_variant, codec_batch = activation_packing()
+    codec_spatial = spatial_activation_layout()
+    from ..backends._shared.activation_codec import activation_pack_warps, activation_pointwise_tile
+    codec_warps, codec_tile = activation_pack_warps(), activation_pointwise_tile()
+    from ..backends._shared.activation_codec import producer_packing, gelu_saved_state, silu_saved_state, activation_layout_policy
+    codec_producer, codec_gelu, codec_silu = producer_packing(), gelu_saved_state(), silu_saved_state()
+    codec_activation_layout = activation_layout_policy()
+    from ..backends._shared.activation_codec import strided_indexing
+    codec_index = strided_indexing()
+    from ..backends._shared.activation_codec import convolution_codec
+    codec_convolution=convolution_codec()
+    from ..backends._shared.gemm_policy import (linear_backward_policy,linear_backward_scope,
+                                               gradient_reduction_policy,linear_forward_backend)
+    dw_backend, native_layout = linear_backward_policy()
+    gradient_reduction=gradient_reduction_policy()
+    forward_backend=linear_forward_backend()
+    from ..backends._shared.pooling import pooling_kernel_variant,pooling_kernel_scope
+    pool_variant=pooling_kernel_variant()
     tape = []
 
     @contextmanager
@@ -527,8 +568,19 @@ def fp8_checkpoint(function, *args, **kwargs):
                  and any(plan is not False for plan in plans.values()))
                 or any(policy["enabled"] for policy in compression.values())
                 or frame is not None and bool(frame.root._deepopt_precision_functional.get(frame.training))))
-            with finite_check_scope(checked) if mode == "replay" else nullcontext(), \
-                 _FP8LinearMode() if intercept else nullcontext():
+            with kernel_policy_scope(kernel_policy), \
+                 finite_check_scope(checked) if mode == "replay" else nullcontext(), \
+                 _FP8LinearMode() if intercept else nullcontext(), \
+                 normalization_kernel_scope(kernel_variant, row_chunk=kernel_tuning[0], max_programs=kernel_tuning[1]) if mode == "replay" else nullcontext(), \
+                 pooling_kernel_scope(pool_variant) if mode == "replay" else nullcontext(), \
+                 activation_codec_scope(codec_variant, groups_per_program=codec_batch,
+                                        spatial_layout=codec_spatial, num_warps=codec_warps,
+                                        pointwise_tile=codec_tile, producer_pack=codec_producer,
+                                        gelu_state=codec_gelu, silu_state=codec_silu, strided_index=codec_index,
+                                        activation_layout=codec_activation_layout,
+                                        convolution_codec=codec_convolution) if mode == "replay" else nullcontext(), \
+                 linear_backward_scope(dw_backend=dw_backend, native_layout=native_layout,
+                                       gradient_reduction=gradient_reduction,forward_backend=forward_backend) if mode == "replay" else nullcontext():
                 yield
         finally:
             if frame_token is not None:

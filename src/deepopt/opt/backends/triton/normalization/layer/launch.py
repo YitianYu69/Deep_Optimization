@@ -1,13 +1,15 @@
 """Bounded LayerNorm launch policy and native/FP8 forward storage."""
 
 from math import prod
+from deepopt.opt.backends._shared.normalization import normalization_variant
 
 import torch
 import triton
 
-from .forward import _row_forward, _epilogue, _output_amax, _xhat_ranges
+from .forward import _row_forward, _epilogue, _output_amax, _xhat_ranges, _linear_output_epilogue
 from .statistics import _partial_statistics, _complete_statistics
 from ..recenter import reduce_center
+from .moments import reduce_layer_moments
 from ..statistics import _merge_stats, _finish_stats
 from ...activation.elementwise_forward import _reduce_ranges
 from ...quantization.activation.affine import _finish_min_max
@@ -37,11 +39,17 @@ def forward(x, geometry, **options):
 
 
 def _forward(x, geometry, *, weight, bias, dtype, block_shape, compression, check_finite,
-             scale=None, observe=False, capture_scale=False, center_shift=None):
+             scale=None, observe=False, capture_scale=False, center_shift=None, output_pack=None, moment_gain=None,
+             activation=None, preactivation=None):
     m, k = geometry.matrix_shape
     rows, cols = geometry.transport.matrix_shape
     data, x_inverse, meta = tensor_arguments(x)
+    fused_activation = dict(preactivation=preactivation, ACTIVATION=activation[0] if activation else "",
+                            APPROXIMATE=activation[1] if activation else "none",
+                            SAVE_PREACTIVATION=preactivation is not None)
     fp8 = dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if activation and (fp8 or output_pack is not None):
+        raise ValueError("Normalization activation epilogues require native dense output without consumer packing")
     maximum = torch.finfo(dtype).max if fp8 else 0.0
     br, bc = block_shape or (max(1, rows), max(1, cols))
     sr, sc = (1, 1) if block_shape is None else (triton.cdiv(rows, br), triton.cdiv(cols, bc))
@@ -53,6 +61,7 @@ def _forward(x, geometry, *, weight, bias, dtype, block_shape, compression, chec
             "recenter_launches": 0, "recenter_scratch_bytes": 0,
             "recenter_partial_launches": 0, "recenter_partial_tiles": 0, "recenter_finish_launches": 0,
             "recenter_state_bytes": m * 4 if center_shift is not None else 0,
+            "moment_launches": 0, "moment_scratch_bytes": 0,
             "scale_mode": "provided" if scale is not None else "current" if fp8 else "none"}
     if not m * k:
         return output, out_inverse, LayerNormState(mean, inverse), None, None, info
@@ -79,6 +88,10 @@ def _forward(x, geometry, *, weight, bias, dtype, block_shape, compression, chec
              (group == pad or groups == 1) and bc <= pad and pad % bc == 0))
     direct = small and (not fp8 or scale is not None or local)
     prepass = small and not direct and block_shape is None
+    fused_output = output_pack is not None and prepass and not channels
+    info["producer_pack_fused"] = fused_output
+    info["activation_epilogue"] = activation[0] if activation else None
+    info["retained_preactivation_bytes"] = preactivation.numel() * preactivation.element_size() if preactivation is not None else 0
     snapshot = torch.empty(2, device=x.device, dtype=torch.float32) if capture_scale else None
     observations = None
     error_buffers = []
@@ -93,7 +106,8 @@ def _forward(x, geometry, *, weight, bias, dtype, block_shape, compression, chec
             geometry.eps, group, groups, pgroups, pad, words, bits, compressed, fp8, prepass, local,
             block_shape is None, cols, channels, c, s, br, bc, sc, maximum, observe, capture_scale,
             check_finite, triton.next_power_of_2(k),
-            center_shift=center_shift, RECENTER=center_shift is not None,
+            center_shift=center_shift, RECENTER=center_shift is not None, REUSE_ROW=normalization_variant() != "baseline",
+            moment_gain=moment_gain, MOMENTS=moment_gain is not None, **fused_activation,
             num_warps=8 if pgroups * pad >= 4096 else 4, enable_fp_fusion=False)
         if check_finite:
             error_buffers.append(errors)
@@ -150,22 +164,38 @@ def _forward(x, geometry, *, weight, bias, dtype, block_shape, compression, chec
                 info["compression_launches"] += 1
             _finish_min_max[(m * groups,)](lo, hi, steps, minima, n, bits, triton.next_power_of_2(n), enable_fp_fusion=False)
             info["compression_launches"] += 1
-        observations = torch.empty(m * groups * parts, device=x.device, dtype=torch.float32) if observe else None
-        errors = torch.empty(m * groups * parts, device=x.device, dtype=torch.int32) if check_finite else output
+        programs = output_pack.data.shape[0] if fused_output else m * groups * parts
+        observations = torch.empty(programs, device=x.device, dtype=torch.float32) if observe else None
+        errors = torch.empty(programs, device=x.device, dtype=torch.int32) if check_finite else output
         recenter_here = save_here and center_shift is not None
         center_parts = groups * parts
-        center_errors = (torch.empty((2, m, center_parts), device=x.device, dtype=torch.float32)
+        center_errors = (torch.empty((4 if moment_gain is not None else 2, m, center_parts), device=x.device, dtype=torch.float32)
                          if recenter_here and center_parts > 1 else output)
-        _epilogue[(m * groups, parts)](
-            data, x_inverse, w, b, mean, inverse, output, saved, steps, minima,
-            scale if scale is not None else output, out_inverse if fp8 else output,
-            observations if observe else output, snapshot if snapshot is not None else output, errors,
-            k, geometry.shape, geometry.normalized_shape, meta, ws, bs, weight is not None, bias is not None,
-            group, groups, words, bits, save_here, prec, fp8, cols, channels, c, s, br, bc, sc,
-            maximum, parts, observe, capture_scale, check_finite, block,
-            center_shift=center_shift, center_errors=center_errors, M=m, RECENTER=recenter_here, enable_fp_fusion=False)
+        if fused_output:
+            _linear_output_epilogue[(programs,)](data, x_inverse, w, b, mean, inverse, output,
+                scale, out_inverse, output_pack.data, output_pack.step, output_pack.minimum,
+                observations if observe else output, snapshot if snapshot is not None else output, errors,
+                m, k, geometry.shape, geometry.normalized_shape, meta, ws, bs, weight is not None, bias is not None,
+                output_pack.group_size, output_pack.data.shape[1], output_pack.bits,
+                maximum, observe, capture_scale, check_finite, triton.next_power_of_2(output_pack.group_size),
+                num_warps=4, enable_fp_fusion=False)
+        else:
+            _epilogue[(m * groups, parts)](
+                data, x_inverse, w, b, mean, inverse, output, saved, steps, minima,
+                scale if scale is not None else output, out_inverse if fp8 else output,
+                observations if observe else output, snapshot if snapshot is not None else output, errors,
+                k, geometry.shape, geometry.normalized_shape, meta, ws, bs, weight is not None, bias is not None,
+                group, groups, words, bits, save_here, prec, fp8, cols, channels, c, s, br, bc, sc,
+                maximum, parts, observe, capture_scale, check_finite, block,
+                center_shift=center_shift, center_errors=center_errors, M=m, RECENTER=recenter_here,
+                moment_gain=moment_gain, MOMENTS=moment_gain is not None and save_here, **fused_activation, enable_fp_fusion=False)
         if recenter_here and center_parts > 1:
-            launches, scratch = reduce_center(center_errors, center_shift, m, center_parts)
+            if moment_gain is not None:
+                launches, scratch = reduce_layer_moments(center_errors, center_shift, moment_gain, m, center_parts)
+                info["moment_launches"] += launches
+                info["moment_scratch_bytes"] += scratch + center_errors.numel() * center_errors.element_size()
+            else:
+                launches, scratch = reduce_center(center_errors, center_shift, m, center_parts)
             info["recenter_launches"] += launches
             info["recenter_partial_launches"] = 1
             info["recenter_partial_tiles"] = m * center_parts

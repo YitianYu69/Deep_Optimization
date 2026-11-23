@@ -3,11 +3,9 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
-import sys
 import tempfile
-from types import ModuleType
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -20,8 +18,11 @@ class RecordingBar:
     def __init__(self, **options):
         self.options = options
         self.n = options["initial"]
+        self.total = options["total"]
+        self.desc = options["desc"]
         self.increments = []
         self.postfixes = []
+        self.descriptions = []
         self.closes = 0
 
     def update(self, count):
@@ -30,6 +31,10 @@ class RecordingBar:
 
     def set_postfix(self, values, *, refresh):
         self.postfixes.append((dict(values), refresh))
+
+    def set_description(self, description, refresh=True):
+        self.desc = description
+        self.descriptions.append(description)
 
     def close(self):
         self.closes += 1
@@ -61,14 +66,12 @@ class ProgressBarTests(unittest.TestCase):
             bars.append(bar)
             return bar
 
-        package, auto = ModuleType("tqdm"), ModuleType("tqdm.auto")
-        package.__path__ = []
-        auto.tqdm = Mock(side_effect=create)
-        package.auto = auto
-        with patch.dict(sys.modules, {"tqdm": package, "tqdm.auto": auto}):
-            yield bars, auto.tqdm
+        # Keep the real module metadata: PyTorch's lazy Dynamo import inspects
+        # optional packages with find_spec() while constructing an optimizer.
+        with patch("tqdm.auto.tqdm", side_effect=create) as factory:
+            yield bars, factory
 
-    def test_default_bar_counts_complete_epochs_and_reuses_reported_metrics(self):
+    def test_explicit_epoch_bar_counts_complete_epochs_and_reuses_reported_metrics(self):
         trainer, train_loader, validation_loader = self.trainer(), IterableBatches(), IterableBatches()
         rows, callback_counts = [], []
         with self.capture_bars() as (bars, factory):
@@ -76,7 +79,7 @@ class ProgressBarTests(unittest.TestCase):
                 rows.append(row)
                 callback_counts.append(bars[0].n)
 
-            trainer.fit(train_loader, validation_loader, epochs=2, callbacks=[record])
+            trainer.fit(train_loader, validation_loader, epochs=2, callbacks=[record], progress_bar="epoch")
         factory.assert_called_once_with(total=2, initial=0, desc="Training", unit="epoch", dynamic_ncols=True)
         bar = bars[0]
         self.assertEqual(bar.increments, [1, 1])
@@ -111,7 +114,7 @@ class ProgressBarTests(unittest.TestCase):
             current.request_stop()
 
         with self.capture_bars() as (bars, factory):
-            trainer.fit(loader, epochs=5, callbacks=[stop])
+            trainer.fit(loader, epochs=5, callbacks=[stop], progress_bar="epoch")
         self.assertEqual(bars[0].options["total"], 5)
         self.assertEqual(bars[0].n, 1)
         self.assertEqual(bars[0].closes, 1)
@@ -129,7 +132,7 @@ class ProgressBarTests(unittest.TestCase):
             restore_checkpoint(read_checkpoint(checkpoint), resumed, {}, generators={})
         loader = IterableBatches()
         with self.capture_bars() as (bars, factory):
-            resumed.fit(loader, epochs=3)
+            resumed.fit(loader, epochs=3, progress_bar="epoch")
         factory.assert_called_once_with(total=3, initial=1, desc="Training", unit="epoch", dynamic_ncols=True)
         self.assertEqual(bars[0].increments, [1, 1])
         self.assertEqual(bars[0].n, 3)
@@ -149,10 +152,10 @@ class ProgressBarTests(unittest.TestCase):
                     if phase == "validation":
                         with patch.object(trainer, "evaluate", side_effect=RuntimeError("epoch failed")):
                             with self.assertRaisesRegex(RuntimeError, "epoch failed"):
-                                trainer.fit(IterableBatches(), IterableBatches(), epochs=2)
+                                trainer.fit(IterableBatches(), IterableBatches(), epochs=2, progress_bar="epoch")
                     else:
                         with self.assertRaisesRegex(RuntimeError, "epoch failed"):
-                            trainer.fit(IterableBatches(), epochs=2, callbacks=[fail])
+                            trainer.fit(IterableBatches(), epochs=2, callbacks=[fail], progress_bar="epoch")
                 self.assertEqual(bars[0].n, 0)
                 self.assertEqual(bars[0].closes, 1)
                 self.assertEqual(bars[0].postfixes, [])
@@ -166,14 +169,14 @@ class ProgressBarTests(unittest.TestCase):
 
         with self.capture_bars() as (bars, factory):
             with self.assertRaises(KeyboardInterrupt):
-                trainer.fit(IterableBatches(), epochs=2, callbacks=[interrupt])
+                trainer.fit(IterableBatches(), epochs=2, callbacks=[interrupt], progress_bar="epoch")
         self.assertEqual(bars[0].n, 0)
         self.assertEqual(bars[0].closes, 1)
         self.assertFalse(trainer.at_epoch_boundary)
 
     def test_invalid_progress_flag_fails_before_training_or_bar_creation(self):
         trainer = self.trainer()
-        for flag in (None, 0, 1, "yes"):
+        for flag in (None, 0, 1, "yes", [], {}):
             with self.subTest(progress_bar=flag), self.capture_bars() as (bars, factory):
                 with self.assertRaisesRegex(ValueError, "progress_bar"):
                     trainer.fit(IterableBatches(), epochs=1, progress_bar=flag)
@@ -190,7 +193,7 @@ class ProgressBarTests(unittest.TestCase):
         trainer = self.trainer()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             trainer.fit(IterableBatches(), epochs=1,
-                        callbacks=[lambda current, row: print(json.dumps(row))])
+                        callbacks=[lambda current, row: print(json.dumps(row))], progress_bar="epoch")
         lines = stdout.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0])["epoch"], 1)

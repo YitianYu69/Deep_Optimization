@@ -24,8 +24,10 @@ class DOReLU(nn.ReLU):
         if (training is not None and training["scaling_recipe"] == "delayed" and self.fp8_scaling is None
                 and any(value is not None for outputs in self._precision_outputs.values() for value in outputs)):
             from ...scaling.delayed import DelayedScalingState
+            from deepopt.kernel_policy import plan_kernel_policy
 
-            self.fp8_scaling = DelayedScalingState(training["delayed_scaling"], training["fp8_dtypes"], device=device)
+            self.fp8_scaling = DelayedScalingState(training["delayed_scaling"], training["fp8_dtypes"], device=device,
+                                                   autotune=training["autotune"], kernel_policy=plan_kernel_policy(self.plan))
 
     @property
     def execution_info(self):

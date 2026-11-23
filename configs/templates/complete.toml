@@ -82,9 +82,14 @@ fullgraph = false
 # Use nonempty options OR mode, not both.
 # "triton.cudagraphs" = false
 
+[runtime.kernels]
+backend = "inherit"                # Preserve legacy selection; explicit triton, tilelang, or mixed.
+# Mixed-only options: preferred = "triton", fallback = "error" or "other".
+# See docs/architecture/kernel_backends.md for family and role route tables.
+
 [runtime.fp8]
 enabled = false
-backend = "reference"              # reference emulation or triton native CUDA FP8 GEMM.
+backend = "reference"              # reference, triton, tilelang, or inherit from runtime.kernels.
 trace_mode = "modules"             # modules, full, or auto.
 intercept_linear = true            # false: prepared DO operations only; native F.linear stays dense.
 # intercept_convolution = true     # Optional override; otherwise inherits intercept_linear.
@@ -95,8 +100,9 @@ activation_dtype = "e4m3fn"         # e4m3fn or e5m2.
 weight_dtype = "e4m3fn"             # e4m3fn or e5m2.
 grad_dtype = "e4m3fn"               # e4m3fn or e5m2; each operand chooses independently.
 num_stages = "auto"                # Tune Triton stages; an integer 1–5 pins the depth.
+autotune = true                    # false uses fixed launches; auto stages then means depth 3.
 scaling_recipe = "current"         # delayed requires prepared adapters and tensorwise block_shapes.
-backward_backend = "inherit"       # inherit, native_fast, native_precise; native requires triton + tensorwise.
+backward_backend = "inherit"       # inherit, native_fast, native_precise; native requires custom FP8 + tensorwise.
 exclude_modules = []               # Qualified-name globs; nonempty exclusions require intercept_linear=false.
 # out_dtype = "fp32"               # fp32, bf16, fp16; omit to follow active AMP/input dtype.
 
@@ -121,9 +127,15 @@ reduce_amax = true                 # Synchronize observations at update boundari
 enabled = false
 group_size = 512                  # Tensorwise FP8 and BF16 groups; block FP8 uses activation scale tiles.
 bits = 2                          # Global saved-activation precision: 1, 2, 4 or 8 bits.
-norm_xhat_recenter = false         # Preserve the original xhat mean after decoding in norm backward.
+norm_xhat_recenter = false         # BatchNorm/GroupNorm mean correction; compressed LayerNorm always corrects both moments.
 # Attention Q/K/V default to max(4, bits). Set attention_bits explicitly to override, including lower precision.
 # attention_bits = 2
+
+[runtime.attention]
+# Optional installed FlashAttention-2 forward/backward; requires flash-attn 2.
+# First prepare the model, then capture under the same DeepOpt autocast config.
+# flash_attn_2 supports unmasked noncausal BF16/FP16, head dimensions divisible by 8 up to 256.
+backend = "native"                 # native or flash_attn_2
 
 [runtime.ddp]
 # Applied by the DDP core. Launch/group/rank/device assignment remains external.
@@ -136,6 +148,7 @@ validation_sync_buffers = true
 
 [runtime.cuda_graph]
 # Defaults for explicit capture calls; these fields never trigger capture.
+enabled = true                    # false runs callable/decorator handles eagerly and skips graph warmup.
 # device = "cuda"                  # cuda or cuda:N; omit for the core's normal device selection.
 warmup = 3                         # Positive number of warmup iterations.
 allow_unused_input = false

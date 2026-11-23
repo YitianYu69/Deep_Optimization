@@ -1,0 +1,45 @@
+{
+  "settings": {
+    "compression": {
+      "bits": 2,
+      "group_size": 1024
+    },
+    "runtime": {
+      "scope_lifetime": "reused",
+      "optimizer": "adamw",
+      "lr": 0.0001
+    }
+  },
+  "workloads": [
+    {
+      "name": "attention_block",
+      "op": "attention_pipeline",
+      "shape": [
+        32,
+        197,
+        768
+      ],
+      "kwargs": {
+        "num_heads": 12
+      }
+    }
+  ],
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  }
+}

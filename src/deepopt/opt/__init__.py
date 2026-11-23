@@ -14,12 +14,15 @@ __all__ = [
     "autocast",
     "FP8Config",
     "DelayedScalingConfig", "fp8_scaling_scope", "fp8_checkpoint",
+    "KernelConfig", "kernel_policy_scope",
 ]
 
 _EXPORTS = {
     "autocast": "._autocast",
     "FP8Config": "..config",
     "DelayedScalingConfig": "..config",
+    "KernelConfig": "..kernel_policy",
+    "kernel_policy_scope": "..kernel_policy",
     "fp8_scaling_scope": ".scaling.delayed",
     "fp8_checkpoint": ".scaling.delayed",
     "transform_model": ".transform",

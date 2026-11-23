@@ -6,6 +6,7 @@ rank; guard noncollective external side effects with is_main_process().
 """
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 import os
@@ -16,6 +17,7 @@ from deepopt._config_resolution import _UNSET, resolve_config
 
 
 _owns_group = False
+_collective_error_depth = ContextVar("deepopt_collective_error_depth", default=0)
 
 
 @dataclass(frozen=True)
@@ -153,10 +155,13 @@ def collective_errors(operation):
         yield
         return
     error = None
+    token = _collective_error_depth.set(_collective_error_depth.get() + 1)
     try:
         yield
     except Exception as exc:
         error = exc
+    finally:
+        _collective_error_depth.reset(token)
     failed = reduce_number(int(error is not None), dist.ReduceOp.MAX)
     if failed:
         messages = [None] * world_size()
@@ -164,6 +169,11 @@ def collective_errors(operation):
         if error is not None:
             raise error
         raise RuntimeError(f"Distributed {operation} failed: " + "; ".join(message for message in messages if message))
+
+
+def collective_error_boundary_active():
+    """Whether a caller already coordinates this thread's local operation."""
+    return _collective_error_depth.get() > 0
 
 
 def rank_zero_call(function):

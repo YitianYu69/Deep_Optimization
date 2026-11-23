@@ -1,5 +1,9 @@
 # Execution backend organization
 
+Model graph compilation lives separately in the optional
+[DeepOpt compiler](../execution/compiler.md). This guide describes the
+operation executors that the compiler and eager adapters reuse.
+
 [Architecture guide](README.md) · [FP8 guide](../fp8/README.md) · [Activation compression](../activation_compression/README.md)
 
 Optimized operations separate model semantics, operand preparation, and GEMM
@@ -107,7 +111,12 @@ Backend implementations validate their own eligibility and output policies.
 
 ## Selection and lazy imports
 
-Public forward configuration selects `backend="reference"` or `"triton"`.
+Public FP8 configuration selects `backend="reference"`, `"triton"`,
+`"tilelang"`, or `"inherit"`. The explicit `runtime.kernels.backend` policy
+selects Triton, TileLang, or Mixed for custom preparation, operations and
+compiler regions. Omitted selection preserves legacy behavior. See
+[backend selection](kernel_backends.md) for routing and experimental TileLang
+qualification limits.
 `backward_backend="inherit"` retains that executor for backward; the optional
 `"native_fast"` and `"native_precise"` choices use native scaled-FP8 GEMM for
 eligible backward products, with different accumulation policies. They are
@@ -119,9 +128,9 @@ See [native backward controls](../fp8/eager_linear_benchmark.md#native-backward-
 GPU implementations are imported when their operations execute. Importing the
 package or configuring a CPU/reference recipe does not require Triton.
 CPU quantization uses PyTorch reference operations. CUDA quantization uses the
-shared Triton casting and reduction kernels even when the selected GEMM
-executor is reference or native. GEMM backend selection therefore does not
-select a separate casting implementation. The reference CUDA path is an
+resolved custom casting and reduction kernels even when GEMM execution is
+reference or native. Legacy recipes retain Triton casting; explicit kernel
+policies govern the complete preparation path. The reference CUDA path is an
 emulation path, with the CUDA quantization prerequisites described in the
 [FP8 guide](../fp8/README.md#start-with-reference-execution).
 

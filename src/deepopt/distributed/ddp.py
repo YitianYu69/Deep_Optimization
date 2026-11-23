@@ -3,6 +3,7 @@
 import torch
 from contextlib import nullcontext
 from dataclasses import asdict
+from hashlib import sha256
 from copy import deepcopy
 from math import isfinite
 from torch import nn
@@ -11,6 +12,37 @@ from torch.nn.parallel import DistributedDataParallel
 from . import _process as distributed
 from deepopt._config_resolution import _UNSET
 from deepopt.opt.policy import resolve_fp8_config
+
+
+def _validate_offload_capture(model, runtime):
+    """Reject scope gaps before DDP can acquire an already cached callable."""
+    compilation = runtime.get("compile", {})
+    if (compilation.get("enabled") is not True or compilation.get("backend") != "deepopt"
+            or compilation.get("fullgraph") is not True):
+        raise ValueError("Packed offload DDP requires runtime.compile.fullgraph=True with the DeepOpt backend")
+    report = getattr(model, "_deepopt_compile_report", None)
+    if report is not None and report.captured_graphs:
+        # Dynamo does not necessarily invalidate a cached DDPOptimizer split
+        # when optimize_ddp changes. Do not globally reset unrelated caches.
+        raise ValueError("Construct packed offload DDP before the first compiled model forward; "
+                         "create a fresh model instead of adopting a previously captured callable")
+
+
+def _prepared_offload_recipe(model, snapshot):
+    from deepopt.engine.execution.configuration import runtime_signature
+
+    recipe, _ = runtime_signature(snapshot)
+    recipe.pop("device", None)
+    recipe.pop("packed_activation_offload", None)
+    # An inherited numerical facade can own a different effective policy from
+    # the incoming snapshot's defaults. Compare declared owners as well as the
+    # resolved snapshot, without inspecting tensors or traversing schedules.
+    recipe["prepared_model_owners"] = {
+        name: getattr(model, name, None) for name in (
+            "_deepopt_bf16_policy", "_deepopt_activation_memory_plan",
+            "_deepopt_activation_compression_config", "_deepopt_kernel_policy",
+            "_deepopt_attention_config", "_deepopt_fp8_config", "_deepopt_compile_config")}
+    return recipe
 
 
 class _StepModule(nn.Module):
@@ -51,27 +83,63 @@ class DDPCore:
                 runtime["ddp"] = deepcopy(options or {})
             options = runtime.get("ddp", {})
         self.model = model
-        self.device = (distributed.initialize_distributed("auto").device
-                       if selected_device == "auto" else torch.device(selected_device))
+        with distributed.collective_errors("DDP core preconditions"):
+            context = distributed.initialize_distributed(selected_device)
+            if distributed.world_size() < 2:
+                raise ValueError("DDPCore requires an initialized multi-rank process group")
+            if isinstance(model, DistributedDataParallel):
+                raise ValueError("Pass the unwrapped model; DDPCore wraps the complete step in DDP")
+        self.device = context.device
         self.forward_pending = False
         self.wrapper = None
         self.options = {"find_unused_parameters": False, "broadcast_buffers": True,
                         "gradient_as_bucket_view": True, **(options or {})}
         self.validation_sync_buffers = self.options.pop("validation_sync_buffers", True)
         self._observer_interests = set()
-        if distributed.world_size() < 2:
-            raise ValueError("DDPCore requires an initialized multi-rank process group")
-        if isinstance(model, DistributedDataParallel):
-            raise ValueError("Pass the unwrapped model; DDPCore wraps the complete step in DDP")
         with distributed.collective_errors("FP8 configuration"):
             self.fp8 = resolve_fp8_config(model, fp8, config=self._config_snapshot)
         distributed.require_equal(asdict(self.fp8), "FP8 configuration")
         distributed.require_equal({**self.options, "validation_sync_buffers": self.validation_sync_buffers},
                                   "DDP options")
+        from deepopt._packed_offload import resolve_owned_packed_offload
+        from deepopt.distributed.offload import prepare_packed_offload
+        from deepopt.engine.execution.configuration import runtime_signature
+
+        with distributed.collective_errors("packed offload DDP configuration"):
+            offload = resolve_owned_packed_offload(
+                getattr(model, "_deepopt_packed_activation_offload_policy", None),
+                runtime.get("packed_activation_offload"))
+            if offload.enabled or hasattr(model, "_deepopt_packed_activation_offload_policy"):
+                runtime["packed_activation_offload"] = offload.as_config()
+            if offload.enabled and any(parameter.device != self.device for parameter in model.parameters()):
+                raise ValueError("Move the model to the rank's CUDA device before packed offload DDP preparation")
+            if offload.enabled:
+                _validate_offload_capture(model, runtime)
+            recipe, _ = runtime_signature(self._config_snapshot)
+            recipe.pop("device", None)
+            recipe.pop("packed_activation_offload", None)
+        # Every rank participates, including disabled policies. This owns its
+        # own collective phases and must not be nested in collective_errors.
+        self._packed_offload_preparation = prepare_packed_offload(offload, context, recipe=recipe)
+        self._packed_offload_enabled = offload.enabled
+        self._packed_offload_preparation["compiler_scope"] = {
+            "ddp_optimizer_partitioning": "disabled" if offload.enabled else "unchanged",
+            "reason": ("Preserve whole-model offload selection and atomic history admission"
+                       if offload.enabled else "Offload is disabled"),
+            "gradient_reducer": "torch DistributedDataParallel",
+            "communication_overlap_qualified": False,
+        }
         with distributed.collective_errors("FP8 model preparation"):
             self.model, self.fp8, self.transformation_report = prepare_execution_model(
                 model, self._config_snapshot, self.fp8)
         model = self.model
+        if offload.enabled:
+            from deepopt.distributed.offload import _recipe_json
+
+            with distributed.collective_errors("prepared packed offload DDP recipe"):
+                prepared_recipe = _recipe_json(_prepared_offload_recipe(model, self._config_snapshot), enabled=True)
+            distributed.require_equal(prepared_recipe, "prepared packed offload native numerical/compile recipes")
+            self._packed_offload_preparation["prepared_recipe_sha256"] = sha256(prepared_recipe.encode()).hexdigest()
         self._delayed_states = ()
         if self.fp8.enabled and self.fp8.scaling_recipe == "delayed":
             from deepopt.opt.scaling.delayed import delayed_states
@@ -84,9 +152,10 @@ class DDPCore:
                            for name, module in model.named_modules() if module in self._delayed_states
                            for buffer in module._buffers}
                 owner._ddp_params_and_buffers_to_ignore = ignored
-            self.wrapper = DistributedDataParallel(
-                owner, device_ids=[self.device.index] if self.device.type == "cuda" else None,
-                **self.options)
+            with self._compiled_offload_scope():
+                self.wrapper = DistributedDataParallel(
+                    owner, device_ids=[self.device.index] if self.device.type == "cuda" else None,
+                    **self.options)
         if self.fp8.enabled:
             from deepopt.opt.nn._cached_weights import CachedWeightModule
 
@@ -114,13 +183,25 @@ class DDPCore:
     def config(self):
         return deepcopy(self._config_snapshot)
 
+    def _compiled_offload_scope(self):
+        if not self._packed_offload_enabled:
+            return nullcontext()
+        # DDPOptimizer partitions a captured graph by gradient buckets. Each
+        # partition would otherwise select/reserve history independently, after
+        # earlier producers had already run. Keep one native model graph until
+        # cross-partition whole-model admission has its own proven contract.
+        # The DDP reducer stays eager and all offload copy streams stay active.
+        from torch._dynamo import config as dynamo_config
+
+        return dynamo_config.patch(optimize_ddp=False)
+
     def compute(self, batch, step):
         with self._fp8_scope.enter():
             if self.wrapper is not None and self.model.training and torch.is_grad_enabled():
                 from deepopt.opt.scaling.delayed import fp8_scaling_scope
 
                 scope = fp8_scaling_scope(states=self._delayed_states) if self._delayed_states else nullcontext()
-                with scope:
+                with self._compiled_offload_scope(), scope:
                     result = self.wrapper(batch, step)
                 self.forward_pending = True
                 return result

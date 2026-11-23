@@ -15,7 +15,7 @@ def _transpose_quantize(data, inverse, output, out_inverse,
     row = group // triton.cdiv(M, BC) * BR + offset // BC
     col = group % triton.cdiv(M, BC) * BC + offset % BC
     valid = (offset < BR * BC) & (row < N) & (col < M)
-    raw = tl.load(data + col * RS + row * CS, valid, other=0).to(tl.float32)
+    raw = tl.load(data + col * RS + row * CS, valid, other=0.0).to(tl.float32)
     scale_inv = tl.load(inverse + col // IBR * SRS + row // IBC * SCS, valid, other=0)
     value = raw * scale_inv
     amax = tl.max(tl.abs(value), 0)

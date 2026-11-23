@@ -29,6 +29,25 @@ def call(kind, x, approximate, **options):
 
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
 class ActivationCUDATests(unittest.TestCase):
+    def test_vit_sized_current_scale_statistics_exceed_secondary_grid_limit(self):
+        if torch.cuda.mem_get_info()[0] < 12 * 2**30:
+            self.skipTest("ViT launch regression needs 12 GiB of free device memory")
+        x = torch.randn(100864, 3072, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        upstream = torch.ones_like(x)
+        for packed in (False, True):
+            x.grad = None
+            source, dy = (x[:-1], upstream[:-1]) if packed else (x, upstream)
+            with deepopt.autocast("cuda", enabled=False, check_finite=False):
+                output = call("gelu", source, "none", plan=self.policy(packed, group=1024),
+                              output_dtype=torch.float8_e4m3fn)
+            # This shape previously attempted grid=(1, 75648), before any
+            # model graph capture. Check both saving policies and the tail.
+            sample = output.dequantize(torch.float32)[::1024, :63]
+            expected = torch.nn.functional.gelu(source.detach()[::1024, :63].float())
+            torch.testing.assert_close(sample, expected, rtol=.15, atol=.03)
+            output.backward(dy)
+            self.assertTrue(torch.isfinite(x.grad).all())
+
     def policy(self, packed, block=None, bits=2, group=17):
         return activation_plan(fp8={"enabled": True, "backend": "triton", "block_shapes": {"activation": block}},
                                activation_compression={"enabled": packed, "bits": bits, "group_size": group})

@@ -1,5 +1,7 @@
 """Shared plan-driven routing for native and FP8 spatial convolutions."""
 
+from deepopt.kernel_policy import kernel_entry
+
 from contextlib import nullcontext
 from dataclasses import replace
 
@@ -13,22 +15,47 @@ def convolution_execution(geometry, plan):
     """Describe executor eligibility without reading tensor values."""
     if "fp8" in plan:
         return {"forward": "native", "backward": "native", "pointwise": False,
+                "fp8_requested": False, "compute_precision": "native", "convolution_policy": "strict",
                 "compression": plan["activation_compression"]["enabled"], "fallback_reason": None}
     training, blocks = plan["fp8_training"], plan["block_shapes"]
     pointwise = geometry.pointwise and all(block is None for block in blocks.values())
+    policy = training.get("convolution_policy", "strict")
+    kind = ("depthwise" if geometry.groups == geometry.in_channels == geometry.out_channels else
+            "grouped" if geometry.groups > 1 else "pointwise" if pointwise else
+            "strided_pointwise" if geometry.kernel_volume == 1 else "spatial")
+    metadata = {"fp8_requested": True, "convolution_policy": policy, "convolution_kind": kind,
+                "input_shape": geometry.input_shape, "weight_shape": geometry.weight_shape,
+                "stride": geometry.stride, "groups": geometry.groups,
+                "operand_preparation": "layout_and_fp8_quantization", "compute_precision": "fp8",
+                "estimated_forward_flops": 2 * geometry.batch_size * geometry.output_volume * geometry.out_channels
+                * geometry.in_channels_per_group * geometry.kernel_volume}
+    if policy == "native_spatial" and not pointwise:
+        return {**metadata, "forward": "native", "backward": "native", "pointwise": False,
+                "compute_precision": "native", "operand_preparation": "native_amp",
+                "compression": training["activation_compression"]["enabled"],
+                "fallback_reason": "Explicit native_spatial policy; this convolution does not execute FP8 arithmetic"}
+    if policy == "depthwise" and training["backend"] != "reference":
+        from ...backends._shared.convolution import depthwise_eligible
+        if depthwise_eligible(geometry):
+            return {**metadata, "forward": "depthwise_stencil", "backward": "depthwise_stencil",
+                    "compute_precision": "fp8_storage_fp32", "pointwise": False,
+                    "compression": training["activation_compression"]["enabled"],
+                    "fallback_reason": "Opt-in vector stencil uses FP8 operands with FP32 arithmetic, without FP8 tensor-core dots"}
     backend = training["backend"]
     requested = backend if training["backward_backend"] == "inherit" else training["backward_backend"]
     mode = "pointwise_gemm" if pointwise else "implicit_fp8"
     if backend == "reference":
         mode = "reference"
+        metadata["compute_precision"] = "fp8_storage_fp32"
     elif any(block is not None for block in blocks.values()):
         mode = "implicit_blockwise_fp8"
     reason = None
     backward = requested
     if not pointwise and requested in ("native_fast", "native_precise"):
-        backward = "triton"
-        reason = "Native scaled GEMM applies to pointwise convolution; spatial gradients use Triton"
-    return {"forward": mode, "backward": backward, "pointwise": pointwise,
+        from deepopt.kernel_policy import kernel_backend
+        backward = kernel_backend("convolution", backend=backend)
+        reason = f"Native scaled GEMM applies to pointwise convolution; spatial gradients use {backward}"
+    return {**metadata, "forward": mode, "backward": backward, "pointwise": pointwise,
             "compression": training["activation_compression"]["enabled"], "fallback_reason": reason}
 
 
@@ -61,6 +88,7 @@ def _normalize(rank, x, weight, stride, padding, dilation, groups):
     return x, geometry, unbatched
 
 
+@kernel_entry
 def convolution(rank, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1,
                 *, plan=None, weight_cache=None, scaling_state=None, state_training=True, execution_info=None):
     from ..functional import _prepare_linear_plan, _prepare_fp8_plan, do_linear
@@ -102,8 +130,9 @@ def convolution(rank, input, weight, bias=None, stride=1, padding=0, dilation=1,
     if not fp8:
         input = dequantize_activation(input)
         if (compression is None or not compression["enabled"] or not torch.is_grad_enabled()
-                or not isinstance(weight, torch.Tensor) or not weight.requires_grad
+                or not isinstance(weight, torch.Tensor)
                 or not isinstance(input, torch.Tensor) or not input.numel()
+                or not any(value.requires_grad for value in (input, weight, bias) if isinstance(value, torch.Tensor))
                 or input.dtype not in (torch.float32, torch.bfloat16, torch.float16)
                 or weight.dtype not in (torch.float32, torch.bfloat16, torch.float16)):
             if execution_info is not None:
@@ -134,12 +163,28 @@ def convolution(rank, input, weight, bias=None, stride=1, padding=0, dilation=1,
             "fp8": False, "activation_compression": compression}))
     from ..autograd.convolution.native import _memory_format, _NativeConvolutionFunction
 
-    if not fp8:
+    mixed = fp8 and convolution_execution(geometry, checked)["compute_precision"] == "native"
+    if mixed:
+        x = dequantize_activation(x)
+        native_weight, native_bias = weight, bias
+        if not torch.is_autocast_enabled(x.device.type):
+            native_weight = weight.to(x.dtype)
+            native_bias = bias.to(x.dtype) if bias is not None else None
+        if (compression["enabled"] and torch.is_grad_enabled()
+                and any(value.requires_grad for value in (x, native_weight, native_bias) if value is not None)):
+            output = _NativeConvolutionFunction.apply(x, native_weight, native_bias, geometry, compression)
+        else:
+            # Keep ordinary native autograd when compression is disabled. The
+            # compressed Function deliberately saves a lossy source for dW.
+            output = native(x, native_weight, native_bias, geometry.stride, geometry.padding, geometry.dilation, geometry.groups)
+        if checked["fp8_training"]["out_dtype"] is not None:
+            output = output.to(checked["fp8_training"]["out_dtype"])
+    elif not fp8:
         output = _NativeConvolutionFunction.apply(x, weight, bias, geometry, compression)
     else:
         training = checked["fp8_training"]
-        if training["backend"] == "triton" and input.device.type != "cuda":
-            raise ValueError("The Triton convolution backend requires CUDA")
+        if training["backend"] != "reference" and input.device.type != "cuda":
+            raise ValueError(f"The {training['backend'].capitalize()} convolution backend requires CUDA")
         if training["scaling_recipe"] == "delayed":
             if scaling_state is None:
                 raise ValueError("Delayed scaling requires a prepared convolution adapter or FX call site")
@@ -172,4 +217,7 @@ def convolution(rank, input, weight, bias=None, stride=1, padding=0, dilation=1,
                     x, weight, bias, geometry, checked, out_dtype,
                     torch.is_grad_enabled() and any(t.requires_grad for t in (x, weight, bias) if t is not None),
                     weight_cache, scaling_state, state_training and torch.is_grad_enabled())
+    if execution_info is not None:
+        execution_info.update(input_strides=tuple(x.stride()), output_strides=tuple(output.stride()),
+                              output_dtype=str(output.dtype))
     return output.squeeze(0) if unbatched else output

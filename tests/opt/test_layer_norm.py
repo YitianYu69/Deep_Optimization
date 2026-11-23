@@ -15,9 +15,10 @@ from deepopt.opt.nn import functional as doF
 from deepopt.opt.nn.normalization.modules import DOLayerNorm
 from deepopt.opt.policy import normalization_plan, prepare_fp8_model
 from deepopt.opt.precision import precision_report
-from deepopt.opt.quantization.activation import quantize_pack_activation, dequantize_unpack_activation
+from deepopt.opt.quantization.activation import quantize_pack_activation
 from deepopt.opt.quantization.activation_tensor import FP8Activation, to_fp8_activation, dequantize_activation
 from deepopt.opt.quantization.quantizer import quantize_fp8
+from tests.opt.test_layer_norm_moments import restored_xhat
 
 
 def policy(compressed=True, *, bits=2, group=17, block=None, recipe="current"):
@@ -77,11 +78,11 @@ class LayerNormTests(unittest.TestCase):
                 h, _, inverse = oracle(x.detach(), (3, 19))
                 effective = min(group, 57)
                 q = quantize_pack_activation(h, effective, (1, effective), bits=bits)
-                self.assertEqual(len(saved), 5)
+                self.assertEqual(len(saved), 7)
                 self.assertFalse(any(t is x or t.shape == x.shape for t in saved))
                 for actual, expected in zip(saved[:3], (q.data, q.step, q.minimum)):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                reconstructed = dequantize_unpack_activation(q, dtype=torch.float32)
+                reconstructed, _, _ = restored_xhat(h, effective, bits)
                 dy = torch.randn_like(x)
                 output.backward(dy)
                 u = dy.reshape_as(h) * w.detach().reshape(1, -1)
@@ -153,8 +154,7 @@ class LayerNormTests(unittest.TestCase):
             y.backward(dy)
             if need_dx or need_dw:
                 h, _, inverse = oracle(x.detach(), (7,))
-                q = quantize_pack_activation(h, 7, (1, 7), bits=2)
-                h = dequantize_unpack_activation(q, dtype=torch.float32)
+                h, _, _ = restored_xhat(h, 7, 2)
                 if need_dx:
                     u = dy * w.detach()
                     dx = (u - u.mean(1, keepdim=True) - h * (u * h).mean(1, keepdim=True)) * inverse[:, None]
@@ -163,7 +163,7 @@ class LayerNormTests(unittest.TestCase):
                     torch.testing.assert_close(w.grad, (dy * h).sum(0))
             if need_db:
                 torch.testing.assert_close(b.grad, dy.sum(0))
-            self.assertEqual(len(saved), 5 if need_dx else 3 if need_dw else 0)
+            self.assertEqual(len(saved), 7 if need_dx else 6 if need_dw else 0)
 
     def test_no_grad_fake_meta_and_explicit_scales(self):
         for device in ("meta", "cpu"):

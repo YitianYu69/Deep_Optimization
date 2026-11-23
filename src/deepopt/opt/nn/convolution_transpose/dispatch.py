@@ -1,5 +1,7 @@
 """Plan-driven transposed compute with independent activation compression."""
 
+from deepopt.kernel_policy import kernel_entry
+
 from contextlib import nullcontext
 
 import torch
@@ -26,8 +28,9 @@ def convolution_execution(geometry, plan):
     reason = None
     backward = requested
     if not pointwise and requested in ("native_fast", "native_precise"):
-        backward = "triton"
-        reason = "Native scaled GEMM applies to pointwise convolution; spatial gradients use Triton"
+        from deepopt.kernel_policy import kernel_backend
+        backward = kernel_backend("convolution", backend=backend)
+        reason = f"Native scaled GEMM applies to pointwise convolution; spatial gradients use {backward}"
     return {"forward": mode, "backward": backward, "pointwise": pointwise,
             "compression": training["activation_compression"]["enabled"], "fallback_reason": reason}
 
@@ -43,6 +46,7 @@ def _normalize(rank, x, weight, stride, padding, output_padding, groups, dilatio
     return x, geometry, unbatched
 
 
+@kernel_entry
 def convolution_transpose(rank, input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1,
                 *, plan=None, weight_cache=None, scaling_state=None, state_training=True, execution_info=None, output_slot=None):
     from ..functional import _prepare_linear_plan, _prepare_fp8_plan
@@ -120,8 +124,8 @@ def convolution_transpose(rank, input, weight, bias=None, stride=1, padding=0, o
         output = _NativeConvTransposeFunction.apply(x, weight, bias, geometry, compression)
     else:
         training = checked["fp8_training"]
-        if training["backend"] == "triton" and input.device.type != "cuda":
-            raise ValueError("The Triton convolution backend requires CUDA")
+        if training["backend"] != "reference" and input.device.type != "cuda":
+            raise ValueError(f"The {training['backend'].capitalize()} convolution backend requires CUDA")
         if training["scaling_recipe"] == "delayed":
             if scaling_state is None:
                 raise ValueError("Delayed scaling requires a prepared convolution adapter or FX call site")

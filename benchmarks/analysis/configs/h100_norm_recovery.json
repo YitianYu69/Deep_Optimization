@@ -1,0 +1,112 @@
+{
+  "settings": {
+    "runtime": {
+      "scope_lifetime": "reused",
+      "numerical_probe": "random_upstream"
+    }
+  },
+  "grid": {
+    "runtime.norm_kernel_variant": [
+      "baseline",
+      "auto",
+      "candidate"
+    ],
+    "runtime.execution": [
+      "eager",
+      "graph"
+    ]
+  },
+  "workloads": [
+    {
+      "name": "ln_small",
+      "op": "layer_norm",
+      "shape": [
+        32,
+        197,
+        768
+      ]
+    },
+    {
+      "name": "ln_vit",
+      "op": "layer_norm",
+      "shape": [
+        512,
+        197,
+        768
+      ]
+    },
+    {
+      "name": "ln_wide",
+      "op": "layer_norm",
+      "shape": [
+        32,
+        197,
+        3072
+      ]
+    },
+    {
+      "name": "bn_large",
+      "op": "batch_norm",
+      "shape": [
+        16,
+        64,
+        56,
+        56
+      ]
+    },
+    {
+      "name": "bn_small",
+      "op": "batch_norm",
+      "shape": [
+        32,
+        256,
+        7,
+        7
+      ]
+    },
+    {
+      "name": "gn_small",
+      "op": "group_norm",
+      "shape": [
+        16,
+        128,
+        7,
+        7
+      ],
+      "kwargs": {
+        "num_groups": 32
+      }
+    },
+    {
+      "name": "gn_large",
+      "op": "group_norm",
+      "shape": [
+        16,
+        64,
+        56,
+        56
+      ],
+      "kwargs": {
+        "num_groups": 8
+      }
+    }
+  ],
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  }
+}

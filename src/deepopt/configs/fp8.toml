@@ -25,6 +25,7 @@ activation_dtype = "e4m3fn"
 weight_dtype = "e4m3fn"
 grad_dtype = "e4m3fn"
 num_stages = "auto"
+autotune = true                    # Set false to skip runtime kernel searches (useful for DDP startup).
 # Omit out_dtype to follow the active AMP/input dtype.
 # out_dtype = "fp32"
 

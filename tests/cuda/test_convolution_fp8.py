@@ -13,7 +13,7 @@ from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 class ConvolutionFP8CUDATests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(929)
-        self.enterContext(torch.backends.cudnn.flags(deterministic=True))
+        self.enterContext(torch.backends.cudnn.flags(enabled=True, deterministic=True))
 
     def test_spatial_fp8_forward_dx_dw_match_explicit_quantized_reference(self):
         from deepopt import FP8Config

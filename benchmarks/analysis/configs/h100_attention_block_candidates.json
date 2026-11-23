@@ -1,0 +1,125 @@
+{
+  "settings": {
+    "fp8": {
+      "backend": "triton",
+      "trace_mode": "modules",
+      "num_stages": 3,
+      "backward_backend": "native_fast",
+      "backward_precision": "native"
+    },
+    "compression": {
+      "bits": 2,
+      "group_size": 1024,
+      "norm_xhat_recenter": true
+    },
+    "runtime": {
+      "binding": "prepared",
+      "scope_lifetime": "reused",
+      "optimizer": "adamw",
+      "optimizer_options": {
+        "weight_decay": 0
+      },
+      "lr": 0.0001,
+      "cache_enabled": false,
+      "check_finite": false,
+      "execution": "graph",
+      "timing_fill_uninitialized_memory": false,
+      "spatial_activation_layout": "auto",
+      "codec_num_warps": "auto",
+      "gelu_saved_state": "auto",
+      "native_operand_layout": "prepare",
+      "attention_backend": "flash_attn_2",
+      "attention_pack": "auto"
+    }
+  },
+  "workloads": [
+    {
+      "name": "attention_block_interleaved",
+      "op": "model",
+      "shape": [
+        512,
+        197,
+        768
+      ],
+      "input_requires_grad": true,
+      "factory": "analysis.example_model:build_attention_block",
+      "factory_kwargs": {
+        "batch_size": 512,
+        "sequence_length": 197,
+        "width": 768,
+        "heads": 12,
+        "source_layout": "interleaved"
+      },
+      "calls_per_step": 1
+    },
+    {
+      "name": "attention_block_bshd",
+      "op": "model",
+      "shape": [
+        512,
+        197,
+        768
+      ],
+      "input_requires_grad": true,
+      "factory": "analysis.example_model:build_attention_block",
+      "factory_kwargs": {
+        "batch_size": 512,
+        "sequence_length": 197,
+        "width": 768,
+        "heads": 12,
+        "source_layout": "bshd"
+      },
+      "calls_per_step": 1
+    },
+    {
+      "name": "attention_block_bhsd",
+      "op": "model",
+      "shape": [
+        512,
+        197,
+        768
+      ],
+      "input_requires_grad": true,
+      "factory": "analysis.example_model:build_attention_block",
+      "factory_kwargs": {
+        "batch_size": 512,
+        "sequence_length": 197,
+        "width": 768,
+        "heads": 12,
+        "source_layout": "bhsd"
+      },
+      "calls_per_step": 1
+    }
+  ],
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  },
+  "grid": {
+    "runtime.attention_pack": [
+      "auto",
+      "separate",
+      "joint"
+    ],
+    "runtime.attention_grad_layout": [
+      "auto",
+      "bshd",
+      "bhsd",
+      "interleaved"
+    ]
+  }
+}

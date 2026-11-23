@@ -20,6 +20,9 @@ from deepopt.memory.planning import loader_batch_size
 from deepopt.memory.statistics import log_model_memory, summarize_model_memory
 from deepopt.engine.training.loops import EpochRunner
 from deepopt.engine.training.progress import EpochProgress
+from deepopt.engine.training.progress_bar import (
+    ProgressBarMode, TrainingProgress, progress_bar_mode, validate_progress_bar_every_steps,
+)
 from deepopt.engine.execution.runtime import TrainingRuntime
 from deepopt.engine.training.state import TrainingState
 from deepopt.engine.training.steps import StepAdapter
@@ -63,7 +66,8 @@ class Trainer:
                  loss_strategy: LossStrategy | None = None, gradient_strategy: GradientStrategy | None = None,
                  loss_fn=None, step_fn=None, validation_step_fn=None, metrics=None, metric_inputs=None,
                  checks=None, ddp_options=_UNSET, execution_mode=_UNSET, diagnostics=_UNSET, mode_schedule=_UNSET,
-                 non_blocking=None, experiment_identity=_UNSET, schedules=_UNSET, fp8=_UNSET, config=None):
+                 non_blocking=None, fill_uninitialized_memory=_UNSET,
+                 experiment_identity=_UNSET, schedules=_UNSET, fp8=_UNSET, config=None):
         with distributed.collective_errors("trainer configuration"):
             explicit_training = {"accumulation_steps": accumulation_steps,
                                  "scheduler_interval": scheduler_interval}
@@ -84,6 +88,7 @@ class Trainer:
                     checks=checks if checks is not None else _UNSET, grad_clip_norm=grad_clip_norm,
                     execution_mode=execution_mode, diagnostics=diagnostics, mode_schedule=mode_schedule,
                     non_blocking=non_blocking if non_blocking is not None else _UNSET,
+                    fill_uninitialized_memory=fill_uninitialized_memory,
                     fp8=fp8, model=model, ddp_options=ddp_options, training_overrides=explicit_training)
             training = self._config_snapshot.get("training", {})
             scheduler_was_explicit = scheduler is not _UNSET
@@ -104,7 +109,8 @@ class Trainer:
             if isinstance(model, TrainingRuntime):
                 if (any(value is not None for value in (optimizer, device, precision, gradient_strategy, checks, non_blocking))
                         or any(value is not _UNSET and value is not None for value in
-                               (grad_clip_norm, ddp_options, execution_mode, diagnostics, mode_schedule, fp8))):
+                               (grad_clip_norm, ddp_options, execution_mode, diagnostics, mode_schedule, fp8,
+                                fill_uninitialized_memory))):
                     raise ValueError("Configure optimizer, device, precision, gradients, and checks on the supplied runtime")
                 self.runtime = model
         if not isinstance(model, TrainingRuntime):
@@ -298,7 +304,7 @@ class Trainer:
 
     def fit(self, train_loader, validation_loader=None, *, epochs=_UNSET,
             monitor=_DEFAULT_MONITOR, monitor_mode=_UNSET, callbacks=(), step_callbacks=(),
-            progress_bar: bool = True, config=None) -> TrainingState:
+            progress_bar: ProgressBarMode = True, progress_bar_every_steps: int = 1, config=None) -> TrainingState:
         """Control epochs and optional validation; delegate side effects to callbacks.
 
         Each callback(trainer, epoch_metrics) runs after validation and progress
@@ -310,8 +316,11 @@ class Trainer:
         Without a validation loader, validation results are empty and best-score
         selection is disabled. Otherwise the default monitor is validation loss;
         pass monitor=None explicitly to disable selection while still evaluating.
-        The optional progress bar reports completed epochs to stderr using only
-        their computed metrics. Set progress_bar=False to disable it entirely.
+        True (or "step") displays optimizer updates within each epoch on stderr.
+        "epoch" displays completed epochs; False disables the bar. Step progress
+        reports every progress_bar_every_steps optimizer updates, including live
+        loss and all accumulated training metrics. Metric summaries can synchronize
+        devices at reporting boundaries; validation metrics appear after evaluation.
         logging.memory_each_epoch in the trainer configuration enables a fresh
         memory report after each epoch's training and validation.
         """
@@ -338,8 +347,8 @@ class Trainer:
                 raise ValueError("Total epochs must exceed the number already completed")
             if monitor_mode not in ("min", "max"):
                 raise ValueError("monitor_mode must be min or max")
-            if type(progress_bar) is not bool:
-                raise ValueError("progress_bar must be a boolean")
+            progress_mode = progress_bar_mode(progress_bar)
+            validate_progress_bar_every_steps(progress_bar_every_steps)
             if monitor is _DEFAULT_MONITOR:
                 monitor = fit_settings.get("monitor", "loss") if validation_loader is not None else None
             if monitor is not None and (not isinstance(monitor, str) or not monitor):
@@ -354,6 +363,8 @@ class Trainer:
         self.runtime.core.require_equal({"epochs": epochs, "monitor": monitor, "monitor_mode": monitor_mode,
                                          "callbacks": len(callbacks), "step_callbacks": len(step_callbacks),
                                          "memory_each_epoch": memory_each_epoch,
+                                         "progress_bar_every_steps": (progress_bar_every_steps
+                                                                      if progress_mode == "step" else None),
                                          "validation": validation_loader is not None}, "fit settings")
         for callback in callbacks:
             start = getattr(callback, "on_fit_start", None)
@@ -363,11 +374,10 @@ class Trainer:
                                if callable(getattr(callback, "on_optimizer_step", None))) + step_callbacks
         self._stop_requested = False
         progress = None
-        if progress_bar and distributed.is_main_process():
-            from tqdm.auto import tqdm
-
-            progress = tqdm(total=epochs, initial=self.state.completed_epochs,
-                            desc="Training", unit="epoch", dynamic_ncols=True)
+        if progress_mode is not None and distributed.is_main_process():
+            progress = TrainingProgress(progress_mode, epochs=epochs,
+                                        completed_epochs=self.state.completed_epochs,
+                                        every_steps=progress_bar_every_steps)
         logger.info("Training started: completed=%s target=%s device=%s precision=%s accumulation=%s",
                     self.state.completed_epochs, epochs, self.device, self.precision, self.accumulation_steps)
         try:
@@ -378,7 +388,12 @@ class Trainer:
                     [group.get("lr") for group in self.optimizer.param_groups])
                 lr = learning_rates[0] if learning_rates else None
                 batch_size = loader_batch_size(train_loader)
-                training = self.train_epoch(train_loader, step_callbacks=step_callbacks)
+                training = self.train_epoch(train_loader, step_callbacks=step_callbacks,
+                                            _progress_bar=progress,
+                                            _progress_every_steps=(progress_bar_every_steps
+                                                                   if progress_mode == "step" else None))
+                if progress is not None and validation_loader is not None:
+                    progress.phase("Validation", metrics=training)
                 validation = self.evaluate(validation_loader) if validation_loader is not None else {}
                 if monitor is not None:
                     if monitor not in validation:
@@ -401,17 +416,14 @@ class Trainer:
                 if memory_each_epoch:
                     with self.runtime.core.check_errors("epoch memory logging"):
                         self._log_epoch_memory()
+                if progress is not None:
+                    progress.phase("Finalizing", metrics=training)
                 for callback in callbacks:
                     with self.runtime.core.check_errors("epoch callback"):
                         callback(self, row)
                 self._stop_requested = bool(distributed.reduce_number(int(self._stop_requested), torch.distributed.ReduceOp.MAX))
                 if progress is not None:
-                    postfix = {f"{phase}/{name}": value
-                               for phase, metrics in (("train", training), ("val", validation))
-                               for name, value in metrics.items()
-                               if name not in {"samples", "batches", "seconds", "samples_per_second"}}
-                    progress.set_postfix(postfix, refresh=False)
-                    progress.update(1)
+                    progress.finish_epoch(row)
         except BaseException as exc:
             # A failed validation or callback must not silently skip work when
             # fitting again. Recover from the last fully saved checkpoint.
@@ -431,10 +443,11 @@ class Trainer:
                     self.state.completed_epochs, self.state.optimizer_steps)
         return self.state
 
-    def train_epoch(self, loader, *, step_callbacks=()) -> dict:
+    def train_epoch(self, loader, *, step_callbacks=(), _progress_bar=None, _progress_every_steps=None) -> dict:
         if not self.at_epoch_boundary and not self._resume_pending:
             raise RuntimeError("Previous epoch failed; restore the last checkpoint before continuing")
-        if not self._resume_pending:
+        resuming = self._resume_pending
+        if not resuming:
             distributed.set_loader_epoch(loader, self.state.completed_epochs)
         progress = (self.epoch_progress if self._resume_pending else
                     EpochProgress(self.new_metrics(), self.state.optimizer_steps,
@@ -446,6 +459,11 @@ class Trainer:
         self.runtime.core.require_equal(len(step_callbacks), "step callback counts")
 
         selected_callbacks = []
+        progress_start_step = self.state.optimizer_steps
+        if _progress_bar is not None:
+            _progress_bar.start_epoch(loader, progress, epoch=self.state.completed_epochs + 1,
+                                      optimizer_steps=self.state.optimizer_steps,
+                                      accumulation_steps=self.accumulation_steps, resuming=resuming)
 
         def prepare_coefficients():
             self.schedules.prepare_update(self.state.optimizer_steps + 1, epoch=self.state.completed_epochs + 1)
@@ -478,6 +496,16 @@ class Trainer:
                 self.scheduler.step()
             self.at_step_boundary = True
             try:
+                live_metrics = None
+                if (_progress_every_steps is not None
+                        and (self.state.optimizer_steps - progress_start_step) % _progress_every_steps == 0):
+                    # Every rank summarizes the same accumulated states; only
+                    # rank zero renders. No metric forward/update is repeated.
+                    with self.runtime.diagnostic_scope("deepopt.progress", phase="report"), \
+                         self.runtime.core.check_errors("progress metric summary"):
+                        live_metrics = self._epochs.metrics.compute(progress.metrics, observe=self.runtime.observe)
+                if _progress_bar is not None:
+                    _progress_bar.update_step(self.state.optimizer_steps, metrics=live_metrics)
                 event = {"epoch": self.state.completed_epochs + 1,
                          "optimizer_step": self.state.optimizer_steps,
                          "batches_processed": progress.batches, "samples_processed": progress.samples}

@@ -11,12 +11,14 @@ INDEX_ALIASES = tuple(name + "_with_indices" for name in POOL_OPS if (
     name.startswith(("max_pool", "adaptive_max_pool", "fractional_max_pool"))))
 OPS = ("linear", "hf_conv1d", *(f"conv{n}d" for n in (1, 2, 3)),
        *(f"conv_transpose{n}d" for n in (1, 2, 3)), "batch_norm", "group_norm", "layer_norm",
-       *ACTIVATIONS, *POOL_OPS, *INDEX_ALIASES, "scaled_dot_product_attention", "multihead_attention",
+       *ACTIVATIONS, "mul", "pad", *POOL_OPS, *INDEX_ALIASES, "scaled_dot_product_attention", "multihead_attention",
        "linear_pipeline", "conv_pipeline", "attention_pipeline", "model",
        "activation_codec", "fp8_activation_codec", "boolean_codec", "index_codec")
 
 
 def family(op):
+    if op in ("mul", "pad"):
+        return "binary" if op == "mul" else "padding"
     if op in ("linear", "hf_conv1d", "linear_pipeline"):
         return "linear"
     if op.startswith("conv"):
@@ -36,7 +38,12 @@ def default_workload(op, small=False):
     if op not in OPS:
         raise ValueError(f"Unknown operator {op}")
     options = {}
-    if op in ("linear", "hf_conv1d", "linear_pipeline", "activation_codec", "fp8_activation_codec",
+    if op in ("mul", "pad"):
+        # Both multiplication coefficients exceed one compression group, even
+        # in a small positive fixture. Padding retains geometry, not values.
+        shape = [2, 1031] if small else [4096, 768]
+        options = {"other_shape": list(shape)} if op == "mul" else {"pad": [1, 2], "mode": "constant", "value": .25}
+    elif op in ("linear", "hf_conv1d", "linear_pipeline", "activation_codec", "fp8_activation_codec",
               "boolean_codec", "index_codec"):
         shape = [16, 32] if small else [4096, 768]
         if op in ("linear", "hf_conv1d", "linear_pipeline"):
@@ -106,6 +113,7 @@ def normalize_workload(value):
 
 def inventory():
     return [{"op": op, "family": family(op), "torch": (
+        "torch.mul" if op == "mul" else
         "torch.nn.MultiheadAttention" if op == "multihead_attention" else
         "transformers.pytorch_utils.Conv1D" if op == "hf_conv1d" else
         f"torch.nn.functional.{op.replace('_tanh', '')}" if op not in (

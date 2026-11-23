@@ -1,5 +1,31 @@
 # FP8 CUDA execution and autotuning
 
+To avoid runtime kernel searches, including during distributed startup, set:
+
+```toml
+[runtime.fp8]
+enabled = true
+backend = "triton"
+autotune = false
+num_stages = "auto"
+```
+
+The equivalent Python setting is `FP8Config(enabled=True, backend="triton", autotune=False)`.
+The default is `autotune=true`, preserving the existing search and cached-winner
+behavior. Disabling it applies to forward and backward GEMMs, native GEMM
+fallbacks, and delayed FP8 conversion. It bypasses the autotuners and does not
+read or populate their winner caches. Existing spatial convolution kernels
+already use fixed launches.
+
+Untuned GEMMs use the compatible historical tile/warp choice, a single split-K
+partition, and ungrouped scheduling. `num_stages="auto"` selects depth 3;
+an explicit depth from 1 to 5 is honored. Delayed conversion uses a fixed 32x32
+tile with four warps. These choices trade potentially lower steady-state
+throughput for shorter startup; they do not benchmark candidate configurations.
+Triton still JIT-compiles each required kernel specialization on first use.
+Use the same FP8 settings on every distributed rank. This removes autotune
+search delays but does not guarantee that unrelated NCCL timeout causes disappear.
+
 [FP8 guide](README.md) · [Benchmark catalog](../../benchmarks/README.md) · [Validation](validation.md)
 
 Use this guide when selecting CUDA kernels, measuring projections, or comparing
@@ -41,7 +67,7 @@ FP8 quantization, but may have lower throughput than native FP8 dot products.
 The backend packs strided/misaligned operands, pads partial tiles, and returns
 FP32/BF16/FP16 results. Correctness/performance must be measured on the target GPU.
 
-The kernel automatically uses Triton's native `@triton.autotune` to select
+With `autotune=true`, the kernel uses Triton's native `@triton.autotune` to select
 matrix tile sizes, warp counts, pipeline stages, grouped launch ordering, and
 eligible split-K factors. The search measures at most 48 configurations,
 retaining the historical tile/warp/stage choice as a measured candidate.

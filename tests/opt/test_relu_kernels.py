@@ -63,6 +63,7 @@ class ReLUKernelTests(unittest.TestCase):
                 node.decorator_list = []
             module = CPUCast().visit(ast.Module(body=functions, type_ignores=[]))
             exec(compile(ast.fix_missing_locations(module), path, "exec"), self.k)
+        self.k["_forward"],self.k["_backward"]=self.k["_relu_forward"],self.k["_relu_backward"]
 
     def launch(self, name, programs, *args):
         args = tuple(TypedPointer(value) if isinstance(value, torch.Tensor) else value for value in args)

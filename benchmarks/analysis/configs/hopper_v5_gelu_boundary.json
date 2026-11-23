@@ -1,0 +1,66 @@
+{
+  "settings": {
+    "fp8": {
+      "backend": "triton",
+      "trace_mode": "modules",
+      "num_stages": 3,
+      "backward_backend": "native_fast",
+      "backward_precision": "native"
+    },
+    "compression": {
+      "bits": 2,
+      "group_size": 1024,
+      "norm_xhat_recenter": true
+    },
+    "runtime": {
+      "binding": "functional",
+      "scope_lifetime": "reused",
+      "optimizer": "none",
+      "optimizer_options": {
+        "weight_decay": 0
+      },
+      "lr": 0.0001,
+      "cache_enabled": false,
+      "check_finite": false,
+      "execution": "graph",
+      "timing_fill_uninitialized_memory": false,
+      "spatial_activation_layout": "auto",
+      "output_dtype": "fp8",
+      "numerical_probe": "random_upstream"
+    }
+  },
+  "workloads": [
+    {
+      "name": "vit_gelu_fp8_edge",
+      "op": "gelu",
+      "shape": [
+        100864,
+        3072
+      ]
+    }
+  ],
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  },
+  "grid": {
+    "runtime.gelu_saved_state": [
+      "derivative",
+      "recompute"
+    ]
+  }
+}

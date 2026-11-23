@@ -29,7 +29,8 @@ class NormGeometry:
             raise ValueError("normalization kind must be batch or group")
         if len(self.shape) < 2 or self.kind == "batch" and len(self.shape) != 4:
             raise ValueError("BatchNorm2d requires N,C,H,W; GroupNorm requires N,C,*spatial")
-        if any(size <= 0 for size in self.shape[1:]) or self.shape[0] < 0:
+        if (self.shape[1] <= 0 or self.shape[0] < 0 or any(size < 0 for size in self.shape[2:])
+                or self.kind == "group" and any(size == 0 for size in self.shape[2:])):
             raise ValueError("normalization channels and spatial dimensions must be positive")
         if type(self.groups) is not int or self.groups <= 0 or self.shape[1] % self.groups:
             raise ValueError("num_groups must be positive and divide the channels")

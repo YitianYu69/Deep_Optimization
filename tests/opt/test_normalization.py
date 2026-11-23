@@ -20,6 +20,25 @@ class NormalizationTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(1893)
 
+    def test_functional_adapters_record_batch_and_group_execution(self):
+        from deepopt.opt.nn.normalization.modules import DOFunctionalNormalization
+        for kind in ("batch", "group"):
+            with self.subTest(kind=kind):
+                module = DOFunctionalNormalization(normalization_plan(False, activation_compression=True), kind)
+                x = torch.randn(2, 4, 3, 5, requires_grad=True)
+                y = (module(x, None, None, None, None, True) if kind == "batch" else module(x, 2))
+                first = module.last_execution
+                self.assertTrue(module.execution_info["compression"])
+                self.assertGreater(module.execution_info["saved_state_bytes"], 0)
+                self.assertEqual(module.execution_info["output"], "native")
+                y.sum().backward()
+                if kind == "batch":
+                    module(x.detach(), None, None, None, None, True)
+                else:
+                    module(x.detach(), 2)
+                self.assertIsNot(module.last_execution, first)
+                self.assertFalse(module.execution_info["compression"])
+
     def test_fp8_activation_autograd_relu_and_native_boundaries(self):
         x = torch.randn(2, 4, 3, 5, requires_grad=True)
         q = to_fp8_activation(x, block_shape=(4, 4))

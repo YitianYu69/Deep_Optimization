@@ -32,6 +32,56 @@ class CUDAGlobalConfigWhiteBoxTests(unittest.TestCase):
         self.assertFalse(decorated.captured)
         self.assertEqual(decorated._capture.warmup, 5)
 
+    def test_disabled_capture_skips_cuda_setup_warmup_and_model_mutation(self):
+        load_config(graph_config(enabled=False))
+        model = torch.nn.Linear(2, 1)
+        original = model.forward
+        function = Mock(return_value=torch.ones(2))
+        with patch("torch.cuda.is_available", side_effect=AssertionError("queried CUDA")), \
+                patch("torch.cuda.current_device", side_effect=AssertionError("selected CUDA")), \
+                patch("torch.cuda.Stream", side_effect=AssertionError("created stream")), \
+                patch("torch.cuda.CUDAGraph", side_effect=AssertionError("created graph")), \
+                patch("torch.cuda.make_graphed_callables", side_effect=AssertionError("captured callable")):
+            core = CUDAGraphCore()
+            handle = core.capture_model(model, (torch.ones(2, 2),))
+            decorated = core.capture(function)
+            core.warmup(function)
+            function.assert_not_called()
+            self.assertEqual(model.forward, original)
+            self.assertFalse(handle.captured)
+            self.assertIsNone(handle.graph)
+            decorated(torch.ones(2))
+            function.assert_called_once()
+            handle.close()
+            decorated.close()
+            with self.assertRaisesRegex(RuntimeError, "disabled"):
+                with core.capture():
+                    self.fail("disabled raw capture entered its body")
+
+    def test_enabled_switch_follows_core_and_handle_snapshot_precedence(self):
+        load_config(graph_config(enabled=False))
+        core = CUDAGraphCore()
+        existing = cuda_graph_core.capture(lambda value: value + 1)
+        load_config(graph_config(enabled=True))
+        self.assertFalse(core.capture().enabled)
+        self.assertFalse(existing.enabled)
+        self.assertTrue(cuda_graph_core.capture().enabled)
+        self.assertTrue(core.capture(config={"runtime": {"cuda_graph": {"enabled": True}}}).enabled)
+        load_config(graph_config())
+        self.assertTrue(cuda_graph_core.capture().enabled)
+
+    def test_disabling_an_already_captured_model_requires_closing_its_existing_handle(self):
+        model = torch.nn.Linear(2, 1)
+        original = model.forward
+        def forward(value):
+            return original(value)
+        forward._deepopt_cuda_capture = True
+        model.forward = forward
+        with self.assertRaisesRegex(ValueError, "close the existing capture"):
+            cuda_graph_core.capture_model(model, (torch.ones(1, 2),),
+                                          config={"runtime": {"cuda_graph": {"enabled": False}}})
+        self.assertIs(model.forward, forward)
+
     def test_ordinary_cores_snapshot_but_singleton_uses_defaults_for_each_new_handle(self):
         load_config(graph_config(device="cuda:1", warmup=4))
         core = CUDAGraphCore()
@@ -89,7 +139,7 @@ class CUDAGlobalConfigWhiteBoxTests(unittest.TestCase):
         self.assertFalse(function.captured)
 
     def test_direct_model_handle_resolves_config_before_native_dispatch(self):
-        load_config(graph_config(warmup=5, allow_unused_input=True))
+        load_config(graph_config(enabled=True, warmup=5, allow_unused_input=True))
         function = lambda value: value * 2
         with patch("deepopt.cuda_graph.model.cuda_device", return_value=torch.device("cpu")), \
                 patch("deepopt.cuda_graph.model.capture_guard", return_value=nullcontext()), \

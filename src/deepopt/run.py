@@ -14,6 +14,7 @@ from deepopt.memory.planning import apply_batch_size_plan, plan_batch_size
 from .baseline import baseline_sample_batch, build_baseline_experiment
 from .logger import init_logger, logging_session, log_output
 from .callbacks import EveryNSteps
+from .engine.training.progress_bar import ProgressBarMode, progress_bar_mode, validate_progress_bar_every_steps
 from .distributed import _process as distributed
 
 
@@ -37,17 +38,19 @@ def _append_json_record(path: Path, record: dict) -> None:
 
 def train(config=None, *, output=None, resume=None, epochs=None, batch_size=None,
           batch_size_mode="auto", sample_batch_fn=None, memory_budget_bytes=None,
-          checkpoint_every_steps=None, progress_bar=True, experiment_factory=build_baseline_experiment,
-          execution_mode=None) -> Path:
+          checkpoint_every_steps=None, progress_bar: ProgressBarMode = True, experiment_factory=build_baseline_experiment,
+          execution_mode=None, progress_bar_every_steps: int = 1) -> Path:
     """Run a configured experiment with artifacts and optional memory planning.
 
     config accepts an ExperimentConfig, a dictionary, a TOML path, or builtin:NAME.
     batch_size overrides the configured size. Auto may adjust it before fresh
-    or resumed training; manual keeps it fixed. Progress writes to stderr, while
-    completed epoch records are JSON on stdout.
+    or resumed training; manual keeps it fixed. True/"step" displays optimizer
+    updates on stderr; "epoch" displays completed epochs and False hides it.
+    progress_bar_every_steps sets the live loss/metric reporting cadence in
+    optimizer updates. Completed epoch records are JSON on stdout.
     """
-    if type(progress_bar) is not bool:
-        raise ValueError("progress_bar must be a boolean")
+    progress_bar_mode(progress_bar)
+    validate_progress_bar_every_steps(progress_bar_every_steps)
     if batch_size_mode not in ("auto", "manual"):
         raise ValueError("batch_size_mode must be auto or manual")
     if sample_batch_fn is not None and not callable(sample_batch_fn):
@@ -145,7 +148,11 @@ def train(config=None, *, output=None, resume=None, epochs=None, batch_size=None
         if history and payload["kind"] == "epoch" and trainer.state.best_epoch == trainer.state.completed_epochs:
             save(run_dir / "best.pt")
         write_history()
-        _write_text(run_dir / "config.json", json.dumps(asdict(config), indent=2) + "\n")
+        persisted = asdict(config)
+        # Persist the canonical descriptor shape: log naming and resolved
+        # snapshots omit the historical descriptor-v1 version field.
+        persisted["runtime"]["packed_activation_offload"] = config.runtime.packed_activation_offload.as_config()
+        _write_text(run_dir / "config.json", json.dumps(persisted, indent=2) + "\n")
         _write_text(run_dir / "environment.json", json.dumps(
             {**environment(), "device": str(trainer.device)}, indent=2) + "\n")
 
@@ -172,7 +179,7 @@ def train(config=None, *, output=None, resume=None, epochs=None, batch_size=None
                     callbacks=[record_epoch],
                     step_callbacks=[EveryNSteps(record_step, config.training.checkpoint_every_steps)]
                     if config.training.checkpoint_every_steps else [],
-                    progress_bar=progress_bar)
+                    progress_bar=progress_bar, progress_bar_every_steps=progress_bar_every_steps)
         logger.info("Run saved to %s", run_dir)
         return run_dir
 

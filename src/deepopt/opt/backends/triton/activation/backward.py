@@ -7,7 +7,7 @@ from .common import _load
 
 
 @triton.jit
-def _backward(data, inverse, saved, output, ROWS: tl.constexpr, COLS: tl.constexpr,
+def _relu_backward(data, inverse, saved, output, ROWS: tl.constexpr, COLS: tl.constexpr,
               SHAPE: tl.constexpr, CHANNELS: tl.constexpr, META: tl.constexpr,
               PACKED: tl.constexpr, REUSE: tl.constexpr, FP8: tl.constexpr, BLOCK: tl.constexpr):
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -23,3 +23,7 @@ def _backward(data, inverse, saved, output, ROWS: tl.constexpr, COLS: tl.constex
         tl.store(output + index, result.to(output.dtype.element_ty, fp_downcast_rounding="rtne"), valid)
     else:
         tl.store(output + index, result.to(output.dtype.element_ty), valid)
+
+
+# Preserve private launch imports; profiler names identify the actual operation.
+_backward = _relu_backward

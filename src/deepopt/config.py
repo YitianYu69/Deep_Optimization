@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any
 import tomllib
 
+from .kernel_policy import KernelConfig, kernel_config_from_dict, resolve_kernel_policy
+from ._bf16_policy import resolve_bf16_policy
+from ._activation_memory import ActivationMemoryConfig, resolve_activation_memory
+from ._packed_offload import (PackedActivationOffloadConfig, resolve_packed_offload,
+                             validate_packed_offload_execution)
+
 
 class ConfigError(ValueError):
     """A readable configuration contains invalid settings."""
@@ -60,6 +66,11 @@ class ActivationCompressionConfig:
 
 
 @dataclass(frozen=True)
+class AttentionConfig:
+    backend: str = "native"
+
+
+@dataclass(frozen=True)
 class FP8Config:
     enabled: bool = False
     backend: str = "reference"
@@ -81,6 +92,8 @@ class FP8Config:
     backward_precision: str = "native"
     exclude_modules: tuple[str, ...] = ()
     intercept_pooling: bool | None = None
+    autotune: bool = True
+    convolution_policy: str = "strict"
 
 
 @dataclass(frozen=True)
@@ -98,6 +111,12 @@ class RuntimeConfig:
     ddp: dict[str, Any] = field(default_factory=dict)
     cuda_graph: dict[str, Any] = field(default_factory=dict)
     activation_compression: ActivationCompressionConfig = field(default_factory=ActivationCompressionConfig)
+    fill_uninitialized_memory: bool | None = None
+    attention: AttentionConfig = field(default_factory=AttentionConfig)
+    kernels: KernelConfig = field(default_factory=KernelConfig)
+    bf16_policy: str = "torch_amp"
+    activation_memory: ActivationMemoryConfig = field(default_factory=ActivationMemoryConfig)
+    packed_activation_offload: PackedActivationOffloadConfig = field(default_factory=PackedActivationOffloadConfig)
 
 
 @dataclass(frozen=True)
@@ -261,7 +280,7 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
     r = raw.get("runtime", {})
     _require_keys(r, set(), "runtime", {"device", "precision", "deterministic", "checks", "execution_mode",
                                           "diagnostics", "mode_schedule", "non_blocking", "compile", "fp8", "ddp", "cuda_graph",
-                                          "activation_compression"})
+                                          "activation_compression", "activation_memory", "packed_activation_offload", "fill_uninitialized_memory", "attention", "kernels", "bf16_policy"})
     device, precision = r.get("device", "cpu"), r.get("precision", "fp32")
     if not isinstance(device, str) or not (
         device in ("cpu", "cuda", "auto") or
@@ -279,6 +298,9 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
     if type(checks) is not bool:
         raise ConfigError("runtime.checks must be a boolean")
     mode = r.get("execution_mode")
+    fill = r.get("fill_uninitialized_memory")
+    if fill is not None and type(fill) is not bool:
+        raise ConfigError("runtime.fill_uninitialized_memory must be a boolean or None")
     modes = ("max_speed", "balanced", "analyze")
     if mode is not None and mode not in modes:
         raise ConfigError(f"runtime.execution_mode must be max_speed, balanced, or analyze; got {mode!r}")
@@ -314,9 +336,49 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
         raise ConfigError("runtime.non_blocking must be a boolean")
     compilation = compile_config_from_dict(r.get("compile", {}))
     fp8 = fp8_config_from_dict(r.get("fp8", {}))
+    if "bf16_policy" in r and r["bf16_policy"] is None:
+        raise ConfigError("runtime.bf16_policy must be torch_amp or bf16_storage")
+    try:
+        bf16_policy = resolve_bf16_policy(r.get("bf16_policy", "torch_amp"))
+    except ValueError as exc:
+        raise ConfigError(f"runtime.bf16_policy: {exc}") from exc
+    if bf16_policy.storage_enabled and (precision != "bf16" or fp8.enabled):
+        raise ConfigError("runtime.bf16_policy=bf16_storage requires precision=bf16 and FP8 disabled")
+    try:
+        kernels = kernel_config_from_dict(r.get("kernels", {}))
+        resolve_kernel_policy(kernels, fp8_backend=fp8.backend if fp8.enabled else None)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     activation_compression = activation_compression_config_from_dict(r.get("activation_compression", {}))
+    activation_memory = activation_memory_config_from_dict(r.get("activation_memory", {}))
+    try:
+        resolve_activation_memory(activation_memory, compiler_options=(
+            compilation.options if compilation.backend == "deepopt" else None))
+    except ValueError as exc:
+        raise ConfigError(f"runtime.activation_memory: {exc}") from exc
     ddp = _ddp_config_from_dict(r.get("ddp", {}))
     cuda_graph = _cuda_graph_config_from_dict(r.get("cuda_graph", {}))
+    try:
+        if "packed_activation_offload" in r and r["packed_activation_offload"] is None:
+            raise ValueError("packed_activation_offload must be a configuration table")
+        packed_offload = resolve_packed_offload(r.get("packed_activation_offload"))
+        if "packed_activation_offload" in compilation.options:
+            selected = resolve_packed_offload(compilation.options["packed_activation_offload"])
+            if "packed_activation_offload" in r and selected != packed_offload:
+                raise ValueError("Runtime and compiler packed_activation_offload policies conflict")
+            packed_offload = selected
+        if packed_offload.enabled:
+            if not compilation.enabled or compilation.backend != "deepopt":
+                raise ValueError("Packed activation offload requires runtime.compile enabled with backend=deepopt")
+            # DDP options do not activate a distributed execution owner.
+            # TrainingRuntime rejects an actual multi-rank process group
+            # before constructing a core or running numerical work.
+            validate_packed_offload_execution(packed_offload,
+                device_type=None if device == "auto" else device,
+                compiler_options=compilation.options,
+                cuda_graph=bool(cuda_graph) and cuda_graph.get("enabled", True), fp8=fp8.enabled)
+    except ValueError as exc:
+        raise ConfigError(f"runtime.packed_activation_offload: {exc}") from exc
     loader = _loader_config_from_dict(raw.get("loader", {}))
     logging = _logging_config_from_dict(raw.get("logging", {}))
     identity = raw.get("experiment_identity", {})
@@ -325,7 +387,12 @@ def config_from_dict(raw: Mapping[str, Any]) -> ExperimentConfig:
     identity = _application_value(identity, "experiment_identity")
     return ExperimentConfig(name, seed, training, application=application,
                             runtime=RuntimeConfig(device, precision, deterministic, checks, mode, diagnostics, schedule,
-                                                  non_blocking, compilation, fp8, ddp, cuda_graph, activation_compression),
+                                                  non_blocking, compilation, fp8, ddp, cuda_graph, activation_compression,
+                                                  fill_uninitialized_memory=fill,
+                                                  attention=attention_config_from_dict(r.get("attention", {})),
+                                                  kernels=kernels, bf16_policy=bf16_policy.name,
+                                                  activation_memory=activation_memory,
+                                                  packed_activation_offload=packed_offload),
                             experiment_identity=identity, schedules=schedules, loader=loader, logging=logging)
 
 
@@ -345,7 +412,7 @@ def _ddp_config_from_dict(raw: Mapping[str, Any]) -> dict:
 
 def _cuda_graph_config_from_dict(raw: Mapping[str, Any]) -> dict:
     _require_keys(raw, set(), "runtime.cuda_graph", {
-        "device", "warmup", "allow_unused_input", "autograd", "capture_error_mode",
+        "enabled", "device", "warmup", "allow_unused_input", "autograd", "capture_error_mode",
     })
     result = dict(raw)
     device = result.get("device")
@@ -354,7 +421,7 @@ def _cuda_graph_config_from_dict(raw: Mapping[str, Any]) -> dict:
         raise ConfigError("runtime.cuda_graph.device must be cuda, cuda:N, or null")
     if "warmup" in result:
         _integer(result["warmup"], "runtime.cuda_graph.warmup", 1)
-    for key in ("allow_unused_input", "autograd"):
+    for key in ("enabled", "allow_unused_input", "autograd"):
         if key in result and type(result[key]) is not bool:
             raise ConfigError(f"runtime.cuda_graph.{key} must be a boolean")
     if result.get("capture_error_mode", "global") not in ("global", "thread_local", "relaxed"):
@@ -411,6 +478,46 @@ def _logging_config_from_dict(raw: Mapping[str, Any]) -> dict:
     return result
 
 
+def _packed_peak_profile_config(raw):
+    """Own and validate the one structured native peak-profile option.
+
+    Keep this schema Torch-free. BackendConfig subsequently converts these
+    portable rows to independent frozen ScopePeakWindow/Profile values.
+    """
+    if raw is None:
+        return None
+    location = "runtime.compile.options.packed_offload_peak_profile"
+    _require_keys(raw, {"schema_version", "scope_identity", "cuda_execution_verified",
+                        "source_receipt_sha256", "windows"}, location)
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
+        raise ConfigError(f"{location}.schema_version must be 1")
+    if raw["cuda_execution_verified"] is not True:
+        raise ConfigError(f"{location}.cuda_execution_verified must be true")
+    for key in ("scope_identity", "source_receipt_sha256"):
+        value = raw[key]
+        if type(value) is not str or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise ConfigError(f"{location}.{key} must be a lowercase SHA256")
+    if not isinstance(raw["windows"], (tuple, list)) or not raw["windows"]:
+        raise ConfigError(f"{location}.windows must be a nonempty list of target windows")
+    windows = []
+    for index, value in enumerate(raw["windows"]):
+        row_location = f"{location}.windows[{index}]"
+        _require_keys(value, {"region", "phase", "boundary", "baseline_bytes"}, row_location, {"source"})
+        phase = value["phase"]
+        if type(phase) is not str or phase not in ("forward", "backward"):
+            raise ConfigError(f"{row_location}.phase must be forward or backward")
+        source = value.get("source", "target_storage_ledger")
+        if type(source) is not str or source != "target_storage_ledger":
+            raise ConfigError(f"{row_location}.source must be target_storage_ledger")
+        windows.append({"region": _integer(value["region"], row_location+".region", 0),
+            "phase": phase, "boundary": _integer(value["boundary"], row_location+".boundary", 0),
+            "baseline_bytes": _integer(value["baseline_bytes"], row_location+".baseline_bytes", 0),
+            "source": source})
+    return {"schema_version": 1, "scope_identity": raw["scope_identity"],
+        "cuda_execution_verified": True, "source_receipt_sha256": raw["source_receipt_sha256"],
+        "windows": tuple(windows)}
+
+
 def compile_config_from_dict(raw: Mapping[str, Any]) -> CompileConfig:
     """Validate compiler settings without importing Torch or loading backends."""
     _require_keys(raw, set(), "runtime.compile", {"enabled", "backend", "mode", "fullgraph", "dynamic", "options"})
@@ -430,12 +537,34 @@ def compile_config_from_dict(raw: Mapping[str, Any]) -> CompileConfig:
     options = raw.get("options", {})
     if not isinstance(options, dict) or any(not isinstance(key, str) or not key for key in options):
         raise ConfigError("runtime.compile.options must be a table with nonempty string keys")
-    if any(type(value) not in (str, bool, int, float) or (type(value) is float and not isfinite(value))
-           for value in options.values()):
-        raise ConfigError("runtime.compile.options values must be strings, booleans or finite numbers")
+    for key, value in options.items():
+        if key == "packed_activation_offload" and backend == "deepopt":
+            try:
+                if value is None:
+                    raise ValueError("packed_activation_offload must be a configuration table")
+                options[key] = resolve_packed_offload(value).as_config()
+            except ValueError as exc:
+                raise ConfigError(f"runtime.compile.options.packed_activation_offload: {exc}") from exc
+        elif key == "packed_offload_peak_profile" and backend == "deepopt":
+            options[key] = _packed_peak_profile_config(value)
+        elif type(value) not in (str, bool, int, float) or (type(value) is float and not isfinite(value)):
+            raise ConfigError("runtime.compile.options values must be strings, booleans or finite numbers")
     if mode is not None and options:
         raise ConfigError("Choose runtime.compile.mode or runtime.compile.options, not both")
     return CompileConfig(raw.get("enabled", False), backend, mode, raw.get("fullgraph", False), dynamic, dict(options))
+
+
+def activation_memory_config_from_dict(raw) -> ActivationMemoryConfig:
+    """Parse the public table without accepting checkpoint descriptor fields."""
+    if isinstance(raw, ActivationMemoryConfig):
+        raw = {key: getattr(raw, key) for key in (
+            "multiply_backward", "pack_reuse", "reduction_scratch_bytes", "recompute_modules")}
+    _require_keys(raw, set(), "runtime.activation_memory", {
+        "multiply_backward", "pack_reuse", "reduction_scratch_bytes", "recompute_modules"})
+    try:
+        return ActivationMemoryConfig(**dict(raw))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"runtime.activation_memory: {exc}") from exc
 
 
 def delayed_scaling_config_from_dict(raw) -> DelayedScalingConfig:
@@ -456,6 +585,14 @@ def delayed_scaling_config_from_dict(raw) -> DelayedScalingConfig:
     if type(reduce) is not bool:
         raise ConfigError("delayed_scaling.reduce_amax must be boolean")
     return DelayedScalingConfig(history, algorithm, margin, reduce)
+
+
+def attention_config_from_dict(raw: Mapping[str, Any]) -> AttentionConfig:
+    _require_keys(raw, set(), "runtime.attention", {"backend"})
+    backend = raw.get("backend", "native")
+    if backend not in ("native", "flash_attn_2"):
+        raise ConfigError("runtime.attention.backend must be native or flash_attn_2")
+    return AttentionConfig(backend)
 
 
 def activation_compression_config_from_dict(raw: Mapping[str, Any]) -> ActivationCompressionConfig:
@@ -485,17 +622,17 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
                           "remove the setting for a new run, or use the original library to resume an older run")
     _require_keys(raw, set(), "runtime.fp8", {
         "enabled", "backend", "trace_mode", "activation_dtype", "weight_dtype",
-        "grad_dtype", "block_shapes", "num_stages", "out_dtype", "intercept_linear",
+        "grad_dtype", "block_shapes", "num_stages", "autotune", "out_dtype", "intercept_linear",
         "scaling_recipe", "delayed_scaling", "backward_backend", "exclude_modules", "intercept_convolution",
-        "intercept_normalization", "backward_precision", "intercept_pooling",
+        "intercept_normalization", "backward_precision", "intercept_pooling", "convolution_policy",
     })
     raw = _copy_tables(raw)
     enabled = raw.get("enabled", False)
     if type(enabled) is not bool:
         raise ConfigError("runtime.fp8.enabled must be a boolean")
     backend = raw.get("backend", "reference")
-    if backend not in ("reference", "triton"):
-        raise ConfigError("runtime.fp8.backend must be reference or triton")
+    if backend not in ("reference", "triton", "tilelang", "inherit"):
+        raise ConfigError("runtime.fp8.backend must be reference, triton, tilelang, or inherit")
     trace_mode = raw.get("trace_mode", "modules")
     if trace_mode not in ("full", "modules", "auto"):
         raise ConfigError("runtime.fp8.trace_mode must be full, modules, or auto")
@@ -517,6 +654,9 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
         if dtype not in ("e4m3fn", "e5m2"):
             raise ConfigError(f"runtime.fp8.{role}_dtype must be e4m3fn or e5m2")
     stages = raw.get("num_stages", "auto")
+    autotune = raw.get("autotune", True)
+    if type(autotune) is not bool:
+        raise ConfigError("runtime.fp8.autotune must be a boolean")
     if stages != "auto":
         stages = _integer(stages, "runtime.fp8.num_stages", 1)
         if stages > 5:
@@ -542,12 +682,15 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
         raise ConfigError("Delayed FP8 scaling currently requires tensorwise block_shapes")
     backward_backend = raw.get("backward_backend", "inherit")
     backward_precision = raw.get("backward_precision", "native")
+    convolution_policy = raw.get("convolution_policy", "strict")
+    if convolution_policy not in ("strict", "native_spatial", "depthwise"):
+        raise ConfigError("runtime.fp8.convolution_policy must be strict, native_spatial or depthwise")
     if backward_precision not in ("native", "auto"):
         raise ConfigError("runtime.fp8.backward_precision must be native or auto")
     if backward_backend not in ("inherit", "native_fast", "native_precise"):
         raise ConfigError("runtime.fp8.backward_backend must be inherit, native_fast, or native_precise")
-    if backward_backend != "inherit" and (backend != "triton" or any(block is not None for block in block_shapes.values())):
-        raise ConfigError("Native FP8 backward requires backend=triton and tensorwise block_shapes")
+    if backward_backend != "inherit" and (backend not in ("triton", "tilelang", "inherit") or any(block is not None for block in block_shapes.values())):
+        raise ConfigError("Native FP8 backward requires a custom backend and tensorwise block_shapes")
     exclusions = raw.get("exclude_modules", ())
     if (not isinstance(exclusions, (list, tuple))
             or any(not isinstance(pattern, str) or not pattern.strip() for pattern in exclusions)):
@@ -565,8 +708,9 @@ def fp8_config_from_dict(raw: Mapping[str, Any]) -> FP8Config:
                      intercept_normalization=intercept_normalization, intercept_pooling=intercept_pooling,
                      activation_dtype=dtypes["activation"], weight_dtype=dtypes["weight"],
                      grad_dtype=dtypes["grad"], block_shapes=block_shapes,
-                     num_stages=stages, out_dtype=out_dtype, scaling_recipe=recipe, delayed_scaling=delayed,
+                     num_stages=stages, autotune=autotune, out_dtype=out_dtype, scaling_recipe=recipe, delayed_scaling=delayed,
                      backward_backend=backward_backend, backward_precision=backward_precision,
+                     convolution_policy=convolution_policy,
                      exclude_modules=tuple(exclusions))
 
 

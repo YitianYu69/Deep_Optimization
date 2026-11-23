@@ -1,0 +1,173 @@
+{
+  "settings": {
+    "fp8": {
+      "backend": "triton",
+      "trace_mode": "modules",
+      "num_stages": 3,
+      "backward_backend": "native_fast",
+      "backward_precision": "native"
+    },
+    "compression": {
+      "bits": 2,
+      "group_size": 1024,
+      "norm_xhat_recenter": true
+    },
+    "runtime": {
+      "binding": "prepared",
+      "scope_lifetime": "reused",
+      "optimizer": "none",
+      "optimizer_options": {
+        "weight_decay": 0
+      },
+      "lr": 0.0001,
+      "cache_enabled": false,
+      "check_finite": false,
+      "execution": "graph",
+      "timing_fill_uninitialized_memory": false,
+      "spatial_activation_layout": "auto",
+      "codec_num_warps": "auto",
+      "gelu_saved_state": "auto",
+      "native_operand_layout": "prepare",
+      "attention_backend": "flash_attn_2",
+      "attention_pack": "auto",
+      "attention_grad_layout": "auto",
+      "activation_layout": "auto",
+      "convolution_kernel_variant": "auto"
+    }
+  },
+  "workloads": [
+    {
+      "name": "resnet_dense64",
+      "op": "conv2d",
+      "shape": [
+        512,
+        64,
+        56,
+        56
+      ],
+      "kwargs": {
+        "out_channels": 64,
+        "kernel_size": 3,
+        "padding": 1
+      },
+      "input_requires_grad": true,
+      "calls_per_step": 1
+    },
+    {
+      "name": "resnet_dense128",
+      "op": "conv2d",
+      "shape": [
+        512,
+        128,
+        28,
+        28
+      ],
+      "kwargs": {
+        "out_channels": 128,
+        "kernel_size": 3,
+        "padding": 1
+      },
+      "input_requires_grad": true,
+      "calls_per_step": 1
+    },
+    {
+      "name": "efficient_stem",
+      "op": "conv2d",
+      "shape": [
+        512,
+        3,
+        224,
+        224
+      ],
+      "kwargs": {
+        "out_channels": 32,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1
+      },
+      "input_requires_grad": true,
+      "calls_per_step": 1
+    },
+    {
+      "name": "efficient_depthwise96",
+      "op": "conv2d",
+      "shape": [
+        512,
+        96,
+        112,
+        112
+      ],
+      "kwargs": {
+        "out_channels": 96,
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "groups": 96
+      },
+      "input_requires_grad": true,
+      "calls_per_step": 1
+    },
+    {
+      "name": "vit_patch",
+      "op": "conv2d",
+      "shape": [
+        512,
+        3,
+        224,
+        224
+      ],
+      "kwargs": {
+        "out_channels": 768,
+        "kernel_size": 16,
+        "stride": 16
+      },
+      "input_requires_grad": true,
+      "calls_per_step": 1
+    },
+    {
+      "name": "efficient_pointwise",
+      "op": "conv2d",
+      "shape": [
+        512,
+        16,
+        112,
+        112
+      ],
+      "kwargs": {
+        "out_channels": 96,
+        "kernel_size": 1
+      },
+      "input_requires_grad": true,
+      "calls_per_step": 1
+    }
+  ],
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  },
+  "grid": {
+    "runtime.convolution_kernel_variant": [
+      "baseline",
+      "auto",
+      "tuned"
+    ],
+    "fp8.convolution_policy": [
+      "strict",
+      "depthwise"
+    ]
+  }
+}

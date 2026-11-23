@@ -3,6 +3,7 @@
 import torch
 
 from deepopt._config_resolution import _UNSET, resolve_config
+from deepopt._memory_policy import capture_memory_scope
 
 from ._configuration import _capture_settings
 from ._validation import cuda_device, warmup_count
@@ -44,6 +45,7 @@ class CUDAGraphCore:
         their identity. Plain functions are left unchanged: call the returned
         handle. Pass autograd=False for inference and a native .graph handle.
         Call close() to restore ordinary model execution.
+        runtime.cuda_graph.enabled=False returns an eager handle without setup.
         """
         snapshot, options = _capture_settings(config, base=self._config, device=self._device_override,
                                              warmup=warmup, allow_unused_input=allow_unused_input, autograd=autograd)
@@ -71,12 +73,15 @@ class CUDAGraphCore:
 
         This intentionally preserves side effects, including optimizer updates.
         The caller chooses grad/autocast mode and owns any state restoration.
+        Disabled graph capture skips warmup without invoking the function.
         """
-        _, options = _capture_settings(config, base=self._config, device=self._device_override, warmup=iterations)
+        snapshot, options = _capture_settings(config, base=self._config, device=self._device_override, warmup=iterations)
+        if not options["enabled"]:
+            return
         iterations = options["warmup"]
         warmup_count(iterations)
         device = cuda_device(options["device"])
-        with torch.cuda.device(device):
+        with capture_memory_scope(snapshot), torch.cuda.device(device):
             stream = stream or torch.cuda.Stream(device=device)
             if stream.device != device:
                 raise ValueError("Warmup stream must belong to the graph's device")

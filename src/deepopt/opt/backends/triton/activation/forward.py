@@ -8,7 +8,7 @@ from ..quantization.fp8 import _scale
 
 
 @triton.jit
-def _forward(data, inverse, output, saved, scales, out_inverse, errors, observations, snapshot,
+def _relu_forward(data, inverse, output, saved, scales, out_inverse, errors, observations, snapshot,
              ROWS: tl.constexpr, COLS: tl.constexpr, SHAPE: tl.constexpr, CHANNELS: tl.constexpr,
              META: tl.constexpr, FP8: tl.constexpr, REUSE: tl.constexpr, CURRENT: tl.constexpr,
              BR: tl.constexpr, BC: tl.constexpr, SCALE_COLS: tl.constexpr, MAXIMUM: tl.constexpr,
@@ -123,3 +123,7 @@ def _partial_relu_amax(data, inverse, partials, ROWS: tl.constexpr, COLS: tl.con
     valid = (offsets < BR * BC) & (row < ROWS) & (col < COLS)
     _, value = _load(data, inverse, row, col, valid, COLS, SHAPE, CHANNELS, META)
     tl.store(partials + pid, tl.max(tl.abs(tl.where(value < 0, 0.0, value)), 0))
+
+
+# Preserve private launch imports; profiler names identify the actual operation.
+_forward = _relu_forward

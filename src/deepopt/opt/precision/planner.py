@@ -29,6 +29,11 @@ class _PrecisionForward:
         self.owner = owner
         self.override = owner.__dict__.get("forward")
 
+    @property
+    def __code__(self):
+        # FX/Dynamo inspect callable forwards when compiling copied graphs.
+        return type(self).__call__.__code__
+
     def __call__(self, *args, **kwargs):
         if getattr(self.owner, "_deepopt_gradient_dynamic_device", False):
             from torch.utils._pytree import tree_leaves
@@ -107,6 +112,37 @@ def _metadata(node):
             or node.op == "call_method" and node.target in ("size", "stride", "dim", "numel"))
 
 
+def _fp8_convolution_consumer(plan, kernel, stride=1, padding=0, groups=1):
+    """Match native-spatial executor eligibility before introducing FP8 edges."""
+    training = plan.get("fp8_training", {})
+    if not training:
+        return False
+    if training.get("convolution_policy", "strict") != "native_spatial":
+        return True
+    if kernel is None or type(groups) is not int or groups != 1:
+        return False
+    stride = (stride,) if type(stride) is int else stride
+    padding = (0,) if padding == "valid" else (padding,) if type(padding) is int else padding
+    return (isinstance(stride, (tuple, list)) and isinstance(padding, (tuple, list))
+            and all(value == 1 for value in kernel) and all(value == 1 for value in stride)
+            and all(value == 0 for value in padding)
+            and all(block is None for block in plan["block_shapes"].values()))
+
+
+def _functional_convolution_consumer(node, graph, plan):
+    weight = node.args[1] if len(node.args) > 1 else node.kwargs.get("weight")
+    if isinstance(weight, fx.Node) and weight.op == "get_attr":
+        owner = graph
+        for field in str(weight.target).split("."):
+            owner = getattr(owner, field)
+        weight = owner
+    kernel = tuple(weight.shape[2:]) if isinstance(weight, torch.Tensor) else None
+    def argument(name, position, default):
+        return node.kwargs.get(name, node.args[position] if len(node.args) > position else default)
+    return _fp8_convolution_consumer(plan, kernel, argument("stride", 3, 1),
+                                     argument("padding", 4, 0), argument("groups", 6, 1))
+
+
 def _consumer(node, graph, producer, settings):
     from ..nn.linear import DOLinear
     from ..nn.hf_conv1d import DOHFConv1D
@@ -135,9 +171,13 @@ def _consumer(node, graph, producer, settings):
         if isinstance(module, (DOLinear, DOHFConv1D, DOFunctionalLinear)):
             return "last"
         if isinstance(module, DOFunctionalConvolution):
+            if not _functional_convolution_consumer(node, graph, module.plan):
+                return None
             padding = node.kwargs.get("padding", node.args[4] if len(node.args) > 4 else 0)
             return None if isinstance(padding, str) and padding == "same" else "channels"
         if isinstance(module, (DOConv1d, DOConv2d, DOConv3d)):
+            if not _fp8_convolution_consumer(module.plan, module.kernel_size, module.stride, module.padding, module.groups):
+                return None
             if module.padding_mode != "zeros" or module.padding == "same" and any(
                 d * (k - 1) % 2 for d, k in zip(module.dilation, module.kernel_size)
             ):
@@ -188,6 +228,10 @@ def _consumer(node, graph, producer, settings):
         if node.target in conv and (node.target in conv[:3] or (
             settings.intercept_linear if settings.intercept_convolution is None else settings.intercept_convolution
         )):
+            from ..policy import fp8_plan
+            plan = node.kwargs.get("plan") or fp8_plan(settings)
+            if not _functional_convolution_consumer(node, graph, plan):
+                return None
             padding = node.kwargs.get("padding", node.args[4] if len(node.args) > 4 else 0)
             return None if isinstance(padding, str) and padding == "same" else "channels"
         if node.target in (do_batch_norm, do_group_norm):
@@ -211,6 +255,11 @@ def _requirements(node, graph, training, settings):
             result.update(({"channels"} if wanted else set()) if global_pool_flatten(user, graph) else wanted)
         else:
             layout = _consumer(user, graph, node, settings)
+            if (layout == "either" and settings.convolution_policy == "native_spatial"
+                    and not _requirements(user, graph, training, settings)):
+                # A chain of compatible operators still ends at a native
+                # consumer. Avoid an FP8 island that immediately decodes again.
+                layout = None
             if layout is not None:
                 result.add(layout)
     return result
@@ -436,6 +485,16 @@ def prepare_precision_plan(model, settings):
     if backward_auto:
         model._deepopt_precision_plan["backward_edges"] = tuple(backward_edges)
     model.forward = _PrecisionForward(model)
+    if isinstance(model, fx.GraphModule):
+        # FX reconstructs its generated forward during deepcopy and otherwise
+        # drops non-graph root attributes. Preserve the host precision frame
+        # and its registered-state aliases using FX's own copied metadata.
+        from torch.fx import graph_module
+
+        key = getattr(graph_module, "_USER_PRESERVED_ATTRIBUTES_KEY", "_user_preserved_attributes")
+        preserved = model.meta.setdefault(key, {})
+        preserved.update({name: value for name, value in model.__dict__.items() if name.startswith("_deepopt")})
+        preserved["forward"] = model.forward
     return model
 
 
