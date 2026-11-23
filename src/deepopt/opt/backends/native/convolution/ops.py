@@ -192,10 +192,15 @@ def native_input_bias_gradients(grad_output, weight, geometry, output_mask, *,
         and geometry.groups == geometry.in_channels == geometry.out_channels
         and grad_output.dtype != torch.bfloat16)
     dilated_bias = need_db and any(dilation != 1 for dilation in geometry.dilation)
+    # oneDNN transposed convolution can reduce the bias in a different order
+    # from Tensor.sum. Preserve ATen's reduction when it can select oneDNN.
+    onednn_transposed_bias = (need_db and transposed and grad_output.device.type == "cpu"
+        and torch.backends.mkldnn.enabled and torch.backends.mkldnn.is_available())
+    native_bias_rounding = depthwise_bias or dilated_bias or onednn_transposed_bias
     transposed_supported = (not transposed or geometry.rank == 1
                             or grad_output.dtype == torch.bfloat16)
     layout_supported = grad_output.is_contiguous(memory_format=input_memory_format)
-    optimized = (_shape_only_cpu_eligible(grad_output) and not depthwise_bias and not dilated_bias
+    optimized = (_shape_only_cpu_eligible(grad_output) and not native_bias_rounding
                  and transposed_supported and layout_supported)
     if execution_info is not None:
         execution_info["input_bias_gradient_route"] = ("shape_only_cpu" if optimized
@@ -203,7 +208,7 @@ def native_input_bias_gradients(grad_output, weight, geometry, output_mask, *,
         execution_info["input_bias_gradient_fallback_reason"] = (None if optimized else
             "device_dtype_or_deterministic_policy" if not _shape_only_cpu_eligible(grad_output) else
             "upstream_layout" if not layout_supported else
-            "native_bias_rounding" if depthwise_bias or dilated_bias else "transposed_dtype_rank")
+            "native_bias_rounding" if native_bias_rounding else "transposed_dtype_rank")
     if optimized:
         dx = None
         if need_dx:

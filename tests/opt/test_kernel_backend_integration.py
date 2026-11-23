@@ -247,14 +247,18 @@ class KernelBackendIntegrationTests(unittest.TestCase):
 import builtins, sys, torch
 import torch._dynamo
 from torch import nn
-from deepopt.opt.policy import prepare_fp8_model
-from deepopt._config_resolution import ResolvedConfig
+optional_compilers = {'triton', 'tilelang'}
+def loaded_compilers():
+    return {name for name in sys.modules if name.split('.', 1)[0] in optional_compilers}
+torch_compilers = loaded_compilers()
 original = builtins.__import__
 def guarded(name, *args, **kwargs):
-    if name.split('.', 1)[0] in ('triton', 'tilelang'):
+    if name.split('.', 1)[0] in optional_compilers:
         raise AssertionError('optional compiler import: ' + name)
     return original(name, *args, **kwargs)
 builtins.__import__ = guarded
+from deepopt.opt.policy import prepare_fp8_model
+from deepopt._config_resolution import ResolvedConfig
 selected = sys.argv[1]
 foreign = 'triton' if selected == 'tilelang' else 'tilelang'
 config = ResolvedConfig({'runtime': {'kernels': {'backend': selected},
@@ -265,7 +269,7 @@ x = torch.randn(2, 8, requires_grad=True)
 prepared(x).sum().backward()
 assert torch.isfinite(x.grad).all()
 assert not any(name.startswith('deepopt.opt.backends.' + foreign) for name in sys.modules)
-assert 'triton' not in sys.modules and 'tilelang' not in sys.modules
+assert loaded_compilers() == torch_compilers, sorted(loaded_compilers() - torch_compilers)
 """
         env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[2] / "src"))
         for selected in ("triton", "tilelang"):

@@ -85,6 +85,36 @@ class SpatialBufferAllocationTests(unittest.TestCase):
                         torch.testing.assert_close(actual, oracle)
                         torch.testing.assert_close(expected, oracle)
 
+    def test_transposed_bias_uses_native_reduction_when_onednn_is_enabled(self):
+        x = torch.randn(2, 4, 5, requires_grad=True)
+        weight = torch.randn(4, 3, 3)
+        bias = torch.randn(6, requires_grad=True)
+        options = dict(stride=2, padding=1, output_padding=1, groups=2)
+        geometry = ConvTransposeGeometry.from_tensors(x, weight, **options)
+        # Exercise the routing predicate on builds without oneDNN as well.
+        with (
+            torch.backends.mkldnn.flags(enabled=True),
+            patch.object(torch.backends.mkldnn, "is_available", return_value=True),
+        ):
+            output = F.conv_transpose1d(x, weight, bias, **options)
+            gradient = torch.randn_like(output)
+            for need_dx in (False, True):
+                with self.subTest(need_dx=need_dx):
+                    inputs = (x, bias) if need_dx else (bias,)
+                    expected = torch.autograd.grad(output, inputs, gradient, retain_graph=True)
+                    repeated = torch.autograd.grad(output, inputs, gradient, retain_graph=True)
+                    for first, second in zip(expected, repeated):
+                        torch.testing.assert_close(first, second, rtol=0, atol=0)
+                    info = {}
+                    dx, _, db = native_input_bias_gradients(gradient, weight if need_dx else None, geometry,
+                        (need_dx, False, True), transposed=True, execution_info=info)
+                    self.assertEqual(info["input_bias_gradient_fallback_reason"], "native_bias_rounding")
+                    torch.testing.assert_close(db, expected[-1], rtol=0, atol=0)
+                    if need_dx:
+                        torch.testing.assert_close(dx, expected[0], rtol=0, atol=0)
+                    else:
+                        self.assertIsNone(dx)
+
     def test_deterministic_and_depthwise_bias_policies_keep_visible_native_fallback(self):
         x, weight = torch.randn(2, 4, 7, 8), torch.randn(4, 1, 3, 3)
         geometry = ConvGeometry.from_tensors(x, weight, padding=1, groups=4)
