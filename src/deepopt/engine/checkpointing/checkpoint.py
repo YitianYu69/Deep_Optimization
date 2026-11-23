@@ -24,9 +24,10 @@ from deepopt.engine.checkpointing.strategy_state import snapshot_strategies, val
 from deepopt.memory.planning import loader_batch_size, plan_batch_size, apply_batch_size_plan
 from deepopt.module import TrainingModule
 from deepopt.optimizers import MultiOptimizer
-from deepopt.opt._recipe import fp8_recipe
+from deepopt.opt._recipe import fp8_recipe, activation_compression_recipe, kernel_recipe
 from deepopt.logger import init_logger
-from .identity import snapshot_identity, validate_identity
+from .identity import (snapshot_identity, validate_identity, normalized_bf16_settings,
+                       model_bf16_policy, model_activation_memory)
 
 
 logger = init_logger("deepopt.engine.checkpoint")
@@ -82,11 +83,27 @@ def _component_types(trainer) -> dict:
 def _trainer_settings(trainer) -> dict:
     settings = {**{key: getattr(trainer, key) for key in ("precision", "accumulation_steps", "grad_clip_norm")},
                 "loss_scaling": LOSS_SCALING_VERSION}
+    settings["bf16_policy"] = model_bf16_policy(trainer.model, trainer.config).as_dict()
+    settings["activation_memory"] = model_activation_memory(trainer.model, trainer.config).as_dict()
+    from deepopt.opt._recipe import bf16_recipe
+
+    if settings["bf16_policy"]["name"] == "bf16_storage":
+        settings["bf16_storage_recipe"] = bf16_recipe(settings["bf16_policy"])
+    attention_recipes = [(name, module._deepopt_attention_recipe_version)
+                         for name, module in trainer.model.named_modules() if hasattr(module, "_deepopt_attention_recipe_version")]
+    if attention_recipes:
+        settings["attention_preparation_recipe"] = attention_recipes
     if trainer.runtime.distributed:
         settings["ddp"] = trainer.runtime.core.options
     if trainer.runtime.fp8.enabled:
         settings["fp8"] = asdict(trainer.runtime.fp8)
-        settings["fp8_recipe"] = fp8_recipe(trainer.runtime.fp8.backend, trainer.runtime.fp8)
+        settings["fp8_recipe"] = fp8_recipe(trainer.runtime.fp8.backend, trainer.runtime.fp8,
+            kernel_policy=getattr(trainer.model, "_deepopt_kernel_policy", None))
+    kernels = kernel_recipe(trainer.model, trainer.runtime.config.get("runtime", {}).get("kernels"))
+    if kernels is not None:
+        settings["kernel_recipe"] = kernels
+    if _actual_activation_compression(trainer).enabled:
+        settings["activation_compression_recipe"] = activation_compression_recipe()
     if trainer.ema is not None:
         settings["ema"] = {"enabled": True, "decay": trainer.ema.decay}
     # Earlier checkpoints already used epoch scheduling. Keep that default's
@@ -152,7 +169,10 @@ def _validate_model_state(saved, model) -> None:
 def environment() -> dict:
     return {"python": platform.python_version(), "torch": str(torch.__version__),
             "torchmetrics": version("torchmetrics"),
-            "cuda": torch.version.cuda, "platform": platform.platform()}
+            "cuda": torch.version.cuda, "platform": platform.platform(),
+            "allocator_environment": {key: os.environ.get(key) for key in
+                                      ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")},
+            "allocator_backend": (torch.cuda.memory.get_allocator_backend() if torch.cuda.is_initialized() else None)}
 
 
 def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", train_loader=None):
@@ -174,6 +194,17 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
             or (trainer.ema is not None and configured_ema["decay"] != trainer.ema.decay)):
         raise ValueError("Checkpoint configuration must match the trainer's EMA settings")
     runtime_config = saved_config.setdefault("runtime", {})
+    actual_bf16 = model_bf16_policy(trainer.model, trainer.config)
+    from deepopt._bf16_policy import resolve_bf16_policy
+    if "bf16_policy" in runtime_config and resolve_bf16_policy(runtime_config["bf16_policy"]) != actual_bf16:
+        raise ValueError("Checkpoint configuration must match the trainer's BF16 policy")
+    runtime_config["bf16_policy"] = actual_bf16.as_dict()
+    actual_memory = model_activation_memory(trainer.model, trainer.config)
+    from deepopt._activation_memory import resolve_activation_memory
+
+    if "activation_memory" in runtime_config and resolve_activation_memory(runtime_config["activation_memory"]) != actual_memory:
+        raise ValueError("Checkpoint configuration must match the trainer's activation memory recipe")
+    runtime_config["activation_memory"] = actual_memory.as_config()
     actual_compression = _actual_activation_compression(trainer)
     if "activation_compression" in runtime_config:
         configured_compression = activation_compression_config_from_dict(
@@ -194,6 +225,15 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
     # Explicit recipe metadata may omit runtime settings. Always retain the
     # actual preparation policy so reconstruction uses the saved computation.
     runtime_config["fp8"] = asdict(actual_fp8)
+    from deepopt.kernel_policy import resolve_kernel_policy
+    actual_kernels = kernel_recipe(trainer.model, trainer.runtime.config.get("runtime", {}).get("kernels"))
+    if actual_kernels is not None:
+        if "kernels" in runtime_config:
+            configured_kernels = resolve_kernel_policy(runtime_config["kernels"],
+                fp8_backend=actual_fp8.backend if actual_fp8.enabled else None)
+            if configured_kernels.as_dict() != actual_kernels["policy"]:
+                raise ValueError("Checkpoint configuration must match the trainer's actual kernel policy")
+        runtime_config["kernels"] = actual_kernels["policy"]
     batch_size = loader_batch_size(train_loader)
     if batch_size is None:
         batch_size = _config_batch_size(saved_config)
@@ -236,6 +276,7 @@ def _checkpoint_payload(trainer, config, *, generators, history, kind="epoch", t
 def save_checkpoint(path, trainer, config=None, *, generators, history, kind="epoch", train_loader=None) -> None:
     """Collect rank-local resume state on all ranks; atomically write on rank zero."""
     with distributed.collective_errors("checkpoint snapshot"):
+        trainer.runtime._quiesce_packed_offload()
         if config is None:
             config = trainer.config
         elif isinstance(config, (str, Path)):
@@ -342,14 +383,23 @@ def _resume_config_for_comparison(config) -> dict:
         settings.pop("loader", None)
     # Logging is passive and can change without changing training state.
     settings.pop("logging", None)
+    settings.setdefault("runtime", {})
     if "runtime" in settings:
+        settings["runtime"] = normalized_bf16_settings(settings["runtime"])
+        from deepopt.kernel_policy import resolve_kernel_policy, KernelPolicy
+        if "kernels" in settings["runtime"]:
+            kernels = resolve_kernel_policy(settings["runtime"]["kernels"],
+                fp8_backend=settings["runtime"].get("fp8", {}).get("backend"))
+            if kernels == KernelPolicy():
+                settings["runtime"].pop("kernels", None)
         if "activation_compression" in settings["runtime"]:
             settings["runtime"]["activation_compression"] = asdict(activation_compression_config_from_dict(
                 settings["runtime"]["activation_compression"]))
         # Passive diagnostics may be enabled after a resume. Their objects
         # and counters are not part of optimization or checkpoint state.
         settings["runtime"] = {k: v for k, v in settings["runtime"].items()
-                               if k not in ("checks", "execution_mode", "diagnostics", "mode_schedule", "non_blocking")}
+                               if k not in ("checks", "execution_mode", "diagnostics", "mode_schedule", "non_blocking",
+                                              "fill_uninitialized_memory")}
         # Old checkpoints omit the compiler table. Disabled compilation is
         # equivalent; enabled settings remain strict for reproducibility.
         if not settings["runtime"].get("compile", {}).get("enabled", False):
@@ -364,7 +414,7 @@ def _resume_config_for_comparison(config) -> dict:
             "ddp": {"find_unused_parameters": False, "broadcast_buffers": True,
                     "gradient_as_bucket_view": True, "static_graph": False,
                     "validation_sync_buffers": True},
-            "cuda_graph": {"device": None, "warmup": 3, "allow_unused_input": False,
+            "cuda_graph": {"enabled": True, "device": None, "warmup": 3, "allow_unused_input": False,
                            "autograd": True, "capture_error_mode": "global"},
         }
         for field, values in defaults.items():
@@ -425,8 +475,29 @@ def _requested_resume_batch_size(payload, trainer, requested, train_loader, *,
 def _validate_resume_state(payload, trainer, requested, *, generators, train_loader,
                            old_batch_size, requested_batch_size, saved_world):
     """Check compatibility before any state-loading hooks can mutate objects."""
+    from deepopt._bf16_policy import resolve_bf16_policy
+    saved_bf16 = resolve_bf16_policy(payload["config"].get("runtime", {}).get("bf16_policy"))
+    if saved_bf16 != model_bf16_policy(trainer.model, trainer.config):
+        raise ValueError("Resume configuration differs from checkpoint: BF16 policy changed")
+    from deepopt.opt._recipe import bf16_recipe
+
+    if saved_bf16.storage_enabled and payload["trainer_settings"].get("bf16_storage_recipe") != bf16_recipe(saved_bf16):
+        raise ValueError("BF16 storage numerical recipe differs from checkpoint; load weights for a new run")
+    from deepopt._activation_memory import resolve_activation_memory
+
+    saved_memory = resolve_activation_memory(payload["trainer_settings"].get("activation_memory"))
+    if saved_memory != model_activation_memory(trainer.model, trainer.config):
+        raise ValueError("Activation memory recipe differs from checkpoint; load weights for a new run")
+    expected_kernels = kernel_recipe(trainer.model, trainer.runtime.config.get("runtime", {}).get("kernels"))
+    if payload["trainer_settings"].get("kernel_recipe") != expected_kernels:
+        raise ValueError("Custom kernel policy or compiler versions differ from checkpoint; load weights for a new run")
+    if _actual_activation_compression(trainer).enabled:
+        if payload["trainer_settings"].get("activation_compression_recipe") != activation_compression_recipe():
+            raise ValueError("Activation compression numerical recipe differs from checkpoint; "
+                             "resume with the original library, or load model weights for a new run")
     if payload["trainer_settings"].get("fp8", {}).get("enabled", False):
-        if payload["trainer_settings"].get("fp8_recipe") != fp8_recipe(trainer.runtime.fp8.backend, trainer.runtime.fp8):
+        if payload["trainer_settings"].get("fp8_recipe") != fp8_recipe(trainer.runtime.fp8.backend, trainer.runtime.fp8,
+                kernel_policy=getattr(trainer.model, "_deepopt_kernel_policy", None)):
             raise ValueError("FP8 numerical recipe or Triton version differs from checkpoint; "
                              "resume with the original library/environment, or load model weights for a new run")
     if _resume_config_for_comparison(payload["config"]) != _resume_config_for_comparison(requested):
@@ -441,7 +512,7 @@ def _validate_resume_state(payload, trainer, requested, *, generators, train_loa
         # Older snapshots omit newly added default policy fields. Preserve
         # their meaning while still rejecting an actual execution-policy change.
         saved_settings["fp8"] = asdict(fp8_config_from_dict(saved_settings["fp8"]))
-    if payload["components"] != _component_types(trainer) or saved_settings != _trainer_settings(trainer):
+    if payload["components"] != _component_types(trainer) or normalized_bf16_settings(saved_settings) != normalized_bf16_settings(_trainer_settings(trainer)):
         raise ValueError("Resume requires the same component types and trainer settings")
     saved_compile = compile_config_from_dict(payload["config"].get("runtime", {}).get("compile", {}))
     actual_compile = compile_config_from_dict(trainer.config.get("runtime", {}).get("compile", {}))

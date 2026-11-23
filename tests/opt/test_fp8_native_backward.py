@@ -58,6 +58,8 @@ class NativeBackwardTests(unittest.TestCase):
             native_fp8.unsupported_reason(operand(), operand(cols=32))
 
     def test_native_executor_passes_existing_buffers_scales_and_output_dtype(self):
+        # These fake tensors stand in for real executor operands. The public
+        # dispatcher now handles actual metadata probes without entering here.
         with FakeTensorMode(), patch.object(native_fp8, "device_metadata", return_value=(90, 132)), \
              patch.object(torch.cuda, "device", return_value=nullcontext()), \
              patch.object(torch, "autocast", return_value=nullcontext()):
@@ -65,7 +67,8 @@ class NativeBackwardTests(unittest.TestCase):
             for backend in ("native_fast", "native_precise"):
                 result = torch.empty(32, 48, device="cuda:0", dtype=torch.float32)
                 with patch.object(torch, "_scaled_mm", return_value=result) as scaled:
-                    self.assertIs(gemm_nt(a, b, backend=backend, out_dtype=torch.float32), result)
+                    self.assertIs(native_fp8.gemm_nt(a, b, out_dtype=torch.float32,
+                                                    use_fast_accum=backend == "native_fast"), result)
                 self.assertIs(scaled.call_args.args[0], a.data)
                 self.assertEqual(scaled.call_args.args[1].stride(), b.data.T.stride())
                 self.assertIs(scaled.call_args.kwargs["scale_a"], a.scale_inv)
@@ -73,7 +76,7 @@ class NativeBackwardTests(unittest.TestCase):
                 self.assertEqual(scaled.call_args.kwargs["use_fast_accum"], backend == "native_fast")
                 self.assertEqual(scaled.call_args.kwargs["out_dtype"], torch.float32)
                 with patch.object(torch, "_scaled_mm", return_value=(result, torch.empty((), device="cuda:0"))):
-                    self.assertIs(gemm_nt(a, b, backend=backend), result)
+                    self.assertIs(native_fp8.gemm_nt(a, b, use_fast_accum=backend == "native_fast"), result)
 
     def test_unsupported_metadata_falls_back_but_native_execution_errors_propagate(self):
         fallback = Mock()
@@ -81,11 +84,11 @@ class NativeBackwardTests(unittest.TestCase):
              patch.object(torch.cuda, "device", return_value=nullcontext()), \
              patch.object(torch, "autocast", return_value=nullcontext()), \
              patch.dict(sys.modules, {"deepopt.opt.backends.triton.gemm.fp8": SimpleNamespace(gemm_nt=fallback)}):
-            gemm_nt(operand(device="cuda:0"), operand(rows=17, device="cuda:0"), backend="native_fast")
+            native_fp8.gemm_nt(operand(device="cuda:0"), operand(rows=17, device="cuda:0"), use_fast_accum=True)
             self.assertEqual(fallback.call_count, 1)
             with patch.object(torch, "_scaled_mm", side_effect=RuntimeError("native failure")):
                 with self.assertRaisesRegex(RuntimeError, "native failure"):
-                    gemm_nt(operand(device="cuda:0"), operand(device="cuda:0"), backend="native_fast")
+                    native_fp8.gemm_nt(operand(device="cuda:0"), operand(device="cuda:0"), use_fast_accum=True)
             self.assertEqual(fallback.call_count, 1)
 
     def test_only_backward_products_change_executor_and_keep_fp32_masters(self):
@@ -123,7 +126,7 @@ class NativeBackwardTests(unittest.TestCase):
     def test_manual_plans_are_validated_and_cpu_execution_is_rejected(self):
         plan = fp8_plan(FP8Config())
         plan["fp8_training"]["backward_backend"] = "native_fast"
-        with self.assertRaisesRegex(ValueError, "backend=triton"):
+        with self.assertRaisesRegex(ValueError, "Native FP8 backward requires"):
             functional.validate_fp8_plan(plan)
         with self.assertRaisesRegex(ValueError, "CUDA"):
             gemm_nt(operand(), operand(), backend="native_fast")

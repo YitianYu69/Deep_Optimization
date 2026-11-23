@@ -25,11 +25,22 @@ class PackagedConfigBlackBoxTests(unittest.TestCase):
         staging.mkdir()
         # Build metadata and egg-info belong to the temporary copy, never the
         # developer's checkout. Build-system dependencies come from this Python.
-        for name in ("pyproject.toml", "MANIFEST.in", "README.md", "LICENSE"):
+        for name in ("pyproject.toml", "MANIFEST.in", "README.md", "LICENSE", "AGENTS.md"):
             shutil.copy2(ROOT / name, staging / name)
         for name in ("src", "configs", "tests", "docs", "examples", "benchmarks", "scripts"):
-            shutil.copytree(ROOT / name, staging / name,
-                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info", ".DS_Store"))
+            shutil.copytree(
+                ROOT / name,
+                staging / name,
+                ignore=shutil.ignore_patterns(
+                    "__pycache__", "*.pyc", "*.egg-info", ".DS_Store", "inductor_vae_v2_b16_224_*"
+                ),
+            )
+        reference_guide = Path("compiler_references/inductor/README.md")
+        (staging / reference_guide).parent.mkdir(parents=True)
+        shutil.copy2(ROOT / reference_guide, staging / reference_guide)
+        capture = staging / "examples/vae/inductor_vae_v2_b16_224_local_test/debug/output_code.py"
+        capture.parent.mkdir(parents=True)
+        capture.write_text("# Local compiler capture\n", encoding="utf-8")
         distributions = cls.directory / "distributions"
         distributions.mkdir()
         script = """
@@ -87,6 +98,26 @@ print(json.dumps({"wheel": wheel, "sdist": sdist}))
                     self.assertEqual(len(members), 1)
                     with sdist.extractfile(members[0]) as stream:
                         self.assertEqual(stream.read(), (ROOT / "configs" / (preset + ".toml")).read_bytes())
+
+    def test_sdist_includes_documented_recipes_and_excludes_local_capture(self):
+        with tarfile.open(self.sdist) as sdist:
+            sources = {member.name.partition("/")[2]: member for member in sdist.getmembers() if member.isfile()}
+            for name in (
+                "AGENTS.md",
+                "examples/vae/imagenet.toml",
+                "examples/vae/run_VAE.sh",
+                "examples/vae/packed_memory_tiled16.json",
+                "benchmarks/analysis/configs/settings_sweep.json",
+                "benchmarks/analysis/run_runtime_speed.sh",
+                "scripts/run_h200_packed_offload_ddp.sh",
+                "compiler_references/inductor/README.md",
+            ):
+                with self.subTest(name=name):
+                    self.assertTrue(name in sources, f"Source distribution is missing {name}")
+                    with sdist.extractfile(sources[name]) as stream:
+                        self.assertEqual(stream.read(), (ROOT / name).read_bytes())
+            capture = "examples/vae/inductor_vae_v2_b16_224_local_test/debug/output_code.py"
+            self.assertFalse(capture in sources, "Source distribution includes a local compiler capture")
 
     def test_installed_wheel_loads_presets_and_builtin_cli_without_checkout_or_torch(self):
         target = self.directory / "installed"

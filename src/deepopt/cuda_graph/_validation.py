@@ -71,9 +71,14 @@ def operation_policy_spec():
     an explicit disabled policy can select different backward work. Preserve
     that distinction. FP8 plans are owned immutable execution dictionaries.
     """
+    from deepopt.kernel_policy import current_kernel_policy
     from deepopt.opt._autocast import (_active_interception, _active_convolution_interception,
                                       _active_normalization_interception, _active_pooling_interception, _get_activation_compression,
-                                      _get_fp8_plan)
+                                      _get_fp8_plan, _get_attention_backend)
+
+    from deepopt._bf16_policy import current_bf16_policy
+    from deepopt._activation_memory import current_activation_memory
+    from deepopt.opt._recipe import bf16_recipe
 
     compression = _get_activation_compression("cuda")
     compression_spec = (None if compression is None else
@@ -83,7 +88,11 @@ def operation_policy_spec():
     return (_get_fp8_plan("cuda"), compression_spec, _active_interception.get().get("cuda", True),
             _active_convolution_interception.get().get("cuda", True),
             _active_normalization_interception.get().get("cuda", True),
-            _active_pooling_interception.get().get("cuda", True))
+            _active_pooling_interception.get().get("cuda", True), _get_attention_backend("cuda") or "native",
+            current_kernel_policy().fingerprint,
+            current_activation_memory("cuda"),
+            bf16_recipe(current_bf16_policy("cuda")),
+            current_bf16_policy("cuda"))
 
 
 def static_arguments(args):

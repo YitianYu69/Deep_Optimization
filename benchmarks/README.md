@@ -1,5 +1,10 @@
 # Benchmark catalog
 
+For AccumulateGrad stream warnings during capture/training, use the
+[CUDA Graph diagnostic runner](cuda_graph/README.md). It compares native and
+DeepOpt paths in fresh processes and records warning phases, eager-reference
+correctness, graph replay, optional timing and profiler traces.
+
 [Project README](../README.md) · [Documentation](../docs/README.md) · [Examples](../examples/README.md)
 
 Benchmarks are grouped by the workload they measure. Run the commands from the
@@ -7,6 +12,22 @@ repository root after installing DeepOpt in the active Python environment.
 The FP8 and activation-compression programs use normal library imports and can
 be copied outside the checkout to measure an installed build. They do not
 install dependencies or select this repository's source tree.
+
+## Triton TileLang and Mixed comparisons
+
+[benchmark_kernel_backends.py](benchmark_kernel_backends.py) runs matched
+Linear, activation, normalization, pooling, convolution, codec and compiler
+workloads in isolated processes. It retains reports and logs, enforces worker
+timeouts, and compares matching timing/memory rows against Triton. The family
+scripts accept `--deepopt-backend` and `--deepopt-kernel-policy`; the compiler's
+`--backend` option still selects the Torch compiler independently.
+See the [backend benchmark guide](kernel_backends.md) for examples, fixed Mixed
+routes, report interpretation and current measurement limits.
+
+```bash
+python benchmarks/benchmark_kernel_backends.py --device cuda:0 --preset smoke \
+  --backends triton tilelang mixed --output work/kernel-backend-smoke
+```
 
 ## Cross-operator FP8 and compression analysis
 
@@ -70,7 +91,7 @@ python benchmarks/activation_compression/benchmark_boolean_mask.py --help
 isolates the transposed reconstruction bottleneck. It compares grouped, tiled,
 and contiguous-decode-plus-copy strategies on identical packed inputs, with
 exact numerical checks and eager/graph timing. Default shapes reproduce the
-large ViT projection inputs. See [performance recovery](../docs/activation_compression/performance_recovery.md).
+large ViT projection inputs.
 
 ## Spatial convolutions
 

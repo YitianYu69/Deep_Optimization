@@ -1,5 +1,7 @@
 """ReLU precision, mutation and exact saved-mask policy resolution."""
 
+from deepopt.kernel_policy import kernel_entry
+
 import torch
 
 from .geometry import ReLUGeometry
@@ -10,6 +12,7 @@ from ..._execution import finite_checks_enabled
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
+@kernel_entry
 def relu(input, inplace=False, *, plan=None, output_dtype=None, output_layout=None, output_scale=None,
          scaling_state=None, state_training=True, planned=False, execution_info=None,
          _kind="relu", approximate="none"):
@@ -46,11 +49,22 @@ def relu(input, inplace=False, *, plan=None, output_dtype=None, output_layout=No
     training = checked.get("fp8_training")
     compression = (training or checked)["activation_compression"]
     wrapped = isinstance(x, FP8Activation)
+    from deepopt.opt.precision.bf16 import invocation_bf16_policy
+
+    bf16_policy = invocation_bf16_policy(checked, x)
+    storage = (bf16_policy.storage_enabled and not wrapped and training is None
+               and x.dtype in (torch.bfloat16, torch.float32))
+    if storage and x.device.type == "cuda":
+        from deepopt.kernel_policy import kernel_backend
+
+        if kernel_backend("activation") != "triton":
+            raise ValueError("BF16 storage activation requires the Triton CUDA route")
     logical_dtype = x.dtype if x.dtype not in FP8_DTYPES else torch.bfloat16
     if output_dtype is None:
         output_dtype = (x._data.dtype if inplace and wrapped else
                         training["fp8_dtypes"]["activation"] if planned and output_layout is not None and training else
-                        x._data.dtype if wrapped and active is not False and not planned else logical_dtype)
+                        x._data.dtype if wrapped and active is not False and not planned else
+                        torch.bfloat16 if storage and not inplace else logical_dtype)
     if output_dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64, *FP8_DTYPES):
         raise ValueError("ReLU output_dtype must be a supported floating point dtype")
     fp8 = output_dtype in FP8_DTYPES
@@ -99,13 +113,15 @@ def relu(input, inplace=False, *, plan=None, output_dtype=None, output_layout=No
         from ..autograd.activation.elementwise import ActivationFunction
 
         options.update(kind=_kind, approximate=approximate, bits=compression["bits"],
+                       bf16_policy=bf16_policy,
                        group_size=compression["group_size"],
                        check_finite=finite_checks_enabled() and (fp8 or compression["enabled"] and _kind != "relu6"))
         if inplace and not (torch.is_grad_enabled() and x.requires_grad):
             from ...backends.activation import executor
             from torch._subclasses.fake_tensor import FakeTensor
 
-            result = executor(x, _kind).forward(x, geometry, **options, save_mask=False)
+            result = executor(x, _kind).forward(x, geometry,
+                **{key: value for key, value in options.items() if key != "bf16_policy"}, save_mask=False)
             if wrapped or x.device.type == "cuda" or x.device.type == "meta" or isinstance(x, FakeTensor):
                 torch.autograd.graph.increment_version(x)
             if execution_info is not None:
@@ -125,12 +141,12 @@ def relu(input, inplace=False, *, plan=None, output_dtype=None, output_layout=No
         result = executor(x).forward(x, geometry, **options, save_mask=False)
         info = result[-1]
         storage = x._data if wrapped else x
-        if wrapped or info["backend"] == "triton" or isinstance(storage, FakeTensor) or x.device.type == "meta":
+        if wrapped or info["backend"] in ("triton", "tilelang") or isinstance(storage, FakeTensor) or x.device.type == "meta":
             torch.autograd.graph.increment_version(x)
         if execution_info is not None:
             execution_info.update(info, input="fp8" if wrapped else str(x.dtype),
                                   output="fp8" if fp8 else str(output_dtype), compression=False,
                                   saved_mask_bytes=0, backward_launches=0)
         return x
-    return ReLUFunction.apply(x, geometry, options, scaling_state if output_scale is None else None,
+    return ReLUFunction.apply(x, geometry, {**options, "bf16_policy": bf16_policy}, scaling_state if output_scale is None else None,
                               state_training and torch.is_grad_enabled(), backward, execution_info)

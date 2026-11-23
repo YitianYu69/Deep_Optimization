@@ -1,5 +1,7 @@
 """ReLU autograd saving only an exact boolean or one-bit mask."""
 
+from deepopt.kernel_policy import kernel_forward, kernel_backward
+
 import torch
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
@@ -9,15 +11,23 @@ from ....quantization.activation_tensor import FP8Activation
 from ....precision.gradient import capture_gradient
 from ....quantization.gradient import enabled
 from ...._execution import backward_finite_check_policy
+from .._output import restore_fresh_output
+from ....backends._shared.activation_codec import activation_layout_policy, saved_activation_layout
 
 
 class ReLUFunction(Function):
     @staticmethod
+    @kernel_forward
     def forward(ctx, x, geometry, options, scaling_state, state_training, backward_enabled, execution_info):
+        from deepopt._bf16_policy import resolve_bf16_policy
+
+        ctx.bf16_policy = resolve_bf16_policy(options.get("bf16_policy"))
+        ctx.activation_kernel_policy = activation_layout_policy()
         compute = executor(x)
         ctx.gradient_slot = capture_gradient(x)
         ctx.gradient_check = backward_finite_check_policy()
-        arguments = dict(options, save_mask=backward_enabled)
+        arguments = {key: value for key, value in options.items() if key != "bf16_policy"}
+        arguments["save_mask"] = backward_enabled
         if scaling_state is not None and options["dtype"] in (torch.float8_e4m3fn, torch.float8_e5m2) and not options["reuse"]:
             result = scaling_state.relu_forward(x, geometry, compute, arguments, training=state_training)
         else:
@@ -28,7 +38,7 @@ class ReLUFunction(Function):
                                   output="fp8" if inverse is not None else str(options["dtype"]),
                                   compression=options["packed"] and backward_enabled,
                                   saved_mask_bytes=mask.numel() * mask.element_size() if mask is not None else 0,
-                                  backward_launches=int(info["backend"] == "triton" and backward_enabled and x.numel() > 0))
+                                  backward_launches=int(info["backend"] in ("triton", "tilelang") and backward_enabled and x.numel() > 0))
         ctx.geometry, ctx.packed, ctx.input_dtype = geometry, options["packed"], x.dtype
         ctx.input_fp8 = isinstance(x, FP8Activation)
         if backward_enabled:
@@ -39,10 +49,12 @@ class ReLUFunction(Function):
         if inverse is not None:
             logical_dtype = x.dtype if x.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2) else torch.bfloat16
             return FP8Activation(output, inverse, geometry.shape, options["block_shape"], geometry.layout, logical_dtype)
-        return geometry.restore(output)
+        return restore_fresh_output(output, geometry.restore)
 
     @staticmethod
     @once_differentiable
+    @saved_activation_layout
+    @kernel_backward
     def backward(ctx, gradient):
         mask, = ctx.saved_tensors
         slot = ctx.gradient_slot

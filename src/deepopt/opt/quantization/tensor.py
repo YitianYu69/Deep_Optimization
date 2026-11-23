@@ -6,20 +6,22 @@ from dataclasses import dataclass
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
+from deepopt.kernel_policy import current_kernel_policy, decoder_kernel_policy
 
 
 @dataclass(frozen=True)
 class QuantizedTensor:
-    data: torch.Tensor 
+    data: torch.Tensor
 
     # FP32 reconstruction scale
     # tensor-wise: [1, 1]
     # block-wise: [ceil(rows / block_rows), ceil(cols / block_cols)]
-    scale_inv: torch.Tensor 
+    scale_inv: torch.Tensor
 
     block_shape: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "_kernel_policy", current_kernel_policy())
         if self.data.ndim != 2:
             raise ValueError("QuantizedTensor data must be 2D")
         if self.data.numel() == 0:
@@ -36,7 +38,7 @@ class QuantizedTensor:
             if (not isinstance(self.block_shape, tuple) or len(self.block_shape) != 2
                 or any(type(size) is not int or size <= 0 for size in self.block_shape)):
                 raise ValueError("block_shape must be None or a tuple of two positive integers")
-        
+
             rows, cols = self.data.shape
             block_rows, block_cols = self.block_shape
 
@@ -52,7 +54,7 @@ class QuantizedTensor:
             )
 
     @torch.no_grad()
-    def dequantize(self) -> torch.Tensor:
+    def dequantize(self, *, backend=None) -> torch.Tensor:
         """
         Reconstruct an FP32 matrix for reference computations.
         """
@@ -60,7 +62,9 @@ class QuantizedTensor:
         if self.data.device.type == "cuda":
             if isinstance(self.data, FakeTensor):
                 return torch.empty(self.data.shape, device=self.data.device, dtype=torch.float32)
-            from deepopt.opt.backends.triton.quantization.fp8 import dequantize
+            from deepopt.opt.backends.dispatch import backend_module
+            selected = backend if backend is not None else decoder_kernel_policy(getattr(self, "_kernel_policy", None))
+            dequantize = backend_module('quantization', 'quantization.fp8', backend=selected).dequantize
 
             return dequantize(self.data, self.scale_inv, self.block_shape)
 
@@ -68,7 +72,7 @@ class QuantizedTensor:
 
         if self.block_shape is None:
             return values * self.scale_inv
-        
+
         block_rows, block_cols = self.block_shape
         rows, cols = self.data.shape
 
@@ -91,8 +95,10 @@ class QuantizedTensor:
             transposed_block_shape = (block_cols, block_rows)
 
         values, scales = self.data.T, self.scale_inv.T
-        return QuantizedTensor(
+        result = QuantizedTensor(
             data=values.contiguous() if contiguous else values,
             scale_inv=scales.contiguous() if contiguous else scales,
             block_shape=transposed_block_shape
         )
+        object.__setattr__(result, "_kernel_policy", getattr(self, "_kernel_policy", current_kernel_policy()))
+        return result

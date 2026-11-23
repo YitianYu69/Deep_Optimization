@@ -30,10 +30,12 @@ def _forward_kernel(
     GRADIENT_FP8: tl.constexpr = False, GRAD_CURRENT: tl.constexpr = False,
     GRAD_BR: tl.constexpr = 1, GRAD_BC: tl.constexpr = 1,
     GRAD_MAXIMUM: tl.constexpr = 448.0, GRAD_OBSERVE: tl.constexpr = False,
+    CHANNEL_FAST: tl.constexpr = False,
+    TAP_MAJOR: tl.constexpr = False, GROUP_M: tl.constexpr = 1,
 ):
     volume: tl.constexpr = OD * OH * OW
     kernel_volume: tl.constexpr = KD * KH * KW
-    group, pm, pn = _tile_coordinates(BATCH * volume, CO, BLOCK_M, BLOCK_N)
+    group, pm, pn = _tile_coordinates(BATCH * volume, CO, BLOCK_M, BLOCK_N, GROUP_M)
     if INDEX64:
         group, pm, pn = group.to(tl.int64), pm.to(tl.int64), pn.to(tl.int64)
     rows = pm * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -43,14 +45,40 @@ def _forward_kernel(
     channels_out = group * CO + cols
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
 
-    if TENSORWISE:
+    if TENSORWISE and TAP_MAJOR:
+        # Keep spatial coordinates at M elements rather than M x K. Channel
+        # loads remain FP8; only the FP32 accumulator is scaled at the end.
+        for kernel_index in range(kernel_volume):
+            if INDEX64:
+                kernel_index = kernel_index.to(tl.int64)
+            kd, kh, kw = _coordinates(kernel_index, KH, KW)
+            id_ = od * SD - PD + kd * DD
+            ih = oh * SH - PH + kh * DH
+            iw = ow * SW - PW + kw * DW
+            source = batch * (ID * IH * IW) + (id_ * IH + ih) * IW + iw
+            valid_rows = ((rows < BATCH * volume) & (id_ >= 0) & (id_ < VALID_I0)
+                          & (ih >= 0) & (ih < VALID_I1) & (iw >= 0) & (iw < VALID_I2))
+            for channel_tile in range(tl.cdiv(CI, BLOCK_K)):
+                if INDEX64:
+                    channel_tile = channel_tile.to(tl.int64)
+                ci = channel_tile * BLOCK_K + tl.arange(0, BLOCK_K)
+                av = _load_operand(a, source[:, None], group * CI + ci[None, :],
+                                   valid_rows[:, None] & (ci[None, :] < CI), A_RS, A_CS)
+                bv = _load_operand(b, channels_out[None, :],
+                                   ci[:, None] * kernel_volume + kernel_index,
+                                   (ci[:, None] < CI) & (cols[None, :] < CO), B_RS, B_CS)
+                acc = tl.dot(av, bv, acc, out_dtype=tl.float32)
+        acc = (acc * tl.load(a_scale)) * tl.load(b_scale)
+    elif TENSORWISE:
         for tile in range(tl.cdiv(CI * kernel_volume, BLOCK_K)):
             if INDEX64:
                 reduction = tile.to(tl.int64) * BLOCK_K + tl.arange(0, BLOCK_K)
             else:
                 reduction = tile * BLOCK_K + tl.arange(0, BLOCK_K)
-            ci = reduction // kernel_volume
-            kd, kh, kw = _coordinates(reduction % kernel_volume, KH, KW)
+            ci = reduction % CI if CHANNEL_FAST else reduction // kernel_volume
+            kernel_index = reduction // CI if CHANNEL_FAST else reduction % kernel_volume
+            weight_column = ci * kernel_volume + kernel_index
+            kd, kh, kw = _coordinates(kernel_index, KH, KW)
             id_ = od[:, None] * SD - PD + kd[None, :] * DD
             ih = oh[:, None] * SH - PH + kh[None, :] * DH
             iw = ow[:, None] * SW - PW + kw[None, :] * DW
@@ -59,7 +87,7 @@ def _forward_kernel(
                      & (id_ >= 0) & (id_ < VALID_I0) & (ih >= 0) & (ih < VALID_I1)
                      & (iw >= 0) & (iw < VALID_I2))
             av = _load_operand(a, source, group * CI + ci[None, :], valid, A_RS, A_CS)
-            bv = _load_operand(b, channels_out[None, :], reduction[:, None],
+            bv = _load_operand(b, channels_out[None, :], weight_column[:, None],
                                (reduction[:, None] < CI * kernel_volume) & (cols[None, :] < CO), B_RS, B_CS)
             acc = tl.dot(av, bv, acc, out_dtype=tl.float32)
         acc = (acc * tl.load(a_scale)) * tl.load(b_scale)
@@ -112,7 +140,7 @@ def _forward_kernel(
 
 
 @torch.no_grad()
-def forward(qx, qw, geometry, *, bias=None, out_dtype=torch.float32, num_stages="auto", gradient_output=None):
+def forward(qx, qw, geometry, *, bias=None, out_dtype=torch.float32, num_stages="auto", gradient_output=None, autotune=True):
     """Return canonical ``[batch * output_volume, out_channels]`` output.
 
     Kernel reductions use torch's flattened weight order: input channel first,
@@ -145,11 +173,15 @@ def forward(qx, qw, geometry, *, bias=None, out_dtype=torch.float32, num_stages=
                          GRAD_MAXIMUM=torch.finfo(out.dtype).max, GRAD_OBSERVE=out.observations is not None)
         output = torch.empty((rows, geometry.out_channels), device=qx.data.device,
                              dtype=gradient_output.dtype if fused else out_dtype)
-        _forward_kernel[grid(rows, geometry.out_channels_per_group, geometry.groups)](
-            qx.data, qw.data, qx.scale_inv, qw.scale_inv, output,
-            output if bias is None else bias,
-            **arguments(qx, qw, geometry, num_stages, extra_tensors=() if bias is None else (bias,)),
-            HAS_BIAS=bias is not None, BIAS_STRIDE=1 if bias is None else bias.stride(0), **extra,
-        )
+        base = arguments(qx, qw, geometry, num_stages, extra_tensors=() if bias is None else (bias,))
+        from ..._shared.convolution import launch_candidates, select_convolution_launch, convolution_launch_key
+        def launch(config):
+            return _forward_kernel[grid(rows, geometry.out_channels_per_group, geometry.groups)](
+                qx.data, qw.data, qx.scale_inv, qw.scale_inv, output, output if bias is None else bias,
+                **config, HAS_BIAS=bias is not None, BIAS_STRIDE=1 if bias is None else bias.stride(0), **extra)
+        candidates = launch_candidates(base, geometry, "forward", num_stages=num_stages)
+        selected = select_convolution_launch(convolution_launch_key("forward",qx,qw,geometry,base,out_dtype,bias=bias),
+            candidates, launch, autotune=autotune and not fused)
+        launch(selected)
     return (gradient_output.wrap(output) if fused else gradient_output.convert(output, matrix=True)
             if gradient_output is not None else output)

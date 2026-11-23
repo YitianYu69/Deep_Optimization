@@ -9,6 +9,21 @@ from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
 class ActivationCompressionCUDATests(unittest.TestCase):
+    def test_batched_forward_packing_keeps_exact_payload_and_metadata(self):
+        from deepopt.opt.backends.triton.quantization.activation.affine import quantize_pack_affine
+
+        original = torch.randn(67, 131, device="cuda", dtype=torch.bfloat16)
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+            source = original.to(dtype).T
+            for bits in (1, 2, 4, 8):
+                for group in (17, 512, 1024, 2048):
+                    expected = quantize_pack_affine(source, group, bits=bits, implementation="grouped")
+                    for batch in (4, 8):
+                        actual = quantize_pack_affine(source, group, bits=bits,
+                            implementation="batched", groups_per_program=batch)
+                        for value, wanted in zip(actual, expected):
+                            torch.testing.assert_close(value, wanted, rtol=0, atol=0)
+
     def setUp(self):
         torch.manual_seed(719)
 
@@ -35,9 +50,9 @@ class ActivationCompressionCUDATests(unittest.TestCase):
             for group, blocks in ((17, None), (1024, None), (512, (16, 32))):
                 packed = quantize_pack_activation(torch.randn(67, 131, device="cuda", dtype=torch.bfloat16), group, blocks, bits=bits)
                 for dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
-                    def decode(implementation):
+                    def decode(implementation, tile=None):
                         return dequantize_unpack_affine(packed.data, packed.step, packed.minimum, packed.shape,
-                            group, blocks, dtype=dtype, bits=bits, transpose=True, implementation=implementation)
+                            group, blocks, dtype=dtype, bits=bits, transpose=True, implementation=implementation, tile_shape=tile)
                     expected = decode("grouped")
                     for implementation in ("tiled", "copy", "auto"):
                         actual = decode(implementation)
@@ -45,6 +60,8 @@ class ActivationCompressionCUDATests(unittest.TestCase):
                         storage_dtype = torch.int16 if dtype == torch.bfloat16 else torch.uint8
                         self.assertTrue(torch.equal(actual.view(storage_dtype), expected.view(storage_dtype)))
                         self.assertEqual(actual.stride(0) % 16, 0)
+                    actual = decode("tiled", (64, 64))
+                    self.assertTrue(torch.equal(actual.view(storage_dtype), expected.view(storage_dtype)))
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):

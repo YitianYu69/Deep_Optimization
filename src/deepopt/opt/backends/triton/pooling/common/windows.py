@@ -5,6 +5,17 @@ import triton.language as tl
 
 
 @triton.jit
+def _fractional_parameters(nc, valid, samples, GEO: tl.constexpr, AXIS: tl.constexpr):
+    # Each static axis gets its own specialization, rather than redefining
+    # annotated constexpr names on successive unrolled loop iterations.
+    sample_axis: tl.constexpr = 2 - AXIS if GEO[8] == 2 else AXIS
+    index = (nc + valid.to(tl.int64) * 0) * GEO[8] + sample_axis
+    sample = tl.load(samples + index, valid, other=0.0).to(tl.float32)
+    alpha: tl.constexpr = (GEO[1][AXIS] - GEO[3][AXIS]) / (GEO[2][AXIS] - 1)
+    return sample, alpha
+
+
+@triton.jit
 def _window(nc, coordinates, samples, valid, GEO: tl.constexpr):
     starts = ()
     extents = ()
@@ -20,10 +31,7 @@ def _window(nc, coordinates, samples, valid, GEO: tl.constexpr):
             elif GEO[2][axis] == 1:
                 start = o * 0 + GEO[1][axis] - GEO[3][axis]
             else:
-                sample_axis: tl.constexpr = 2 - axis if GEO[8] == 2 else axis
-                sample_index = (nc + valid.to(tl.int64) * 0) * GEO[8] + sample_axis
-                r = tl.load(samples + sample_index, valid, other=0).to(tl.float32)
-                alpha: tl.constexpr = (GEO[1][axis] - GEO[3][axis]) / (GEO[2][axis] - 1)
+                r, alpha = _fractional_parameters(nc, valid, samples, GEO, axis)
                 start = ((o.to(tl.float32) + r) * alpha).to(tl.int64) - (r * alpha).to(tl.int64)
                 start = tl.where(o == GEO[2][axis] - 1, GEO[1][axis] - GEO[3][axis], start)
             extent = o * 0 + GEO[3][axis]
@@ -65,10 +73,7 @@ def _candidates(nc, positions, samples, valid, GEO: tl.constexpr):
             if axis < 3 - GEO[8] or GEO[2][axis] == 1:
                 low, high = i * 0, i * 0 + 1
             else:
-                sample_axis: tl.constexpr = 2 - axis if GEO[8] == 2 else axis
-                index = (nc + valid.to(tl.int64) * 0) * GEO[8] + sample_axis
-                r = tl.load(samples + index, valid, other=0).to(tl.float32)
-                alpha: tl.constexpr = (GEO[1][axis] - GEO[3][axis]) / (GEO[2][axis] - 1)
+                r, alpha = _fractional_parameters(nc, valid, samples, GEO, axis)
                 base = (r * alpha).to(tl.int64)
                 low = tl.floor((i - GEO[3][axis] + base + 1).to(tl.float32) / alpha - r).to(tl.int64) - 1
                 high = tl.ceil((i + base + 1).to(tl.float32) / alpha - r).to(tl.int64) + 1

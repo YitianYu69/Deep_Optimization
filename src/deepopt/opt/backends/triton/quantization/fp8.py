@@ -3,6 +3,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 
 # Algorithm thresholds, not supported block-size limits. Larger groups use
@@ -24,7 +25,9 @@ def _fused_blocks(x_ptr, out_ptr, inv_ptr, errors_ptr, M, N, STRIDE_M, STRIDE_N,
                   FP8_MAX: tl.constexpr, CHECK_FINITE: tl.constexpr,
                   QUANTIZE: tl.constexpr, CONTIGUOUS: tl.constexpr):
 
-    blocks = tl.program_id(0) * GROUPS + tl.arange(0, GROUPS)
+    # Widen before multiplying: VAE activations can exceed 2**31 elements,
+    # and even small strided views can span that many storage elements.
+    blocks = tl.program_id(0).to(tl.int64) * GROUPS + tl.arange(0, GROUPS)
     elements = tl.arange(0, ELEMENTS)
 
     rows = (blocks // NUM_COL_BLOCKS)[:, None] * BLOCK_ROWS + (elements // BLOCK_COLS)[None, :]
@@ -59,8 +62,9 @@ def _partial_amax(x_ptr, partials_ptr, errors_ptr, M, N, STRIDE_M, STRIDE_N,
                   BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr,
                   NUM_COL_BLOCKS: tl.constexpr, CHUNKS: tl.constexpr, BLOCK: tl.constexpr,
                   CONTIGUOUS: tl.constexpr, TENSORWISE: tl.constexpr, CHECK_FINITE: tl.constexpr):
-    scale_block = tl.program_id(0) // CHUNKS
-    chunk = tl.program_id(0) % CHUNKS
+    program = tl.program_id(0).to(tl.int64)
+    scale_block = program // CHUNKS
+    chunk = program % CHUNKS
     offsets = chunk * BLOCK + tl.arange(0, BLOCK)
 
     rows = (scale_block // NUM_COL_BLOCKS) * BLOCK_ROWS + offsets // BLOCK_COLS
@@ -73,7 +77,7 @@ def _partial_amax(x_ptr, partials_ptr, errors_ptr, M, N, STRIDE_M, STRIDE_N,
     else:
         addresses = rows * STRIDE_M + cols * STRIDE_N
     if TENSORWISE:
-        mask = offsets < M * N
+        mask = offsets < tl.cast(M, tl.int64) * N
     else:
         mask = (rows < M) & (cols < N) & (offsets < BLOCK_ROWS * BLOCK_COLS)
     values = tl.load(x_ptr + addresses, mask=mask, other=0.0).to(tl.float32)
@@ -86,8 +90,9 @@ def _partial_amax(x_ptr, partials_ptr, errors_ptr, M, N, STRIDE_M, STRIDE_N,
 
 @triton.jit
 def _reduce_amax(partials_ptr, reduced_ptr, COUNT, OUTPUT_COUNT, BLOCK: tl.constexpr):
-    scale_block = tl.program_id(0) // OUTPUT_COUNT
-    chunk = tl.program_id(0) % OUTPUT_COUNT
+    program = tl.program_id(0).to(tl.int64)
+    scale_block = program // OUTPUT_COUNT
+    chunk = program % OUTPUT_COUNT
     offsets = chunk * BLOCK + tl.arange(0, BLOCK)
     values = tl.load(partials_ptr + scale_block * COUNT + offsets,
                      mask=offsets < COUNT, other=0.0)
@@ -98,7 +103,7 @@ def _reduce_amax(partials_ptr, reduced_ptr, COUNT, OUTPUT_COUNT, BLOCK: tl.const
 def _block_scales(partials_ptr, scale_ptr, inv_ptr, COUNT,
                   BLOCK: tl.constexpr, FP8_MAX: tl.constexpr):
     offsets = tl.arange(0, BLOCK)
-    values = tl.load(partials_ptr + tl.program_id(0) * COUNT + offsets,
+    values = tl.load(partials_ptr + tl.program_id(0).to(tl.int64) * COUNT + offsets,
                      mask=offsets < COUNT, other=0.0)
     scale = _scale(tl.max(values, axis=0), FP8_MAX)
     tl.store(scale_ptr + tl.program_id(0), scale)
@@ -110,7 +115,7 @@ def _cast_scaled(x_ptr, q_ptr, scale_ptr, errors_ptr, N, NUMEL, STRIDE_M, STRIDE
                  BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr, NUM_COL_BLOCKS: tl.constexpr,
                  TENSORWISE: tl.constexpr, BLOCK: tl.constexpr,
                  FP8_MAX: tl.constexpr, CHECK_FINITE: tl.constexpr, CONTIGUOUS: tl.constexpr):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     if CONTIGUOUS:
         addresses = offsets
     else:
@@ -211,9 +216,9 @@ def _run_scaling(x, fp8_max, block_shape, check_finite, fp8_dtype=None):
 def _dequantize(values_ptr, scales_ptr, output_ptr, M, N, STRIDE_M, STRIDE_N,
                  SCALE_STRIDE_M, SCALE_STRIDE_N, BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr,
                  TENSORWISE: tl.constexpr, CONTIGUOUS: tl.constexpr, BLOCK: tl.constexpr):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     rows, cols = offsets // N, offsets % N
-    mask = offsets < M * N
+    mask = offsets < tl.cast(M, tl.int64) * N
     if CONTIGUOUS:
         addresses = offsets
     else:
@@ -245,8 +250,9 @@ def _cast_tensorwise_pair(x_ptr, normal_ptr, transpose_ptr, scale_ptr, M, N,
                           STRIDE_M, STRIDE_N, PADDED_M: tl.constexpr, PADDED_N: tl.constexpr,
                           N_TILES: tl.constexpr, FP8_MAX: tl.constexpr, BLOCK: tl.constexpr,
                           WRITE_NORMAL: tl.constexpr):
-    rows = (tl.program_id(0) // N_TILES) * BLOCK + tl.arange(0, BLOCK)
-    cols = (tl.program_id(0) % N_TILES) * BLOCK + tl.arange(0, BLOCK)
+    program = tl.program_id(0).to(tl.int64)
+    rows = (program // N_TILES) * BLOCK + tl.arange(0, BLOCK)
+    cols = (program % N_TILES) * BLOCK + tl.arange(0, BLOCK)
     values = tl.load(x_ptr + rows[:, None] * STRIDE_M + cols[None, :] * STRIDE_N,
                      mask=(rows[:, None] < M) & (cols[None, :] < N), other=0.0).to(tl.float32)
     scale = tl.load(scale_ptr)
@@ -259,18 +265,123 @@ def _cast_tensorwise_pair(x_ptr, normal_ptr, transpose_ptr, scale_ptr, M, N,
              mask=(cols[:, None] < N) & (rows[None, :] < PADDED_M))
 
 
-def quantize_tensorwise_pair(x, fp8_dtype, check_finite, *, transpose_only=False):
+def quantize_tensorwise_pair(x, fp8_dtype, check_finite, *, transpose_only=False, statistics=None,
+                            autotune=True):
     """Emit both TMA-ready orientations without a later FP8 transpose/pack."""
+    if type(autotune) is not bool:
+        raise ValueError("autotune must be a boolean")
+    from deepopt.opt.backends._shared.cuda import device_metadata
+    from deepopt.opt.backends._shared.paired_cast import paired_cast_key, select_paired_cast
     with torch.cuda.device(x.device):
         maximum = torch.finfo(fp8_dtype).max
-        scale, inverse = _run_scaling(x, maximum, None, check_finite)
+        scale, inverse = _run_scaling(x, maximum, None, check_finite) if statistics is None else statistics
         m, n = x.shape
         padded_m, padded_n = triton.cdiv(m, 16) * 16, triton.cdiv(n, 16) * 16
         normal = None if transpose_only else torch.empty((m, padded_n), device=x.device, dtype=fp8_dtype)
         transposed = torch.empty((n, padded_m), device=x.device, dtype=fp8_dtype)
-        tiles_n = triton.cdiv(n, 32)
-        _cast_tensorwise_pair[(triton.cdiv(m, 32) * tiles_n,)](
-            x, transposed if transpose_only else normal, transposed, scale, m, n, *x.stride(),
-            PADDED_M=padded_m, PADDED_N=padded_n, WRITE_NORMAL=not transpose_only,
-            N_TILES=tiles_n, FP8_MAX=maximum, BLOCK=32, num_warps=4)
+        def cast(config, multiplier):
+            block, warps = config
+            tiles_n = triton.cdiv(n, block)
+            _cast_tensorwise_pair[(triton.cdiv(m, block) * tiles_n,)](
+                x, transposed if transpose_only else normal, transposed, multiplier, m, n, *x.stride(),
+                PADDED_M=padded_m, PADDED_N=padded_n, WRITE_NORMAL=not transpose_only,
+                N_TILES=tiles_n, FP8_MAX=maximum, BLOCK=block, num_warps=warps)
+
+        def benchmark(config):
+            from triton.testing import do_bench_cudagraph
+
+            # Include current-scale reduction and both output writes, rather
+            # than ranking an isolated transpose. Output storage is shared by
+            # candidates; allocating it is identical for every tile. The
+            # optional shared-statistics caller already owns its reduction.
+            def prepare():
+                multiplier = (_run_scaling(x, maximum, None, False)[0]
+                              if statistics is None else scale)
+                cast(config, multiplier)
+
+            torch.cuda.synchronize()
+            try:
+                return do_bench_cudagraph(prepare, rep=5)
+            except OutOfResources:
+                return float("inf")
+
+        capability, sms = device_metadata(x.device.index)
+        key = paired_cast_key(x.shape, x.stride(), x.dtype, fp8_dtype, x.device.index,
+                              capability, sms, transpose_only, statistics is not None, x.data_ptr() % 16)
+        selected = select_paired_cast(key, benchmark, autotune=autotune,
+                                      capturing=autotune and torch.cuda.is_current_stream_capturing())
+        cast(selected, scale)
         return None if transpose_only else normal[:, :n], inverse, transposed[:, :m]
+
+
+@triton.jit
+def _gradient_statistics(x_ptr, bias_ptr, amax_ptr, errors_ptr,
+                         M: tl.constexpr, N: tl.constexpr, STRIDE_M: tl.constexpr, STRIDE_N: tl.constexpr,
+                         ROW_CHUNK: tl.constexpr, COL_TILES: tl.constexpr, CHECK_FINITE: tl.constexpr,
+                         BLOCK: tl.constexpr):
+    part=tl.program_id(0).to(tl.int64)
+    col_tile=tl.program_id(1)
+    cols=col_tile*BLOCK+tl.arange(0,BLOCK)
+    sums=tl.zeros((BLOCK,),tl.float32)
+    maximum=tl.full((),0.,tl.float32)
+    bad=tl.full((),0,tl.int32)
+    for start in range(ROW_CHUNK//32):
+        rows=part*ROW_CHUNK+start*32+tl.arange(0,32)
+        value=tl.load(x_ptr+rows[:,None]*STRIDE_M+cols[None,:]*STRIDE_N,
+                      (rows[:,None]<M)&(cols[None,:]<N),other=0.0).to(tl.float32)
+        sums+=tl.sum(value,0)
+        maximum=tl.maximum(maximum,tl.max(tl.max(tl.abs(value),0),0))
+        if CHECK_FINITE:
+            bad=tl.maximum(bad,tl.max(tl.max((~(tl.abs(value)<float("inf"))).to(tl.int32),0),0))
+    tl.store(bias_ptr+part*N+cols,sums,cols<N)
+    tl.store(amax_ptr+part*COL_TILES+col_tile,maximum)
+    if CHECK_FINITE:
+        tl.store(errors_ptr+part*COL_TILES+col_tile,bad)
+
+
+@triton.jit
+def _merge_gradient_bias(input_ptr, output_ptr, COUNT: tl.constexpr, N: tl.constexpr,
+                         BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr):
+    rows=tl.program_id(0).to(tl.int64)*BLOCK_ROWS+tl.arange(0,BLOCK_ROWS)
+    cols=tl.program_id(1)*BLOCK_COLS+tl.arange(0,BLOCK_COLS)
+    values=tl.load(input_ptr+rows[:,None]*N+cols[None,:],
+                   (rows[:,None]<COUNT)&(cols[None,:]<N),other=0.0)
+    tl.store(output_ptr+tl.program_id(0).to(tl.int64)*N+cols,tl.sum(values,0),cols<N)
+
+
+def quantize_gradient_pair_and_bias(x, fp8_dtype, check_finite, *, transpose_only=False, autotune=True):
+    """Candidate: one input read for tensorwise amax and original-value db."""
+    from deepopt.opt.backends._shared.gemm_policy import gradient_statistics_geometry
+    shape=gradient_statistics_geometry(*x.shape)
+    if shape is None:
+        normal,inverse,transpose=quantize_tensorwise_pair(x,fp8_dtype,check_finite,transpose_only=transpose_only,
+                                                       autotune=autotune)
+        return normal,inverse,transpose,x.sum(0,dtype=torch.float32)
+    row_chunk,parts,_=shape
+    m,n=x.shape
+    cols=triton.cdiv(n,64)
+    partial_bias=torch.empty((parts,n),device=x.device,dtype=torch.float32)
+    partial_max=torch.empty((parts*cols,),device=x.device,dtype=torch.float32)
+    errors=torch.empty_like(partial_max,dtype=torch.int32) if check_finite else partial_max
+    _gradient_statistics[(parts,cols)](x,partial_bias,partial_max,errors,m,n,*x.stride(),
+        row_chunk,cols,check_finite,64,enable_fp_fusion=False)
+    count=parts*cols
+    while count>1024:
+        next_count=triton.cdiv(count,1024)
+        reduced=torch.empty(next_count,device=x.device,dtype=torch.float32)
+        _reduce_amax[(next_count,)](partial_max,reduced,count,next_count,BLOCK=1024)
+        partial_max,count=reduced,next_count
+    scale=torch.empty((1,1),device=x.device,dtype=torch.float32)
+    inverse=torch.empty_like(scale)
+    _block_scales[(1,)](partial_max,scale,inverse,count,BLOCK=triton.next_power_of_2(count),FP8_MAX=torch.finfo(fp8_dtype).max)
+    count=parts
+    while count>1:
+        next_count=triton.cdiv(count,128)
+        reduced=torch.empty((next_count,n),device=x.device,dtype=torch.float32)
+        _merge_gradient_bias[(next_count,triton.cdiv(n,64))](partial_bias,reduced,count,n,128,64,enable_fp_fusion=False)
+        partial_bias,count=reduced,next_count
+    if check_finite and errors.any().item():
+        raise ValueError("AmaxScaling requires finite inputs")
+    normal,_,transpose=quantize_tensorwise_pair(x,fp8_dtype,False,transpose_only=transpose_only,
+                                              statistics=(scale,inverse),autotune=autotune)
+    return normal,inverse,transpose,partial_bias.reshape(n)

@@ -16,9 +16,20 @@ def baseline_gemm_tile(a_block_shape, b_block_shape):
     return 128, 128, block_k, 8
 
 
+def fixed_gemm_parameters(a_block_shape, b_block_shape, *, num_stages="auto"):
+    """One compatible baseline launch, without benchmarking any candidates."""
+    if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4, 5)):
+        raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
+    bm, bn, bk, warps = baseline_gemm_tile(a_block_shape, b_block_shape)
+    stages = 3 if num_stages == "auto" else num_stages
+    return dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, NUM_STAGES=stages,
+                SPLIT_K=1, GROUP_SIZE_M=1, PERSISTENT=False, num_warps=warps, num_stages=stages)
+
+
 # Reserve room for independent tile, warp and pipeline choices. Selection
 # below is independent of this tuple's ordering.
 MAX_TUNING_CONFIGS = 48
+MAX_PERSISTENT_CONFIGS = 8
 MAX_TILE_FAMILIES = 12
 AUTOTUNE_STAGES = (1, 2, 3, 4, 5)
 GROUP_SIZE_M_CHOICES = (1, 8)
@@ -130,7 +141,7 @@ def set_descriptor_block_shapes(args):
     args["c_desc"].block_shape = [bm, bn]
 
 
-def prune_gemm_configs(configs, named_args, **kwargs):
+def _prune_nonpersistent_gemm_configs(configs, named_args, **kwargs):
     args = {**named_args, **kwargs}
     if args.get("GRAD_CURRENT", False):
         configs = [config for config in configs if config.kwargs["BLOCK_M"] % args["GRAD_BR"] == 0
@@ -292,3 +303,48 @@ def prune_gemm_configs(configs, named_args, **kwargs):
                 if len(selected) == MAX_TUNING_CONFIGS:
                     return selected
     return selected
+
+
+def prune_gemm_configs(configs, named_args, **kwargs):
+    """Keep the existing search and a bounded set of matching persistent tiles.
+
+    Persistent CTAs visit multiple output tiles, retaining the same reduction
+    order within every tile. The first version is limited to tensorwise,
+    unsplit outputs: gradient observation slots currently use physical CTA IDs
+    and cannot be shared by several logical tiles.
+    """
+    nonpersistent = [config for config in configs if not config.kwargs.get("PERSISTENT", False)]
+    selected = _prune_nonpersistent_gemm_configs(nonpersistent, named_args, **kwargs)
+    args = {**named_args, **kwargs}
+    if (not args.get("TENSORWISE", False) or not args.get("NATIVE_FP8", False)
+            or args.get("GRADIENT_FP8", False)):
+        return selected
+    persistent = {
+        tuple(config.kwargs[name] for name in ("BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_SIZE_M"))
+        + (config.num_warps, config.num_stages): config
+        for config in configs if config.kwargs.get("PERSISTENT", False)
+        and config.kwargs["SPLIT_K"] == 1
+    }
+    candidates = []
+    m, n, sms = args["M"], args["N"], args.get("NUM_SMS", 132)
+    for config in selected:
+        if config.kwargs["SPLIT_K"] != 1:
+            continue
+        bm, bn = config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"]
+        if ceil(m / bm) * ceil(n / bn) <= sms:
+            continue
+        key = tuple(config.kwargs[name] for name in ("BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_SIZE_M"))
+        key += (config.num_warps, config.num_stages)
+        if key in persistent:
+            candidates.append(persistent[key])
+            if len(candidates) == MAX_PERSISTENT_CONFIGS:
+                break
+    # Preserve the historical candidate and reserve the bounded schedule
+    # comparison without increasing the total cold-start search budget.
+    return selected[:MAX_TUNING_CONFIGS - len(candidates)] + candidates
+
+
+def gemm_program_grid(m, n, block_m, block_n, split_k, sms, persistent=False):
+    """One CTA per tile, or one persistent CTA per SM, without data pointers."""
+    tiles = ceil(m / block_m) * ceil(n / block_n)
+    return (min(tiles, sms) if persistent else tiles, split_k)

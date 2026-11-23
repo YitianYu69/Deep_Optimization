@@ -19,6 +19,7 @@ from deepopt.opt.quantization.quantizer import quantize_fp8
 
 class LayerLanguage(Language):
     rsqrt = staticmethod(torch.rsqrt)
+    sqrt = staticmethod(torch.sqrt)
 
     @staticmethod
     def sum(value, axis):
@@ -31,7 +32,9 @@ class LayerNormKernelTests(unittest.TestCase):
         self.k = {"tl": self.tl, "triton": SimpleNamespace(cdiv=self.tl.cdiv)}
         root = files("deepopt.opt.backends.triton")
         for path in ("quantization/fp8.py", "quantization/activation/affine.py", "activation/common.py",
-                     "normalization/recenter.py", "normalization/statistics.py", "normalization/layer/common.py", "normalization/layer/statistics.py",
+                     "activation/math.py", "normalization/activation.py",
+                     "normalization/recenter.py", "normalization/statistics.py", "normalization/layer/moments.py",
+                     "normalization/layer/common.py", "normalization/layer/statistics.py",
                      "normalization/layer/forward.py", "normalization/layer/backward.py"):
             tree = ast.parse(root.joinpath(path).read_text())
             nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and any(
@@ -51,7 +54,7 @@ class LayerNormKernelTests(unittest.TestCase):
 
     def check(self, shape=(3, 33), norm=(33,), *, bits=2, group=17, compressed=True,
               source_fp8=False, output_fp8=False, layout="last", staged=False, scaling="provided",
-              gradient_fp8=False, affine=True, gradient_mode="retile", recenter=False):
+              gradient_fp8=False, affine=True, gradient_mode="retile", recenter=False, moments=False):
         torch.manual_seed(624)
         source = torch.randn((*shape[:-1], shape[-1] * 2), dtype=torch.bfloat16)[..., ::2]
         source = to_fp8_activation(source, layout="channels" if len(shape) > 1 else "last", block_shape=(2, 8)) if source_fp8 else source
@@ -81,8 +84,9 @@ class LayerNormKernelTests(unittest.TestCase):
         c, s = (shape[1], prod(shape[2:])) if len(shape) > 1 else (1, 1)
         capacity = m * groups * max(20, (group + 31) // 32)
         obs, snap, errors = torch.empty(capacity), torch.empty(2), torch.empty(capacity, dtype=torch.int32)
-        center = torch.empty(m) if recenter else None
-        correction = dict(center_shift=center, RECENTER=recenter)
+        center = torch.empty(m) if recenter or moments else None
+        gain = torch.empty(m) if moments else None
+        correction = dict(center_shift=center, RECENTER=recenter or moments, moment_gain=gain, MOMENTS=moments)
         if not staged:
             self.launch("_row_forward", m, data, xinv, weight, bias, output, mean, inverse, packed, steps, minima,
                         scales, oinv, obs, snap, errors, m, k, shape, norm, meta, ws, bs, affine, affine, 1e-5,
@@ -117,14 +121,18 @@ class LayerNormKernelTests(unittest.TestCase):
                 self.launch("_xhat_ranges", (m * groups, parts), data, xinv, mean, inverse, lows, highs,
                             k, shape, meta, group, groups, parts, block)
                 self.launch("_finish_min_max", m * groups, lows, highs, steps, minima, parts, bits, 1 << (parts - 1).bit_length())
-            center_errors = torch.empty(2, m, groups * parts)
+            center_errors = torch.empty(4 if moments else 2, m, groups * parts)
             self.launch("_epilogue", (m * groups, parts), data, xinv, weight, bias, mean, inverse, output, packed, steps, minima,
                         scales, oinv, obs, snap, errors, k, shape, norm, meta, ws, bs, affine, affine,
                         group, groups, words, bits, compressed, parts > 1, output_fp8, cols, layout == "channels", c, s,
                         br, bc, sc, 448., parts, False, False, True, block, center_errors=center_errors, M=m, **correction)
-            if recenter and groups * parts > 1:
-                self.launch("_merge_center", m, center_errors, center, center, m, groups * parts, 1, True,
-                            1 << (groups * parts - 1).bit_length())
+            if (recenter or moments) and groups * parts > 1:
+                if moments:
+                    self.launch("_merge_layer_moments", m, center_errors, center, center, gain,
+                                m, groups * parts, 1, True, 1 << (groups * parts - 1).bit_length())
+                else:
+                    self.launch("_merge_center", m, center_errors, center, center, m, groups * parts, 1, True,
+                                1 << (groups * parts - 1).bit_length())
         torch.testing.assert_close(mean, expected_mean, rtol=2e-5, atol=2e-6)
         torch.testing.assert_close(inverse, expected_inverse, rtol=2e-5, atol=2e-6)
         h = (matrix - mean[:, None]) * inverse[:, None]
@@ -146,7 +154,12 @@ class LayerNormKernelTests(unittest.TestCase):
             original_h = h
             h = dequantize_unpack_activation(q, dtype=torch.float32)
             torch.testing.assert_close(h, dequantize_unpack_activation(oracle, dtype=torch.float32), rtol=2e-5, atol=2e-6)
-            if recenter:
+            if moments:
+                torch.testing.assert_close(center, h.mean(1), rtol=3e-5, atol=2e-6)
+                h = (h - center[:, None]) * gain[:, None]
+                torch.testing.assert_close(h.mean(1), torch.zeros(m), rtol=0, atol=2e-6)
+                torch.testing.assert_close(h.square().mean(1), original_h.square().mean(1), rtol=3e-5, atol=3e-6)
+            elif recenter:
                 torch.testing.assert_close(center, (h - original_h).mean(1), rtol=3e-5, atol=2e-6)
                 h = h - center[:, None]
                 torch.testing.assert_close(h.mean(1), original_h.mean(1), rtol=0, atol=2e-6)
@@ -223,6 +236,15 @@ class LayerNormKernelTests(unittest.TestCase):
                     self.check(bits=bits, group=17, recenter=True, staged=staged, source_fp8=True,
                                output_fp8=True, gradient_fp8=True, gradient_mode=mode)
         self.check((3, 17003), (17003,), staged=True, group=17003, bits=1, recenter=True)
+
+    def test_forced_moments_cover_row_retile_and_fixed_fp8_gradients(self):
+        for bits in (1, 2, 4, 8):
+            for staged in (False, True):
+                for mode in (("retile",) if staged else ("row", "provided", "retile")):
+                    self.check(bits=bits, group=17, moments=True, staged=staged,
+                               source_fp8=True, output_fp8=True, gradient_fp8=True, gradient_mode=mode)
+        self.check((1, 33), (33,), moments=True, source_fp8=True,
+                   gradient_fp8=True, gradient_mode="tensorwise")
 
     def test_row_fast_paths_precision_pairs_and_all_codec_widths(self):
         for bits in (1, 2, 4, 8):

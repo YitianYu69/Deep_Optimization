@@ -94,10 +94,12 @@ on failure. Multiprocessing CI uploads those logs and runs three additional
 four-rank stress checks, failing on the first error. See the
 [scheduling diagnostic command](../docs/scheduling/README.md#verification-and-performance).
 
-CI tiers are defined in [ci.yml](../.github/workflows/ci.yml): fast CPU checks,
-worker/DDP checks, and opt-in GPU correctness/performance jobs. Syntax/name lint
-checks cover the repository; strict typing currently targets the new policy
-module. CUDA skips must not be reported as GPU validation.
+Pull requests run compiler and benchmark smoke tests, core CPU tests, and
+worker/DDP checks. The compiler and benchmark jobs run their full suites on the
+weekly schedule and when started manually. The [CI workflow](../.github/workflows/ci.yml)
+lists the smoke tests and the opt-in GPU jobs. Ruff checks syntax and names,
+and strict typing covers the execution policy module. CUDA skips carry no GPU
+qualification evidence.
 
 | Area | White-box focus | Black-box focus |
 | --- | --- | --- |

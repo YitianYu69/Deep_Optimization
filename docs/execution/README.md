@@ -88,6 +88,22 @@ standalone combined autocast context for caller-owned loops.
 
 ## Compile the model
 
+The optional [DeepOpt compiler](compiler.md) is selected with `backend="deepopt"`.
+Its [native AutoDiff route](compiler_native_autodiff.md) derives supported
+BF16/FP8/custom-op backward graphs before scheduling and provides strict
+ownership and target-GPU qualification checks.
+The [custom operation guide](custom_operations.md) explains reusable decorator
+registration, conditional saved-state plans, and shared eager/native VJPs.
+The [isolated fusion guide](compiler_fusion.md) documents independent
+forward/backward controls, packed operations, shared encodings and
+candidate-specific CUDA launch evidence.
+It reuses the current FP8/compression operations and reports captured work,
+autograd ownership and native execution. The guide includes configuration,
+supported boundaries and target-GPU validation requirements.
+The [compiled packed activation offload guide](packed_activation_offload_ddp.md)
+documents the opt-in host residency policy for saved activations, its DDP
+ownership and host-budget admission rules, and the GPU qualification gates.
+
 The direct Python equivalent of `[runtime.compile]` is:
 
 ```python
@@ -141,6 +157,26 @@ detects them. It does not disable required shape/ownership checks, loader/rank
 consistency, checkpoint compatibility or monitored-score validity. Epoch-end
 Python scalar results still require host reads. Analysis mode intentionally
 adds scans, scalar reads and logging overhead.
+
+`max_speed` also selects allocation filling off inside runtime-owned scopes,
+unless `fill_uninitialized_memory=True` explicitly overrides it. The previous
+Torch flag is restored when the scope exits, including on failure. Forward,
+backward, and optimizer scopes follow the same policy. Balanced/analyze and
+legacy execution inherit the caller's flag by default. This does not change
+deterministic algorithm selection; automatic fills are active only when both
+Torch's deterministic algorithms and fill flag are enabled. The setting is
+process-global: incompatible overlapping DeepOpt scopes across threads raise
+an error, and unscoped third-party changes are outside this ownership contract.
+
+Configure the same policy before CUDA graph warmup/capture. Model handles count
+an eager memory-policy fallback when a runtime requests a different captured
+policy; raw/decorated graphs require recapture. Changing the flag after capture
+does not remove initialization kernels already recorded in a graph.
+
+Allocator configuration is separate. Set `PYTORCH_CUDA_ALLOC_CONF` (or the
+installed Torch's `PYTORCH_ALLOC_CONF` alias) before CUDA allocator initialization.
+`expandable_segments:True` is an opt-in fragmentation experiment, particularly
+for changing batch sizes; it is not automatically enabled by an execution mode.
 
 The runtime establishes phase-local policy in `compute()`, manual `autocast()`,
 `backward()`, optimizer/gradient processing, loss preparation, and trainer metric
@@ -352,24 +388,6 @@ reference before reporting median timings, relative overhead, throughput and
 profiler scalar-read counts. CUDA runs also compare pinned/pageable and
 blocking/nonblocking copies. Results are workload/environment-specific; no GPU
 speedup is inferred from CPU results.
-
-One local CPU run (PyTorch 2.14.1, one CPU thread, 24 preloaded batches of 32,
-64 input features, hidden width 128, accumulation 4, two warmups and seven
-measured repetitions, `DEEPOPT_LOGGING_LEVEL=ERROR`) produced these
-reference-checked results:
-
-| Execution | Median epoch time | Profiled scalar reads per epoch |
-| --- | ---: | ---: |
-| Plain PyTorch | 1.506 ms | 1 |
-| Legacy strict checks | 3.459 ms | 152 |
-| `max_speed` | 2.586 ms | 7 |
-| `balanced` | 2.565 ms | 8 |
-| `analyze` | 5.275 ms | 272 |
-
-These timings describe this small CPU workload, not a general speed guarantee.
-The fast-mode reads are phase-end reporting; the separate profiler test requires
-zero scalar reads in per-batch metric bookkeeping. GPU measurements remain a
-hardware-validation task.
 
 CI separates fast CPU checks, worker/DDP tests, and opt-in scheduled/manual GPU
 jobs. GPU jobs require repository variable `DEEPOPT_GPU_CI=true` and a compatible

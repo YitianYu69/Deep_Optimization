@@ -1,0 +1,164 @@
+{
+  "settings": {
+    "fp8": {
+      "backend": "triton",
+      "trace_mode": "modules",
+      "num_stages": 3,
+      "backward_backend": "native_fast",
+      "backward_precision": "native"
+    },
+    "compression": {
+      "bits": 2,
+      "group_size": 1024,
+      "norm_xhat_recenter": true
+    },
+    "runtime": {
+      "binding": "prepared",
+      "scope_lifetime": "reused",
+      "optimizer": "adamw",
+      "optimizer_options": {
+        "weight_decay": 0
+      },
+      "lr": 0.0001,
+      "cache_enabled": false,
+      "check_finite": false,
+      "execution": "graph",
+      "timing_fill_uninitialized_memory": false,
+      "spatial_activation_layout": "auto",
+      "codec_num_warps": "auto",
+      "gelu_saved_state": "auto",
+      "native_operand_layout": "prepare"
+    }
+  },
+  "workloads": [
+    {
+      "name": "resnet18_b512",
+      "op": "model",
+      "shape": [
+        512,
+        3,
+        224,
+        224
+      ],
+      "input_requires_grad": false,
+      "factory": "analysis.example_model:build_torchvision_cnn",
+      "factory_kwargs": {
+        "model_name": "resnet18",
+        "batch_size": 512,
+        "image_size": 224,
+        "classes": 10,
+        "ema_decay": 0.95
+      },
+      "calls_per_step": 1
+    },
+    {
+      "name": "efficientnet_b0_b512",
+      "op": "model",
+      "shape": [
+        512,
+        3,
+        224,
+        224
+      ],
+      "input_requires_grad": false,
+      "factory": "analysis.example_model:build_torchvision_cnn",
+      "factory_kwargs": {
+        "model_name": "efficientnet_b0",
+        "batch_size": 512,
+        "image_size": 224,
+        "classes": 10,
+        "ema_decay": 0.95
+      },
+      "calls_per_step": 1
+    },
+    {
+      "name": "resnet18_b512_channels_last",
+      "op": "model",
+      "shape": [
+        512,
+        3,
+        224,
+        224
+      ],
+      "input_requires_grad": false,
+      "factory": "analysis.example_model:build_torchvision_cnn",
+      "factory_kwargs": {
+        "model_name": "resnet18",
+        "batch_size": 512,
+        "image_size": 224,
+        "classes": 10,
+        "ema_decay": 0.95,
+        "memory_format": "channels_last"
+      },
+      "calls_per_step": 1
+    },
+    {
+      "name": "efficientnet_b0_b512_channels_last",
+      "op": "model",
+      "shape": [
+        512,
+        3,
+        224,
+        224
+      ],
+      "input_requires_grad": false,
+      "factory": "analysis.example_model:build_torchvision_cnn",
+      "factory_kwargs": {
+        "model_name": "efficientnet_b0",
+        "batch_size": 512,
+        "image_size": 224,
+        "classes": 10,
+        "ema_decay": 0.95,
+        "memory_format": "channels_last"
+      },
+      "calls_per_step": 1
+    }
+  ],
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  },
+  "grid": {
+    "runtime.norm_kernel_variant": [
+      "auto",
+      "batch_shared"
+    ],
+    "runtime.compression_families": [
+      null,
+      [
+        "convolution"
+      ],
+      [
+        "normalization"
+      ],
+      [
+        "activation"
+      ],
+      [
+        "pooling"
+      ]
+    ],
+    "runtime.convolution_codec": [
+      "auto",
+      "materialized"
+    ],
+    "runtime.pool_kernel_variant": [
+      "auto",
+      "generic"
+    ]
+  }
+}

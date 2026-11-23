@@ -15,9 +15,11 @@ class CachedWeightModule(nn.Module):
 
     def configure_delayed_scaling(self, plan, device):
         from deepopt.opt.scaling.delayed import DelayedScalingState
+        from deepopt.kernel_policy import plan_kernel_policy
 
         training = plan["fp8_training"]
-        self.fp8_scaling = (DelayedScalingState(training["delayed_scaling"], training["fp8_dtypes"], device=device)
+        self.fp8_scaling = (DelayedScalingState(training["delayed_scaling"], training["fp8_dtypes"], device=device,
+                                               autotune=training["autotune"], kernel_policy=plan_kernel_policy(plan))
                             if training["scaling_recipe"] == "delayed" else None)
 
     def _apply(self, fn, recurse=True):

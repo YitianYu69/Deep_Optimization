@@ -27,6 +27,43 @@ def rowwise_plan():
 
 
 class FP8ExecutionOverheadTests(unittest.TestCase):
+    def test_norms_reuse_an_identical_scoped_fp8_policy_without_revalidating(self):
+        policy = FP8Config(enabled=True, backend="reference")
+        with autocast("cpu", enabled=False, fp8=policy,
+                      activation_compression={"enabled": True, "bits": 4, "group_size": 17}):
+            with patch.object(functional, "validate_fp8_plan", side_effect=AssertionError("unchanged norm plan revalidated")):
+                x = torch.randn(3, 17, requires_grad=True)
+                functional.do_layer_norm(x, (17,)).sum().backward()
+                for kind in ("batch", "group"):
+                    x = torch.randn(2, 4, 3, 5, requires_grad=True)
+                    y = (functional.do_batch_norm(x, None, None, training=True) if kind == "batch" else
+                         functional.do_group_norm(x, 2))
+                    y.sum().backward()
+
+    def test_changed_norm_compression_override_is_still_validated(self):
+        policy = FP8Config(enabled=True, backend="reference")
+        with autocast("cpu", enabled=False, fp8=policy,
+                      activation_compression={"enabled": True, "bits": 2, "group_size": 17}):
+            with autocast("cpu", enabled=False, fp8=None,
+                          activation_compression={"enabled": True, "bits": 8, "group_size": 17}):
+                with patch.object(functional, "validate_fp8_plan", wraps=functional.validate_fp8_plan) as validate:
+                    functional.do_layer_norm(torch.randn(3, 17, requires_grad=True), (17,)).sum().backward()
+                self.assertGreater(validate.call_count, 0)
+
+    def test_tensorwise_quantization_reuses_only_immutable_strategy_metadata(self):
+        from deepopt.opt.quantization import quantizer
+
+        source = torch.randn(7, 9)
+        expected = quantizer.quantize_fp8(source)
+        with patch.object(quantizer, "AmaxScaling", side_effect=AssertionError("new strategy in tensorwise hot path")):
+            actual = quantizer.quantize_fp8(source)
+            changed = quantizer.quantize_fp8(source * 3)
+        torch.testing.assert_close(actual.data.float(), expected.data.float(), rtol=0, atol=0)
+        torch.testing.assert_close(actual.scale_inv, expected.scale_inv, rtol=0, atol=0)
+        self.assertNotEqual(actual.data.data_ptr(), changed.data.data_ptr())
+        torch.testing.assert_close(changed.scale_inv, actual.scale_inv * 3)
+        self.assertEqual(vars(quantizer._TENSORWISE_SCALING), {"block_shape": None})
+
     def test_device_metadata_is_cached_per_explicit_device_without_tensor_storage(self):
         from types import SimpleNamespace
         from deepopt.opt.backends._shared.cuda import device_metadata

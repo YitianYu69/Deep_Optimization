@@ -17,7 +17,7 @@ from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 class ConvTransposeCUDATests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(309)
-        self.enterContext(torch.backends.cudnn.flags(deterministic=True, allow_tf32=False))
+        self.enterContext(torch.backends.cudnn.flags(enabled=True, deterministic=True, allow_tf32=False))
 
     def test_fp8_all_ranks_groups_scaling_and_compression(self):
         cases = (

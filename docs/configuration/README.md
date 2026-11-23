@@ -139,14 +139,16 @@ parameters; EMA adds parameter-shadow storage.
 | `deterministic` | `true`; boolean | Request deterministic execution in configured setup. This is independent of diagnostic mode. |
 | `checks` | `true`; boolean | Legacy finite checks when no diagnostic policy is selected. |
 | `execution_mode` | `None`; `"max_speed"`, `"balanced"`, `"analyze"` | Diagnostic preset. Mutually exclusive with `diagnostics`. This does not enable FP8, compilation or graph capture. |
+| `fill_uninitialized_memory` | `None`, `True`, `False` | Scoped allocation-fill override. With `None`, `max_speed` selects `False`; other modes inherit the caller's Torch flag. Explicit values win. Deterministic algorithm selection stays unchanged. |
 | `diagnostics` | `None`; table | Custom diagnostic policy; see below. |
 | `mode_schedule` | `None`; table | Diagnostic transitions keyed by positive optimizer-update numbers as strings, e.g. `{"100" = "analyze", "200" = "max_speed"}`. Values are the three execution modes. |
 | `non_blocking` | `false`; boolean | Request nonblocking batch transfers. Pinned host memory can help CPU-to-CUDA transfers. |
 | `compile` | Disabled policy | Model compilation settings below. |
 | `fp8` | Disabled policy | FP8 execution settings below. |
 | `activation_compression` | Disabled policy | Saved-activation compression settings below. |
+| `activation_memory` | Inherit existing behavior | Owned multiply-backward, scratch and future reuse/recompute settings below. |
 | `ddp` | `{}` | Distributed wrapper options below; does not launch processes. |
-| `cuda_graph` | `{}` | Defaults for explicit capture operations below; does not capture automatically. |
+| `cuda_graph` | `{}` | Enable switch and defaults for explicit capture operations below; does not capture automatically. |
 
 ### Diagnostics: `[runtime.diagnostics]`
 
@@ -190,6 +192,15 @@ Preparation happens before compilation. Current custom DO dispatch/autograd
 boundaries run outside Dynamo; enabling compilation does not guarantee fullgraph
 support or a speedup. See [compilation](../execution/README.md).
 
+## Custom kernels: `[runtime.kernels]`
+
+`backend` accepts `triton`, `tilelang`, or `mixed`. Omission/`inherit` preserves
+legacy selection. New explicit recipes use `runtime.fp8.backend="inherit"`
+when custom FP8 is enabled; reference arithmetic remains an independent choice.
+Mixed supports `preferred`, `fallback`, and concrete `families`/`roles` routes.
+See [backend selection](../architecture/kernel_backends.md) for examples,
+precedence, isolation and the experimental TileLang qualification status.
+
 ## FP8: `[runtime.fp8]`
 
 The FP8 policy is independent of runtime AMP precision and activation compression.
@@ -200,12 +211,13 @@ compatible NVIDIA hardware and libraries. See [FP8](../fp8/README.md) and
 | Key | Default / accepted values | Meaning |
 | --- | --- | --- |
 | `enabled` | `false`; boolean | Enable supported DO FP8 operations and automatic model preparation in the trainer/runtime. |
-| `backend` | `"reference"`; `"reference"` or `"triton"` | Reference emulation or CUDA Triton execution. |
+| `backend` | `"reference"`; `"reference"`, `"triton"`, `"tilelang"`, `"inherit"` | Reference emulation, explicit custom FP8 execution, or inheritance from `runtime.kernels`. |
 | `trace_mode` | `"modules"`; `"modules"`, `"full"`, `"auto"` | Preparation boundary: preserve the Python root with converted children; require a rewritten FX graph; or try full tracing and fall back to module preparation. |
 | `activation_dtype` | `"e4m3fn"`; `"e4m3fn"` or `"e5m2"` | FP8 activation operand format. |
 | `weight_dtype` | `"e4m3fn"`; `"e4m3fn"` or `"e5m2"` | FP8 weight operand format, chosen independently. |
 | `grad_dtype` | `"e4m3fn"`; `"e4m3fn"` or `"e5m2"` | FP8 gradient operand format, chosen independently. |
 | `num_stages` | `"auto"`; `"auto"` or integer 1–5 | Search Triton pipeline depths or pin a depth within autotuning. |
+| `autotune` | `true`; boolean | Enable Triton FP8 GEMM and delayed-conversion searches. `false` launches fixed compatible kernels without benchmarking candidates. With tuning disabled, `num_stages="auto"` uses depth 3; an integer still pins the depth. First-use JIT compilation remains. |
 | `out_dtype` | `None`; `"fp32"`, `"bf16"`, `"fp16"` | Dense result dtype where this policy applies. `None` follows active AMP/input dtype. This is not an FP8-output switch. |
 | `intercept_linear` | `true`; boolean | Intercept native functional linear calls inside the FP8 autocast scope. `false` leaves those calls dense while prepared DO adapters still use FP8. |
 | `intercept_convolution` | `None`; boolean when set | Override native ordinary/transposed convolution interception in 1D/2D/3D; omission inherits `intercept_linear`. |
@@ -214,7 +226,7 @@ compatible NVIDIA hardware and libraries. See [FP8](../fp8/README.md) and
 | `scaling_recipe` | `"current"`; `"current"` or `"delayed"` | Compute scales from current values, or cast using saved scales and record observations for future updates. |
 | `delayed_scaling` | Default recipe table below | Delayed-history policy. |
 | `block_shapes` | All three operands `None` | Tensorwise or rectangular per-operand scaling; see below. |
-| `backward_backend` | `"inherit"`; `"inherit"`, `"native_fast"`, `"native_precise"` | Use the selected backend or native tensorwise scaled-GEMM backward. `native_fast` enables fast accumulation; `native_precise` disables it. Native choices require `backend="triton"` and all block shapes omitted/`None`. |
+| `backward_backend` | `"inherit"`; `"inherit"`, `"native_fast"`, `"native_precise"` | Use the selected backend or native tensorwise scaled-GEMM backward. Native choices require a custom FP8 backend and all block shapes omitted/`None`; unsupported native operands use the selected custom route. |
 | `backward_precision` | `"native"`; `"native"` or `"auto"` | Preserve native activation-gradient boundaries, or analyze supported DO backward edges once and relay FP8 gradients where compatible. Requires prepared model execution for automatic planning. |
 | `exclude_modules` | `[]`; list of nonempty qualified-name glob strings | Keep selected modules dense during preparation. Nonempty exclusions require `intercept_linear=false`; explicit convolution/normalization/pooling interception cannot be true. |
 
@@ -266,7 +278,7 @@ remains unsupported. See [delayed scaling](../fp8/delayed_scaling.md).
 | `group_size` | `512`; integer ≥ 1 | Affine quantization group size for BF16 and tensorwise FP8 saved inputs. Blockwise FP8 uses its activation scale rectangles instead. |
 | `bits` | `2`; integer `1`, `2`, `4` or `8` | Global saved-activation quantization precision. Lower values reduce payload size and can increase gradient error. |
 | `attention_bits` | `None`; integer `1`, `2`, `4` or `8` | Override saved attention Q/K/V precision. Omission uses `max(4, bits)`. Explicit 1 or 2 bypasses that floor. |
-| `norm_xhat_recenter` | `false`; boolean | Preserve each normalization domain's original xhat mean after decoding compressed backward state. Applies to BatchNorm2d, GroupNorm and LayerNorm when compression is enabled, independently of FP8. |
+| `norm_xhat_recenter` | `false`; boolean | Preserve the original xhat mean for compressed BatchNorm2d and GroupNorm backward. Compressed LayerNorm always corrects its mean and second moment, independently of this option and FP8. |
 
 Attention's override affects only saved Q/K/V, not projection inputs, masks,
 probabilities or outputs. Linear/convolution compression saves packed inputs;
@@ -306,6 +318,25 @@ forward input used for computation. Fusion and temporary-workspace behavior
 depend on the operation/layout; enabling both policies does not promise one
 kernel for every operation. See [activation compression](../activation_compression/README.md).
 
+## Activation memory: `[runtime.activation_memory]`
+
+The frozen memory recipe is owned by prepared models and individual operation
+plans, including backward after the forward scope exits. It participates in
+compiler capture/cache and exact-resume identity. Empty ambient configuration
+preserves a prepared model's selection.
+
+| Key | Default / accepted values | Meaning |
+| --- | --- | --- |
+| `multiply_backward` | `"inherit"`; `"inherit"`, `"materialized"`, `"packed_streaming"` | Preserve previous behavior, explicitly use the codec oracle, or request bounded Triton packed VJPs in eager/native execution. |
+| `pack_reuse` | `"inherit"`; `"inherit"`, `"off"`, `"forward"` | Preserve legacy native sharing controls or explicitly disable them. `"forward"` is reserved and raises before execution until shared eager/native reuse is implemented. |
+| `reduction_scratch_bytes` | `8388608`; integer ≥ 4 | Per-invocation cap for packed reduction partials. Unsupported selected CUDA routes raise instead of materializing full decoded/product tensors. |
+| `recompute_modules` | `[]`; unique nonoverlapping module paths | Nonempty selections are reserved and raise before execution until eager/native region replay is implemented. |
+
+`packed_streaming` is opt-in and requires compatible Triton codec/pointwise
+routes and native backward fusion when using the DeepOpt compiler. Contradictory
+explicit compiler options are rejected. CPU runs use a reported materialized
+codec oracle; CUDA kernels and H200 memory capacity still need target validation.
+
 ## Distributed wrapper: `[runtime.ddp]`
 
 The stored table defaults to `{}`; effective wrapper defaults are listed below.
@@ -328,6 +359,7 @@ capture APIs; adding this table does not route training through a graph.
 
 | Key | Effective default / accepted values | Meaning |
 | --- | --- | --- |
+| `enabled` | `true`; boolean | `false` runs model/callable handles and decorators eagerly and skips graph warmup. Raw capture blocks require `true`. Applies when creating a new handle. |
 | `device` | Runtime CUDA device when configured, otherwise core selection; Python `None` allowed | Explicit `"cuda"` or `"cuda:N"` capture device. |
 | `warmup` | `3`; integer ≥ 1 | Warmup iterations before capture. |
 | `allow_unused_input` | `false`; boolean | Permit inputs not used by captured autograd computation. |
@@ -397,6 +429,10 @@ For interpolation curves, `duration=1` returns the end value immediately.
 Custom schedule classes are supplied in Python. See [scheduling](../scheduling/README.md).
 
 ## Settings that remain in Python
+
+`[runtime.attention]` accepts `backend = "native"` (the default) or
+`backend = "flash_attn_2"` for the optional installed FlashAttention-2 kernels.
+See [attention alignment and stability](../activation_compression/flash_attention_2.md).
 
 There are no framework `[model]`, `[optimizer]`, `[attention]`, `[normalization]`,
 `[memory]` or `[checkpoint]` tables. Model architecture, per-operation parameters

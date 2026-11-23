@@ -1,5 +1,7 @@
 """Shared BatchNorm2d/GroupNorm autograd and saved-xhat lifetime."""
 
+from deepopt.kernel_policy import kernel_forward, kernel_backward, current_kernel_policy
+
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.autograd import Function
@@ -12,12 +14,22 @@ from ....quantization.quantizer import quantize_fp8
 from ....precision.gradient import capture_gradient
 from ....quantization.gradient import enabled
 from ...._execution import backward_finite_check_policy, finite_checks_enabled
+from ....backends._shared.normalization import normalization_variant, normalization_tuning, saved_normalization_variant
 
 
 class NormalizationFunction(Function):
     @staticmethod
+    @kernel_forward
     def forward(ctx, x, weight, bias, running_mean, running_var, geometry, plan, output_layout,
-                scaling_state, state_training, momentum, backward_enabled, execution_info):
+                scaling_state, state_training, momentum, backward_enabled, execution_info, bf16_policy=None,
+                *, output=None):
+        from ...normalization.policy import capture_normalization_policy, normalization_policy_receipt
+
+        ctx.bf16_policy = bf16_policy or capture_normalization_policy(x, plan)
+        ctx.argument_count = len(ctx.needs_input_grad)
+        ctx.normalization_variant = normalization_variant()
+        ctx.normalization_tuning = normalization_tuning()
+        ctx.execution_info = execution_info
         training = plan.get("fp8_training")
         ctx.gradient_slot = capture_gradient(x)
         ctx.gradient_check = backward_finite_check_policy()
@@ -29,23 +41,33 @@ class NormalizationFunction(Function):
             compression["group_size"] = min(compression["group_size"], geometry.elements)
         center_shift = (torch.empty(geometry.domains, device=x.device, dtype=torch.float32)
                         if compression["enabled"] and compression.get("norm_xhat_recenter", False) else None)
-        backend = training["backend"] if training else "triton" if x.device.type == "cuda" else "reference"
+        backend = training["backend"] if training else current_kernel_policy().backend if x.device.type == "cuda" else "reference"
         compute = executor(x, backend)
         logical_dtype = x.dtype if x.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2) else torch.bfloat16
         if geometry.kind == "group" and x.device.type == "cuda" and torch.is_autocast_enabled("cuda"):
             logical_dtype = torch.float32
         if training is not None and training["out_dtype"] is not None:
             logical_dtype = training["out_dtype"]
+        if ctx.bf16_policy.storage_enabled:
+            logical_dtype = torch.bfloat16
+        if output is not None:
+            from ....backends._shared.normalization_output import validate_normalization_output
+
+            validate_normalization_output(output, x, weight, bias, geometry, dtype=logical_dtype,
+                                          output_layout=output_layout)
         output, mean, inverse, packed = compute.forward(
             x, weight, bias, geometry, compression, running_mean=running_mean, running_var=running_var,
             momentum=momentum, out_dtype=torch.float32 if output_layout is not None else logical_dtype,
-            output_layout=output_layout, center_shift=center_shift, execution_info=execution_info)
+            output_layout=output_layout, center_shift=center_shift, execution_info=execution_info,
+            **({"output": output} if output is not None else {}))
         if (center_shift is not None and finite_checks_enabled()
                 and not isinstance(getattr(x, "_data", x), FakeTensor)):
             if not (torch.isfinite(inverse) & (inverse > 0) & torch.isfinite(center_shift)).all():
                 raise ValueError("Normalization xhat correction requires positive finite rstd and finite codec error")
         if execution_info is not None:
-            execution_info.update(norm_xhat_recenter=center_shift is not None,
+            execution_info.update(normalization_policy_receipt(ctx.bf16_policy, x, logical_dtype, backend),
+                                  norm_xhat_recenter=center_shift is not None,
+                                  recenter_state_bytes=center_shift.numel() * center_shift.element_size() if center_shift is not None else 0,
                                   recenter_rstd_bytes=inverse.numel() * inverse.element_size() if center_shift is not None else 0,
                                   recenter_extra_rstd_bytes=0, saved_state_bytes=0)
         if backward_enabled:
@@ -86,6 +108,8 @@ class NormalizationFunction(Function):
 
     @staticmethod
     @once_differentiable
+    @saved_normalization_variant
+    @kernel_backward
     def backward(ctx, gradient):
         data, step, minimum, inverse, mean, weight, center_shift = ctx.saved_tensors
         original = packed = None
@@ -98,6 +122,7 @@ class NormalizationFunction(Function):
         compute = executor(gradient, ctx.backend)
         with torch.autocast(gradient.device.type, enabled=False):
             arguments = dict(packed=packed, x=original, mean=mean, inverse=inverse, center_shift=center_shift,
+                             execution_info=ctx.execution_info,
                              need_dx=ctx.needs_input_grad[0], need_dw=ctx.needs_input_grad[1], need_db=ctx.needs_input_grad[2])
             if ctx.needs_input_grad[0] and enabled(ctx.gradient_slot):
                 with ctx.gradient_slot.output(ctx.geometry.shape, ctx.input_dtype, check_finite=ctx.gradient_check) as output:
@@ -105,7 +130,8 @@ class NormalizationFunction(Function):
                                                   gradient_output=output, **arguments)
             else:
                 dx, dw, db = compute.backward(gradient, weight, ctx.geometry, input_dtype=ctx.input_dtype, **arguments)
-        return (dx if isinstance(dx, FP8Activation) else dx.to(ctx.input_dtype) if dx is not None else None,
+        result = (dx if isinstance(dx, FP8Activation) else dx.to(ctx.input_dtype) if dx is not None else None,
                 dw.to(ctx.weight_dtype) if dw is not None else None,
                 db.to(ctx.bias_dtype) if db is not None else None,
                 None, None, None, None, None, None, None, None, None, None)
+        return result + (None,) if ctx.argument_count == 14 else result

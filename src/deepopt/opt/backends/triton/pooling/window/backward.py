@@ -10,6 +10,34 @@ from ...quantization.activation.indices import _unpack_codes
 
 
 @triton.jit
+def _max_pool3x3_backward(dy,dy_inverse,routing,output,scales,inverse,observations,
+                         SHAPE:tl.constexpr,OUT_SHAPE:tl.constexpr,DY_META:tl.constexpr,
+                         CHANNELS:tl.constexpr,ROUTE_CHANNELS:tl.constexpr,TOTAL:tl.constexpr,
+                         IH:tl.constexpr,IW:tl.constexpr,OH:tl.constexpr,OW:tl.constexpr,ROUTE_BITS:tl.constexpr,
+                         ROWS:tl.constexpr,COLS:tl.constexpr,BR:tl.constexpr,BC:tl.constexpr,
+                         FP8:tl.constexpr,CURRENT:tl.constexpr,OBSERVE:tl.constexpr,MAXIMUM:tl.constexpr,
+                         BLOCK:tl.constexpr):
+    index=tl.program_id(0).to(tl.int64)*BLOCK+tl.arange(0,BLOCK)
+    valid=index<TOTAL
+    logical=_logical(index,SHAPE,CHANNELS)
+    nc,position=logical//(IH*IW),logical%(IH*IW)
+    h,w=position//IW,position%IW
+    local=tl.arange(0,4)
+    oh=h[:,None]//2+local[None,:]//2
+    ow=w[:,None]//2+local[None,:]%2
+    rh,rw=h[:,None]-oh*2+1,w[:,None]-ow*2+1
+    mask=valid[:,None]&(oh<OH)&(ow<OW)&(rh>=0)&(rh<3)&(rw>=0)&(rw<3)
+    destination=nc[:,None]*(OH*OW)+oh*OW+ow
+    route_index=_matrix_index(destination,OUT_SHAPE,ROUTE_CHANNELS)
+    route=(_unpack_codes(routing,route_index,mask,ROUTE_BITS) if ROUTE_BITS>=0 else
+           tl.load(routing+route_index,mask,other=0))
+    gradient=_load_value(dy,dy_inverse,destination,mask,OUT_SHAPE,DY_META)
+    result=tl.sum(tl.where(mask&(route==rh*3+rw),gradient,0.),1)
+    _store_value(result,output,scales,inverse,observations,output,output,index,valid,
+                 ROWS,COLS,BR,BC,FP8,CURRENT,OBSERVE,False,False,MAXIMUM,BLOCK)
+
+
+@triton.jit
 def _load_coefficient(data, step, minimum, logical, valid, SHAPE: tl.constexpr,
                        CHANNELS: tl.constexpr, COLS: tl.constexpr, COMPRESSED: tl.constexpr,
                        BR: tl.constexpr, BC: tl.constexpr, GROUP: tl.constexpr, WORDS: tl.constexpr, BITS: tl.constexpr):
@@ -32,7 +60,7 @@ def _load_coefficient(data, step, minimum, logical, valid, SHAPE: tl.constexpr,
 
 
 @triton.jit
-def _backward(dy, dy_inverse, routing, coefficient, steps, minima, factor, samples,
+def _pooling_backward(dy, dy_inverse, routing, coefficient, steps, minima, factor, samples,
                output, scales, inverse, observations, snapshot, errors,
                SHAPE: tl.constexpr, OUT_SHAPE: tl.constexpr, DY_META: tl.constexpr, GEO: tl.constexpr,
                CHANNELS: tl.constexpr, ROUTE_CHANNELS: tl.constexpr, TOTAL: tl.constexpr,
@@ -57,8 +85,8 @@ def _backward(dy, dy_inverse, routing, coefficient, steps, minima, factor, sampl
         lows, highs = _candidates(nc, positions, samples, valid, GEO)
         extents = (highs[0] - lows[0], highs[1] - lows[1], highs[2] - lows[2])
         result = tl.full((32,), 0.0, tl.float32)
-        maximum: tl.constexpr = GEO[0] in (0, 2, 4) or GEO[0] == 5 and (GEO[9] == float("inf") or GEO[9] == -float("inf"))
-        step: tl.constexpr = (1, 1, 1) if GEO[0] in (2, 3, 4) else GEO[6]
+        maximum: tl.constexpr = (GEO[0] == 0 or GEO[0] == 2 or GEO[0] == 4) or GEO[0] == 5 and (GEO[9] == float("inf") or GEO[9] == -float("inf"))
+        step: tl.constexpr = (1, 1, 1) if (GEO[0] == 2 or GEO[0] == 3 or GEO[0] == 4) else GEO[6]
         for part in range(triton.cdiv(CANDIDATES, WB)):
             local = part * WB + tl.arange(0, WB)
             eh = tl.maximum(extents[1][:, None], 1)
@@ -97,3 +125,7 @@ def _backward(dy, dy_inverse, routing, coefficient, steps, minima, factor, sampl
         value = result
     _store_value(value, output, scales, inverse, observations, snapshot, errors, index, valid,
                  ROWS, COLS, BR, BC, FP8, CURRENT, OBSERVE, False, CHECK, MAXIMUM, 32)
+
+
+# Preserve private launch imports; profiler names identify the actual operation.
+_backward = _pooling_backward

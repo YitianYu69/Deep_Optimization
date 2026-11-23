@@ -1,8 +1,9 @@
-import torch 
+import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .functional import do_linear, do_scaled_dot_product_attention, _attention_compression, _prepare_fp8_plan
+from .functional import do_linear, do_scaled_dot_product_attention, _attention_compression, _prepare_linear_plan
+from .._autocast import _get_attention_backend
 from ._cached_weights import CachedWeightModule
 
 
@@ -16,17 +17,21 @@ class DOMultiheadAttention(CachedWeightModule):
             raise NotImplementedError("Learned bias key/value tokens are not supported yet")
         if original.add_zero_attn:
             raise NotImplementedError("add_zero_attn is not supported yet")
-        
-        self.plan = _prepare_fp8_plan(plan)
-        self._fp8_out_projection = True
+
+        self.plan = _prepare_linear_plan(plan)
+        self._deepopt_attention_recipe_version = 2
+        self._fp8_out_projection = self.plan.get("fp8", True)
+        self.attention_backend = "native"
         self._projection_scaling = nn.ModuleDict()
-        if self.plan["fp8_training"]["scaling_recipe"] == "delayed":
+        if self._fp8_out_projection and self.plan["fp8_training"]["scaling_recipe"] == "delayed":
             from deepopt.opt.scaling.delayed import DelayedScalingState
+            from deepopt.kernel_policy import plan_kernel_policy
 
             device = next(original.parameters()).device
             for role in ("qkv", "q", "k", "v", "out"):
                 self._projection_scaling[role] = DelayedScalingState(
-                    self.plan["fp8_training"]["delayed_scaling"], self.plan["fp8_training"]["fp8_dtypes"], device=device)
+                    self.plan["fp8_training"]["delayed_scaling"], self.plan["fp8_training"]["fp8_dtypes"], device=device,
+                    autotune=self.plan["fp8_training"]["autotune"], kernel_policy=plan_kernel_policy(self.plan))
 
         self.embed_dim = original.embed_dim
         self.num_heads = original.num_heads
@@ -42,19 +47,19 @@ class DOMultiheadAttention(CachedWeightModule):
         # dictionaries associate saved slots with parameter-list positions.
         for name, parameter in original._parameters.items():
             self.register_parameter(name, parameter)
-        
+
         self.out_proj = original.out_proj
         self.training = original.training
-    
+
     @classmethod
     def from_mha(cls, original: nn.MultiheadAttention, *, plan: dict) -> "DOMultiheadAttention":
         return cls(original, plan=plan)
 
     def _project(
-        self, 
-        query: torch.Tensor, 
-        key: torch.Tensor, 
-        value: torch.Tensor, 
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         *,
         self_attention: bool
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -77,12 +82,12 @@ class DOMultiheadAttention(CachedWeightModule):
                 self.k_proj_weight,
                 self.v_proj_weight,
             )
-        
+
         if self.in_proj_bias is None:
             biases = (None, None, None)
         else:
             biases = self.in_proj_bias.chunk(3, dim=0)
-        
+
         q = do_linear(
             query, weights[0], biases[0], plan=self.plan, _weight_cache=self._fp8_weight_cache,
             _scaling_state=self._projection_scaling["q"] if self._projection_scaling else None, _state_training=self.training,
@@ -152,7 +157,7 @@ class DOMultiheadAttention(CachedWeightModule):
                 raise ValueError(
                     f"Key_padding_mask must have shape {expected_shape}"
                 )
-            
+
             padding = padding.reshape(batch_size, 1, 1, source_length)
             combined = padding if combined is None else combined + padding
         return combined
@@ -171,7 +176,7 @@ class DOMultiheadAttention(CachedWeightModule):
         for flag in (need_weights, average_attn_weights, is_causal):
             if type(flag) is not bool:
                 raise TypeError("Attention flags must be booleans")
-        
+
         for tensor in(query, key, value):
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError("Query, key, and value must be tensors")
@@ -203,7 +208,7 @@ class DOMultiheadAttention(CachedWeightModule):
             query = query.transpose(0, 1)
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
-        
+
         batch_size, target_length, _ = query.shape
         source_length = key.shape[1]
 
@@ -217,7 +222,7 @@ class DOMultiheadAttention(CachedWeightModule):
         ):
             if tensor.shape[-1] != expected_width:
                 raise ValueError("Query, key, or value has an incorrect feature dimension")
-        
+
         q, k, v = self._project(query, key, value, self_attention=self_attention)
         q = q.reshape(batch_size, target_length, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(batch_size, source_length, self.num_heads, self.head_dim).transpose(1, 2)
@@ -232,6 +237,9 @@ class DOMultiheadAttention(CachedWeightModule):
             unbatched=unbatched
         )
         dropout_p = self.dropout if self.training else 0.0
+        backend = _get_attention_backend(q.device.type) or self.attention_backend
+        if backend == "flash_attn_2" and need_weights:
+            raise ValueError("flash_attn_2 does not return full attention weights; call MHA with need_weights=False")
 
         with torch.autocast(device_type=q.device.type, enabled=False):
             if need_weights:
@@ -246,6 +254,12 @@ class DOMultiheadAttention(CachedWeightModule):
 
                     attended = torch.matmul(probabilities, v.float()).to(dtype=q.dtype)
                     weights = probabilities.to(dtype=q.dtype)
+                from .attention_backend import notify_attention
+                from .functional import _attention_compression_settings
+
+                notify_attention(q, k, v, attended, backend="manual",
+                                 compression=_attention_compression_settings(q, k, v, plan=self.plan, attn_mask=mask),
+                                 saved_layout="transposed_k", dropout_p=dropout_p, scale=self.head_dim ** -.5)
             else:
                 attended = do_scaled_dot_product_attention(
                     q, k, v,
@@ -253,11 +267,12 @@ class DOMultiheadAttention(CachedWeightModule):
                     dropout_p=dropout_p,
                     is_causal=False,
                     plan=self.plan,
+                    attention_backend=backend,
                 )
                 weights = None
-            
+
         attended = attended.transpose(1, 2).reshape(batch_size, target_length, self.embed_dim)
-        if self._fp8_out_projection:
+        if self._fp8_out_projection or not self.plan.get("fp8", True):
             output = do_linear(
                 attended, self.out_proj.weight, self.out_proj.bias,
                 plan=self.plan, _weight_cache=self._fp8_weight_cache,
@@ -274,11 +289,11 @@ class DOMultiheadAttention(CachedWeightModule):
                 weights = weights.squeeze(0)
         elif not self.batch_first:
             output = output.transpose(0, 1)
-        
+
         return output, weights
 
     def extra_repr(self) -> str:
-        backend = self.plan["fp8_training"]["backend"]
+        backend = self.plan["fp8_training"]["backend"] if "fp8_training" in self.plan else self.attention_backend
         return (
             f"embed_dim={self.embed_dim}, "
             f"num_heads={self.num_heads}, "

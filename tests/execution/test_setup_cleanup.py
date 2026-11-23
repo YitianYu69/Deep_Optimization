@@ -31,6 +31,9 @@ class SetupCleanupTests(unittest.TestCase):
                     patch("deepopt.distributed.ddp.distributed.world_size", return_value=2), \
                     patch("deepopt.distributed.ddp.distributed.collective_errors", side_effect=lambda _: nullcontext()), \
                     patch("deepopt.distributed.ddp.distributed.require_equal"), \
+                    patch("deepopt.distributed.offload.prepare_packed_offload",
+                          return_value={"schema_version": 1, "status": "disabled",
+                                        "admitted": True, "enabled": False}), \
                     patch("deepopt.distributed.ddp.DistributedDataParallel.__new__", return_value=Mock()) as wrapper:
                 core = DDPCore(nn.Linear(1, 1), "cpu", options,
                                config={"runtime": {"ddp": inherited}})

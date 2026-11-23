@@ -10,6 +10,16 @@ def _three(values, fill):
     return (fill,) * (3 - len(values)) + values
 
 
+def depthwise_eligible(geometry):
+    return (geometry.groups == geometry.in_channels == geometry.out_channels and geometry.kernel_volume > 1
+            and 4 * geometry.in_channels * geometry.kernel_volume <= 32 * 1024 * 1024)
+
+
+def depthwise_splits(reduction, channels, kernel_volume):
+    """Bound the deterministic candidate dW workspace to 32 MiB."""
+    return max(1, min(64, (reduction + 4095) // 4096, (32 * 1024 * 1024) // (4 * channels * kernel_volume)))
+
+
 def geometry_arguments(geometry):
     """Normalize one-, two-, and three-dimensional spatial indices to D/H/W."""
     if geometry.rank not in (1, 2, 3):
@@ -84,15 +94,31 @@ def launch_options(num_stages="auto", *, tensorwise=True):
     }
 
 
-def weight_splits(rows, cols, reduction, groups, *, block_m=64, block_n=32):
+def weight_splits(rows, cols, reduction, groups, *, block_m=64, block_n=32, num_sms=None, target_waves=4):
     """Bound deterministic dW partial storage and expose long reductions.
 
     Small kernels otherwise launch too few CTAs for a large spatial batch.
     Partial buffers contain only weight-gradient tiles, never image patches.
     """
     tiles = ((rows + block_m - 1) // block_m) * ((cols + block_n - 1) // block_n) * groups
-    if reduction < 2048 or tiles >= 128:
+    target = 128 if num_sms is None else max(1, num_sms * target_waves)
+    if reduction < 2048 or tiles >= target:
         return 1
-    desired = min(16, (128 + tiles - 1) // tiles, (reduction + 1023) // 1024)
+    desired = min(16, (target + tiles - 1) // tiles, (reduction + 1023) // 1024)
     memory_bound = max(1, (32 * 1024 * 1024) // (4 * rows * cols * groups))
     return min(desired, memory_bound)
+
+
+def weight_split_options(rows, cols, reduction, groups, selected, *, block_k=64):
+    """Nearby deterministic dW choices within the same 32 MiB scratch cap.
+
+    Called only for the opt-in tuned search. Each timed choice includes its
+    partial computation and final reduction, so extra parallelism is not free.
+    """
+    limit = max(1, min(16, (reduction + block_k - 1) // block_k,
+                       (32 * 1024 * 1024) // (4 * rows * cols * groups)))
+    result = [selected]
+    for value in (max(1, selected // 2), min(limit, selected * 2)):
+        if value <= limit and value not in result:
+            result.append(value)
+    return tuple(result)

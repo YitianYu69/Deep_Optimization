@@ -12,7 +12,7 @@ def _bias_partial(data, scales, partial, M: tl.constexpr, N: tl.constexpr,
     pid = tl.program_id(0).to(tl.int64)
     c, part = pid // PARTS, pid % PARTS
     row = part * BLOCK + tl.arange(0, BLOCK)
-    value = tl.load(data + row * RS + c * CS, row < M, other=0).to(tl.float32)
+    value = tl.load(data + row * RS + c * CS, row < M, other=0.0).to(tl.float32)
     inverse = tl.load(scales + row // BR * SRS + c // BC * SCS, row < M, other=0)
     tl.store(partial + c * PARTS + part, tl.sum(value * inverse, 0))
 

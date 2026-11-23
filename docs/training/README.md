@@ -164,7 +164,10 @@ self-supervised step with two forward passes and no classification labels.
 | `evaluate(loader)` | Return fresh whole-phase metrics; use eval mode and `no_grad()`, then restore previous module training flags |
 | `monitor="loss"`, `monitor_mode="min"` | Default best-score selection when validation is present |
 | `monitor=None` | Keep validation while disabling best-score selection |
-| `progress_bar=False` | Disable the default tqdm epoch bar on stderr |
+| `progress_bar=True` or `"step"` | Show optimizer updates within each epoch on stderr; the default |
+| `progress_bar="epoch"` | Show completed epochs using the earlier display |
+| `progress_bar=False` | Disable progress bars |
+| `progress_bar_every_steps=N` | Report the step bar and running loss/all training metrics every `N` optimizer updates; positive integer, default `1` |
 | `request_stop()` | Stop after the current epoch completes |
 | `new_metrics()` | Create a fresh phase metric collection for advanced integration |
 
@@ -253,8 +256,10 @@ trainer.fit(train_loader, validation_loader, epochs=10,
 ```
 
 Epoch callbacks receive `(trainer, row)` after training, validation, and
-best-score/state updates. The progress bar advances after every callback
-succeeds. Each row contains:
+best-score/state updates. In `progress_bar="epoch"` mode, the bar advances after
+every epoch callback succeeds. The default step bar has already counted the
+optimizer updates and shows the validation/finalization phase until those
+operations finish. Each row contains:
 
 - `epoch` and cumulative `optimizer_steps`;
 - `batch_size`, the training loader's batch size per rank before gradient
@@ -262,6 +267,49 @@ succeeds. Each row contains:
   when the loader does not expose a fixed batch size);
 - `learning_rate` and `learning_rates`, captured at the epoch's start;
 - `train` and `validation` metric dictionaries.
+
+The default `progress_bar=True` is equivalent to `progress_bar="step"`. It
+creates a bar for each epoch, labeled with the current epoch and total target.
+`progress_bar_every_steps` sets how many optimizer updates occur between reports:
+
+```python
+trainer.fit(train_loader, validation_loader, epochs=80,
+            progress_bar="step", progress_bar_every_steps=50)
+```
+
+The postfix shows the cumulative `optimizer_step`, running `train/loss` when the
+objective supplies loss reporting, and **every registered training metric**,
+including nested names. Values summarize all batches processed in the current
+epoch, not only the latest batch. Metric forward/update computations are not
+repeated for display. Validation metrics appear as `val/...` after evaluation;
+future validation values are never inferred from training metrics.
+
+With gradient accumulation, several microbatches produce one optimizer update;
+a final partial accumulation window also counts as one update. The reporting
+interval starts anew for each epoch or resumed epoch. A short final interval
+is flushed before validation/finalization, and interrupted displays retain all
+committed updates. Epoch mode ignores the step cadence. Use `False` to hide the
+bar rather than setting the interval to zero.
+
+Only rank zero renders bars. In DDP, pass the same step-progress mode and cadence
+on every rank: all ranks participate in the scheduled metric summary. Summaries
+can synchronize devices and metric state; a larger interval reduces that cost.
+Between reports the display only tracks host counters and does not calculate
+metric summaries or introduce callback-related synchronization. Tqdm's normal
+time-based terminal throttling still applies in addition to the step interval.
+Stream lengths are not inferred by iterating ahead: an unknown-length loader
+shows a running update count without a percentage or ETA. Finite map-style
+DataLoaders and list/tuple batches provide totals without consuming samples.
+
+Step checkpoints restore the completed-update prefix of the active epoch. When
+the loader exposes `remaining_batches()`, the total combines that prefix with
+the updates needed for the remaining batches at the current accumulation/batch
+size. A final-step checkpoint with no remaining batches does not invent an
+extra update. `progress_bar="epoch"` retains the earlier completed-epoch bar;
+`False` avoids importing tqdm or constructing a display. The configured
+`deepopt.run.train(..., progress_bar=..., progress_bar_every_steps=...)` entry point
+accepts the same controls. The CLI spelling is `deepopt train ...
+--progress-bar-every-steps 50`.
 
 Training metrics include elapsed `seconds`; `samples_per_second` is present
 when all sample counts are known. Validation results contain metrics rather

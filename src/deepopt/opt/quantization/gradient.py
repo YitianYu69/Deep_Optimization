@@ -25,7 +25,8 @@ def gradient_matrix(value, layout):
 
 def gradient_bias(operand):
     if operand.data.device.type == "cuda" and not isinstance(operand.data, FakeTensor):
-        from ..backends.triton.gradient import bias
+        from deepopt.opt.backends.dispatch import backend_module
+        bias = backend_module('gradient', 'gradient').bias
 
         return bias(operand)
     return operand.dequantize().sum(0, dtype=torch.float32)
@@ -38,7 +39,8 @@ def gradient_transpose(value, dtype, blocks, check_finite=None, *, layout="last"
     q = gradient_operand(value, layout)
     if (q is not None and q.data.device.type == "cuda" and not isinstance(q.data, FakeTensor)
             and not checked and blocks is not None and blocks[0] * blocks[1] <= 16384):
-        from ..backends.triton.gradient import transpose_quantize
+        from deepopt.opt.backends.dispatch import backend_module
+        transpose_quantize = backend_module('gradient', 'gradient').transpose_quantize
 
         return transpose_quantize(q, dtype, blocks)
     return quantize_fp8(gradient_matrix(value, layout).T, fp8_dtype=dtype, block_shape=blocks, check_finite=checked)
@@ -47,7 +49,7 @@ def gradient_transpose(value, dtype, blocks, check_finite=None, *, layout="last"
 class GradientSlot(nn.Module):
     """One immutable edge decision and its independent delayed state/report."""
 
-    def __init__(self, plan, options, *, device):
+    def __init__(self, plan, options, *, device, autotune=True):
         super().__init__()
         self.edge = plan
         self.scaling = None
@@ -57,7 +59,8 @@ class GradientSlot(nn.Module):
             from ..scaling.delayed import DelayedScalingState
 
             dtype = getattr(torch, "float8_" + plan.dtype)
-            self.scaling = DelayedScalingState(options, {role: dtype for role in ("activation", "weight", "grad")}, device=device)
+            self.scaling = DelayedScalingState(options, {role: dtype for role in ("activation", "weight", "grad")},
+                                               device=device, autotune=autotune)
 
     @contextmanager
     def output(self, shape, logical_dtype, *, layout=None, check_finite=None, training=None):
@@ -115,6 +118,13 @@ class GradientOutput:
             self.observation_count = programs
 
     def can_fuse(self, value, *, bm=16, bn=16):
+        from deepopt.kernel_policy import current_kernel_policy, current_kernel_role
+        policy, role = current_kernel_policy(), current_kernel_role()
+        if policy.backend == "mixed" and role is not None:
+            family = {"linear": "gemm", "convolution": "convolution", "activation": "activation",
+                      "normalization": "normalization", "pooling": "pooling"}.get(role.split(".")[0])
+            if family and policy.route("gradient", role) != policy.route(family, role):
+                return False
         storage = value._data if isinstance(value, FP8Activation) else value
         if storage.device.type != "cuda" or isinstance(storage, FakeTensor) or self.checked:
             return False
@@ -137,6 +147,11 @@ class GradientOutput:
             self.allocate(*values.shape, values.device)
             return FP8Activation(torch.empty_like(values, dtype=self.dtype), self.inverse, self.shape,
                                  self.block_shape, self.layout, self.logical_dtype)
+        if values.device.type == "cuda":
+            from deepopt.kernel_policy import kernel_backend
+            if kernel_backend("gradient") == "tilelang":
+                from ..backends.tilelang.gradient.epilogue import output
+                return output(values, self)
         if state is not None:
             q = state.quantize(values, "grad", training=self.training, check_finite=self.checked)[0]
         else:

@@ -16,7 +16,7 @@ def _input_gradient_fp8(dy, dy_scale, data, step, minimum, x, x_scale, mean, inv
                         ROWS: tl.constexpr, COLS: tl.constexpr, LAST: tl.constexpr, CHANNELS: tl.constexpr,
                         BR: tl.constexpr, BC: tl.constexpr, CURRENT: tl.constexpr, OBSERVE: tl.constexpr,
                         MAXIMUM: tl.constexpr, BLOCK: tl.constexpr,
-                        center_shift=None, RECENTER: tl.constexpr = False):
+                        center_shift=None, RECENTER: tl.constexpr = False, SHARED_BN: tl.constexpr = False):
     pid = tl.program_id(0).to(tl.int64)
     offset = tl.arange(0, BLOCK)
     if CURRENT:
@@ -37,15 +37,21 @@ def _input_gradient_fp8(dy, dy_scale, data, step, minimum, x, x_scale, mean, inv
     else:
         domain, position = n * G + c // (C // G), c % (C // G) * S + s
     gradient = _load_input(dy, dy_scale, n, c, s, valid, C, S, DY_META)
-    if HAS_WEIGHT:
+    if HAS_WEIGHT and not SHARED_BN:
         gradient *= tl.load(weight + c, valid, other=1).to(tl.float32)
     if BATCH_STATS:
         h, rstd = _load_xhat_rstd(data, step, minimum, x, x_scale, mean, inverse, domain, position, n, c, s, valid,
                        C, S, ELEMENTS, COMPRESSED, GROUP, WORDS, BITS, X_META, center_shift, RECENTER)
-        gradient -= tl.load(sums + domain, valid, other=0) / ELEMENTS
-        gradient -= h * tl.load(sums + DOMAINS + domain, valid, other=0) / ELEMENTS
+        if SHARED_BN:
+            gradient -= tl.load(sums + DOMAINS + domain, valid, other=0.0) / ELEMENTS
+            gradient -= h * tl.load(sums + domain, valid, other=0.0) / ELEMENTS
+        else:
+            gradient -= tl.load(sums + domain, valid, other=0) / ELEMENTS
+            gradient -= h * tl.load(sums + DOMAINS + domain, valid, other=0) / ELEMENTS
     else:
         rstd = tl.load(inverse + domain, valid, other=0)
+    if HAS_WEIGHT and SHARED_BN:
+        gradient *= tl.load(weight + c, valid, other=1).to(tl.float32)
     value = gradient * rstd
     if CURRENT:
         amax = tl.max(tl.where(valid, tl.abs(value), 0), 0)

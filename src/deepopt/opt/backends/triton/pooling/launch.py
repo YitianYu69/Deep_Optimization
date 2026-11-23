@@ -6,7 +6,7 @@ import warnings
 import torch
 import triton
 
-from .window.forward import _forward as _pool_forward
+from .window.forward import _forward as _pool_forward, _max_pool3x3_forward
 from .power.factors import _coefficient
 from .unpool.forward import _zero, _scatter, _check_indices
 from .common.launch import kernel_geometry, output_storage, finish_output
@@ -18,6 +18,7 @@ from ....nn.activation.geometry import ReLUGeometry, tensor_arguments
 from ....nn.pooling.state import PoolState
 from ....quantization.activation import PackedActivation
 from ....quantization.indices import empty_indices
+from ..._shared.pooling import resnet_maxpool
 
 
 def coefficient_state(x, compression, input_block_shape, power, need_state, checked, info, *, allocate_only=False):
@@ -173,7 +174,9 @@ def _forward(x, g, *, options, dtype, block_shape, compression, check_finite, ne
     finite_power = g.family == "power" and not isinf(g.power)
     fused_block = fused_coefficient_block(x, g, compression, input_block_shape, need_state)
     large_global = global_reduction(g)
-    program_block = power_program_block(g) if finite_power and not large_global else 32
+    specialized=resnet_maxpool(g)
+    program_block = 256 if specialized else power_program_block(g) if finite_power and not large_global else 32
+    info["forward_variant"]="max_pool3x3" if specialized else "generic"
     coefficient, coefficient_layout = None, "last"
     if fused_block is not None:
         coefficient, coefficient_layout = coefficient_state(x, compression, input_block_shape, g.power, need_state,
@@ -209,6 +212,16 @@ def _forward(x, g, *, options, dtype, block_shape, compression, check_finite, ne
         launch_global(source, source_inverse, source_meta, g, output, public_matrix, route_data, factor,
                       scale, inverse, observations, snapshot, need_state, compression, bits, dtype, fp8, br, bc,
                       observe, capture_scale, info)
+    elif specialized:
+        _max_pool3x3_forward[(triton.cdiv(output.numel(), program_block),)](
+            source, source_inverse, output, public_matrix if public_matrix is not None else output, route_data,
+            scale if scale is not None else output, inverse if fp8 else output,
+            observations if observations is not None else output, snapshot if snapshot is not None else output,
+            g.shape, g.output_shape, source_meta, g.layout == "channels", output.numel(), need_state,
+            public_matrix is not None, compression["enabled"], rows, cols, br, bc, fp8, scale is None,
+            observe and fp8, capture_scale and fp8, torch.finfo(dtype).max if fp8 else 0., program_block,
+            num_warps=4, enable_fp_fusion=False)
+        info["forward_launches"] = 1
     else:
         programs = triton.cdiv(output.numel(), program_block)
         _pool_forward[(programs,)](source, source_inverse, sample_data, output,

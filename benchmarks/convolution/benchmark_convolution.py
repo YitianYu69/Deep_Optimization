@@ -50,7 +50,7 @@ def parser():
     result.add_argument("--layout", choices=("contiguous", "channels_last"), default="contiguous")
     result.add_argument("--paths", choices=("bf16", "fp8"), nargs="+", default=["bf16", "fp8"])
     result.add_argument("--bits", type=int, choices=(1, 2, 4, 8), default=2)
-    result.add_argument("--group-size", type=int, default=512)
+    result.add_argument("--group-size", type=int, default=1024)
     result.add_argument("--fp8-block", type=positive_shape, help="source FP8 activation scaling rectangle, e.g. 1x32")
     result.add_argument("--fp8-weight-block", type=positive_shape, help="FP8 weight scaling rectangle")
     result.add_argument("--fp8-grad-block", type=positive_shape, help="FP8 output-gradient scaling rectangle")
@@ -58,8 +58,13 @@ def parser():
     result.add_argument("--warmup", type=int, default=10)
     result.add_argument("--iterations", type=int, default=30)
     result.add_argument("--repeats", type=int, default=5)
+    result.add_argument("--autotune", action=argparse.BooleanOptionalAction, default=False)
+    result.add_argument("--time-budget", type=float, default=2.0, help="Warm timing target per variant in seconds; 0 uses exhaustive counts")
     result.add_argument("--seed", type=int, default=42)
     result.add_argument("--device", default="cuda:0")
+    result.add_argument("--deepopt-backend", choices=("triton", "tilelang", "mixed"), default="triton")
+    result.add_argument("--deepopt-kernel-policy", type=json.loads, default={},
+                        help="JSON runtime.kernels policy; its backend must match --deepopt-backend")
     result.add_argument("--cuda-graph", action="store_true", help="capture model forward/backward; replay is timed")
     result.add_argument("--optimizer-step", action="store_true", help="include SGD update outside the model capture")
     result.add_argument("--profile-dir", type=Path, help="write one Chrome trace per case and report CUDA kernel phases")
@@ -78,7 +83,16 @@ def dimensional(value, rank, option):
 
 
 class Case:
-    def __init__(self, args, path, compressed):
+    def __init__(self, args, path, compressed, selection=None):
+        if selection is None:
+            from deepopt._benchmarking import BenchmarkBackend
+            selection = BenchmarkBackend.from_args(args)
+        self.selection = selection
+        with selection.scope():
+            self._prepare(args, path, compressed)
+
+    def _prepare(self, args, path, compressed):
+        kernel_config = self.selection.config
         import deepopt
         from deepopt.opt.nn import functional as deepopt_f
         from deepopt.opt.policy import conv_plan, prepare_fp8_model
@@ -107,20 +121,21 @@ class Case:
         self.context = lambda: torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False)
         if path == "fp8":
             settings = deepopt.FP8Config(
-                enabled=True, backend="triton", trace_mode="modules", intercept_linear=False,
+                enabled=True, backend=self.selection.fp8_backend(self.x.device), autotune=args.autotune, trace_mode="modules", intercept_linear=False,
                 scaling_recipe=args.scaling_recipe,
                 block_shapes={"activation": args.fp8_block, "weight": args.fp8_weight_block, "grad": args.fp8_grad_block},
             )
-            self.model, report = prepare_fp8_model(self.model, settings, activation_compression=compression)
+            self.model, report = prepare_fp8_model(self.model, settings, config=kernel_config,
+                activation_compression=compression)
             if not report.converted_modules:
                 raise RuntimeError("DeepOpt did not convert the spatial convolution")
             self.call = self.model
             self.context = lambda: deepopt.autocast(
                 "cuda", dtype=torch.bfloat16, fp8=settings, activation_compression=compression,
-                cache_enabled=False, check_finite=False,
+                cache_enabled=False, check_finite=False, config=kernel_config,
             )
         else:
-            plan = conv_plan(False, activation_compression=compression)
+            plan = conv_plan(False, activation_compression=compression, config=kernel_config)
             native = getattr(deepopt_f, f"{args.operation}{self.rank}d")
             self.call = lambda value: native(
                 value, self.model.weight, self.model.bias, stride=self.model.stride,
@@ -133,6 +148,8 @@ class Case:
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-3) if args.optimizer_step else None
         self.captured = None
         if args.cuda_graph:
+            from deepopt._benchmarking import capture_warmup_steps
+            self.capture_warmup_steps = capture_warmup_steps(args)
             class Call(torch.nn.Module):
                 def __init__(self, owner, call):
                     super().__init__()
@@ -145,7 +162,7 @@ class Case:
             target = Call(self.model, self.call)
             with self.context():
                 self.captured = deepopt.CUDAGraphCore(self.x.device).capture_model(
-                    target, (self.x,), warmup=max(3, args.warmup), autograd=True)
+                    target, (self.x,), warmup=self.capture_warmup_steps, autograd=True)
             self.call = target
 
     def clear(self):
@@ -153,13 +170,14 @@ class Case:
         self.x.grad = None
 
     def step(self):
-        self.clear()
-        with self.context():
-            output = self.call(self.x)
-            output.backward(self.grad)
-        if self.optimizer is not None:
-            self.optimizer.step()
-        return output
+        with self.selection.scope():
+            self.clear()
+            with self.context():
+                output = self.call(self.x)
+                output.backward(self.grad)
+            if self.optimizer is not None:
+                self.optimizer.step()
+            return output
 
     def close(self):
         if self.captured is not None:
@@ -167,23 +185,35 @@ class Case:
 
 
 def measure(case, args):
+    from deepopt._benchmarking import plan_timing, share_timing_counts
     torch = case.torch
-    for _ in range(args.warmup):
+    measurement_began = perf_counter()
+    plan = plan_timing(case.step, args, synchronize=lambda: torch.cuda.synchronize(args.device))
+    if args.optimizer_step:
+        previous = getattr(args, "_optimizer_timing_plan", None)
+        if previous is None:
+            args._optimizer_timing_plan = plan
+        else:
+            plan = share_timing_counts(plan, previous)
+    for _ in range(plan.warmup):
         case.step()
     torch.cuda.synchronize(args.device)
     wall, events = [], []
-    for _ in range(args.repeats):
+    for _ in range(plan.repeats):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize(args.device)
         began = perf_counter()
         start.record()
-        for _ in range(args.iterations):
+        for _ in range(plan.iterations):
             case.step()
         end.record()
         end.synchronize()
-        wall.append((perf_counter() - began) * 1000 / args.iterations)
-        events.append(start.elapsed_time(end) / args.iterations)
+        wall.append((perf_counter() - began) * 1000 / plan.iterations)
+        events.append(start.elapsed_time(end) / plan.iterations)
+
+    sampling = plan.sampling(perf_counter() - measurement_began)
+    sampling["shared_optimizer_update_counts"] = bool(args.optimizer_step)
 
     case.clear()
     torch.cuda.synchronize(args.device)
@@ -227,11 +257,13 @@ def measure(case, args):
             row["launches"] += 1
             row["cuda_us"] += event.device_time_total
         profile_summary = {"trace": str(trace), "kernel_launches": len(kernels), "phases": phases,
-                           "note": "Spatial phase buckets identify Triton kernel names; GEMM, native kernels, bias, casts and packing remain in preparation_or_other. Kernel durations exclude CPU submission gaps."}
+                           "note": "Spatial phase buckets recognize existing Triton signatures; TileLang and unmatched kernels, GEMM, bias, casts and packing remain in preparation_or_other. Use the trace for actual kernel attribution. Kernel durations exclude CPU submission gaps."}
     return {
         "path": case.path, "activation_compression": case.compressed,
         "cuda_graph": case.captured is not None, "optimizer_step": case.optimizer is not None,
+        "capture_warmup_steps": getattr(case, "capture_warmup_steps", None),
         "profile": profile_summary,
+        "sampling": sampling,
         "execution": getattr(case.model, "execution_info", None),
         "wall_ms_median": median(wall), "wall_ms_repeats": wall,
         "cuda_stream_ms_median": median(events), "cuda_stream_ms_repeats": events,
@@ -281,6 +313,18 @@ def main():
     except ValueError as error:
         arguments.error(str(error))
 
+    from deepopt._benchmarking import BenchmarkBackend, timing_plan_from_cost
+    try:
+        selection = BenchmarkBackend.from_args(args)
+        timing_plan_from_cost(args, 0.0)
+    except (TypeError, ValueError) as error:
+        arguments.error(str(error))
+    with selection.scope():
+        return run(args, arguments, selection)
+
+
+def run(args, arguments, selection):
+
     import deepopt
     import torch
 
@@ -291,11 +335,11 @@ def main():
         raise SystemExit("This benchmark requires CUDA; no CPU performance results are produced.")
     torch.cuda.set_device(device)
     if "fp8" in args.paths and (torch.version.hip is not None or torch.cuda.get_device_capability(device)[0] < 9):
-        raise SystemExit("Triton FP8 requires an NVIDIA GPU with compute capability >= 9.")
+        raise SystemExit("DeepOpt FP8 requires an NVIDIA GPU with compute capability >= 9.")
     results = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "deepopt": {"version": version("deep-optimization"), "path": str(Path(deepopt.__file__).resolve())},
-        "torch": torch.__version__, "gpu": torch.cuda.get_device_name(device),
+        "torch": torch.__version__, "gpu": torch.cuda.get_device_name(device), "kernel_backend": selection.metadata(device),
         "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "notes": [
             "Step includes gradient clearing, quantization, packing, decode and layout handling; optional SGD is outside model capture.",
@@ -315,7 +359,7 @@ def main():
     for path in args.paths:
         off_snapshots, off_result = None, None
         for compressed in (False, True):
-            case = Case(args, path, compressed)
+            case = Case(args, path, compressed, selection=selection)
             try:
                 row, snapshots = measure(case, args)
             finally:

@@ -27,8 +27,10 @@ class _NormalizationAdapter:
         if (training is not None and training["scaling_recipe"] == "delayed" and self.fp8_scaling is None
                 and any(value is not None for outputs in self._precision_outputs.values() for value in outputs)):
             from ...scaling.delayed import DelayedScalingState
+            from deepopt.kernel_policy import plan_kernel_policy
 
-            self.fp8_scaling = DelayedScalingState(training["delayed_scaling"], training["fp8_dtypes"], device=device)
+            self.fp8_scaling = DelayedScalingState(training["delayed_scaling"], training["fp8_dtypes"], device=device,
+                                                   autotune=training["autotune"], kernel_policy=plan_kernel_policy(self.plan))
 
     def _output(self, x):
         from ...precision.planner import normalization_output
@@ -106,9 +108,12 @@ class DOFunctionalNormalization(nn.Module):
         from ...precision.planner import normalization_output
 
         function = {"batch": do_batch_norm, "group": do_group_norm, "layer": do_layer_norm}[self.kind]
+        # Functional BatchNorm/GroupNorm use the same execution recorder as
+        # module adapters; absence of records must not imply native fallback.
+        self.last_execution = {}
+        kwargs = {"_execution_info": self.last_execution, **kwargs}
         if self.kind == "layer":
-            self.last_execution = {}
-            kwargs = {"_execution_info": self.last_execution, **kwargs, "_planned": True}
+            kwargs = {**kwargs, "_planned": True}
         return function(*args, **kwargs, plan=self.plan, _output_layout=normalization_output(self),
                         _scaling_state=self.fp8_scaling, _state_training=self.training)
 

@@ -39,8 +39,10 @@ def _main(argv: list[str] | None = None) -> int:
     train_parser.add_argument("--checkpoint-every-steps", type=int,
                               help="Save last_step.pt every N optimizer updates; 0 disables (default)")
     train_parser.add_argument("--no-progress", action="store_true", help="Disable progress bars on stderr")
+    train_parser.add_argument("--progress-bar-every-steps", type=int, default=1,
+                              help="Refresh live progress metrics every N optimizer updates (default: 1)")
     train_parser.add_argument("--execution-mode", choices=("max_speed", "balanced", "analyze"),
-                              help="Override diagnostics without changing the training algorithm")
+                              help="Override the execution preset without changing the training algorithm")
     evaluate_parser = commands.add_parser("evaluate", help="Evaluate a saved checkpoint")
     evaluate_parser.add_argument("--checkpoint", type=Path, required=True)
     evaluate_parser.add_argument("--device", help="Optional device override; uses fp32")
@@ -60,6 +62,7 @@ def _main(argv: list[str] | None = None) -> int:
                   batch_size=args.batch_size, batch_size_mode=args.batch_size_mode,
                   checkpoint_every_steps=args.checkpoint_every_steps,
                   progress_bar=not args.no_progress,
+                  progress_bar_every_steps=args.progress_bar_every_steps,
                   **({"execution_mode": args.execution_mode} if args.execution_mode is not None else {}))
         elif args.command == "evaluate":
             from .run import evaluate

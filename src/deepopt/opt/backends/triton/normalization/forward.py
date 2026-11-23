@@ -4,6 +4,8 @@ import triton
 import triton.language as tl
 
 from .common import _coordinates, _load_input
+from .activation import _activate
+from ..activation.math import _evaluate
 from .recenter import _record_error
 from ..quantization.activation.affine import _affine_quantize_pack, _affine_quantize_pack_with_metadata
 
@@ -15,7 +17,12 @@ def _apply(x, scales, weight, bias, mean, inverse, output, packed, step, minimum
            BITS: tl.constexpr, PACK: tl.constexpr, PARTIAL: tl.constexpr, ENCODE: tl.constexpr,
            PARTS: tl.constexpr, HAS_WEIGHT: tl.constexpr, HAS_BIAS: tl.constexpr,
            META: tl.constexpr, OUT_STRIDES: tl.constexpr, BLOCK: tl.constexpr,
-           center_shift=None, errors=None, DOMAINS: tl.constexpr = 1, RECENTER: tl.constexpr = False):
+           center_shift=None, errors=None, DOMAINS: tl.constexpr = 1, RECENTER: tl.constexpr = False,
+           preactivation=None, ACTIVATION: tl.constexpr = "", APPROXIMATE: tl.constexpr = "none",
+           SAVE_PREACTIVATION: tl.constexpr = False,
+           activation_saved=None, activation_step=None, activation_minimum=None,
+           SAVE_ACTIVATION_COEFFICIENT: tl.constexpr = False,
+           activation_errors=None, CHECK_ACTIVATION_COEFFICIENT: tl.constexpr = False):
     group, part = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     domain, local_group = group // GROUPS, group % GROUPS
     offsets = part * BLOCK + tl.arange(0, BLOCK)
@@ -33,6 +40,22 @@ def _apply(x, scales, weight, bias, mean, inverse, output, packed, step, minimum
         address = n * OUT_STRIDES[0] + c * OUT_STRIDES[1]
         for axis in tl.static_range(len(META[2])):
             address += s // META[3][axis] % META[2][axis] * OUT_STRIDES[axis + 2]
+        if SAVE_ACTIVATION_COEFFICIENT:
+            # This qualified route has aligned flat1024 activation groups and
+            # GroupNorm domains. Keep the standalone BF16 input boundary and
+            # the shared activation expression, without storing that input.
+            rounded = y.to(output.dtype.element_ty).to(tl.float32)
+            y, coefficient = _evaluate(rounded, ACTIVATION, APPROXIMATE)
+            a_words, a_step, a_minimum = _affine_quantize_pack(coefficient, valid, BITS, BLOCK)
+            a_offsets = tl.arange(0, BLOCK // (32 // BITS))
+            tl.store(activation_saved + group * WORDS + a_offsets, a_words, a_offsets < WORDS)
+            tl.store(activation_step + group, a_step)
+            tl.store(activation_minimum + group, a_minimum)
+            if CHECK_ACTIVATION_COEFFICIENT:
+                tl.store(activation_errors + group,
+                         tl.max((valid & ~(tl.abs(coefficient) < float("inf"))).to(tl.int32), 0))
+        else:
+            y = _activate(y, output, preactivation, address, valid, ACTIVATION, APPROXIMATE, SAVE_PREACTIVATION)
         tl.store(output + address, y, valid)
     if PACK:
         if PARTIAL:

@@ -7,7 +7,7 @@ from ...native.convolution_transpose import native_convolution, native_backward,
 
 
 @torch.no_grad()
-def forward(qx, qw, geometry, *, bias=None, out_dtype=torch.float32, num_stages="auto", output=None):
+def forward(qx, qw, geometry, *, bias=None, out_dtype=torch.float32, num_stages="auto", output=None, autotune=True):
     with torch.autocast(qx.data.device.type, enabled=False):
         x = restore_matrix(qx.dequantize(), geometry.input_shape)
         w = qw.dequantize().reshape(geometry.weight_shape)
@@ -16,7 +16,7 @@ def forward(qx, qw, geometry, *, bias=None, out_dtype=torch.float32, num_stages=
 
 
 @torch.no_grad()
-def input_gradient(qg, qw, geometry, *, out_dtype=torch.float32, num_stages="auto", gradient_output=None):
+def input_gradient(qg, qw, geometry, *, out_dtype=torch.float32, num_stages="auto", gradient_output=None, autotune=True):
     with torch.autocast(qg.data.device.type, enabled=False):
         grad = restore_matrix(qg.dequantize(), geometry.output_shape)
         w = qw.dequantize().reshape(geometry.weight_shape)
@@ -26,7 +26,7 @@ def input_gradient(qg, qw, geometry, *, out_dtype=torch.float32, num_stages="aut
 
 
 @torch.no_grad()
-def weight_gradient(qx, qg, geometry, *, out_dtype=torch.float32, num_stages="auto"):
+def weight_gradient(qx, qg, geometry, *, out_dtype=torch.float32, num_stages="auto", autotune=True):
     with torch.autocast(qx.data.device.type, enabled=False):
         x = restore_matrix(qx.dequantize(), geometry.input_shape)
         grad = restore_matrix(qg.dequantize(), geometry.output_shape)

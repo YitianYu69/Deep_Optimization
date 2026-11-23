@@ -9,9 +9,37 @@ on:
 permissions:
   contents: read
 jobs:
-  cpu:
+  kernel-isolation:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'torch>=2.4,<3' --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pip install '.[dev]'
+      - name: Require optional GPU compilers to be absent
+        run: python -c 'import importlib.util; assert importlib.util.find_spec("triton") is None; assert importlib.util.find_spec("tilelang") is None'
+      - name: Exercise explicit policies without optional compilers
+        run: >-
+          python -m unittest
+          tests.opt.test_kernel_policy
+          tests.opt.test_kernel_backend_integration
+          tests.opt.test_tilelang_primitives
+          tests.opt.test_tilelang_operations
+          tests.compiler.test_kernel_backends
+          tests.onboarding.test_public_imports -v
+  cpu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event_name == 'pull_request' && matrix.suite != 'core' && 12 || 45 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [compiler, benchmarks, core]
+    env:
+      DEEPOPT_REQUIRE_MODEL_TESTS: '1'
+      OMP_NUM_THREADS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,6 +53,7 @@ jobs:
       - name: Install Triton for GPU-free kernel API checks
         run: python -m pip install 'triton>=3.3,<4'
       - name: Check deferred Triton language API references
+        if: matrix.suite == 'core'
         run: python -m unittest tests.opt.test_triton_language_api -v
       - run: python -m pip check
       - name: Verify torchvision native CPU operators
@@ -39,21 +68,67 @@ jobs:
           scores = torch.tensor([0.9, 0.8])
           assert torchvision.ops.nms(boxes, scores, 0.5).tolist() == [0]
           PY
-      - run: python -m ruff check src tests examples benchmarks scripts
-      - run: python scripts/sync_configs.py --check
-      - run: python -m mypy --strict --follow-imports=skip --ignore-missing-imports src/deepopt/engine/execution/policy.py
-      - name: Fast CPU white-box and black-box tests
-        env:
-          DEEPOPT_REQUIRE_MODEL_TESTS: '1'
+      - name: Check source and packaged configs
+        if: matrix.suite == 'core'
         run: |
-          for group in opt benchmarks cuda execution optimization training metrics memory observability application onboarding scheduling; do
-            python -m unittest discover -s tests/$group -v
+          python -m ruff check src tests examples benchmarks scripts
+          python scripts/sync_configs.py --check
+          python -m mypy --strict --follow-imports=skip --ignore-missing-imports src/deepopt/engine/execution/policy.py
+      - name: Compiler smoke tests
+        if: matrix.suite == 'compiler' && github.event_name == 'pull_request'
+        run: >-
+          python -m unittest -v
+          tests.compiler.test_backend
+          tests.compiler.test_bf16_storage_native
+          tests.compiler.test_native_autodiff
+          tests.compiler.test_native_semantic_contracts
+          tests.compiler.test_saved_activation_contracts
+          tests.compiler.test_packed_offload_lifecycle
+          tests.compiler.test_packed_offload_plan
+          tests.compiler.test_compiled_packed_offload.CompiledPrecisionFacadeCPUTests.test_same_policy_reprepare_preserves_numerical_body_and_native_backward
+          tests.compiler.test_native_vae.NativeVAETests.test_swiglu_training_then_no_grad_validation
+      - name: Full compiler suite
+        if: matrix.suite == 'compiler' && github.event_name != 'pull_request'
+        run: python -m unittest discover -s tests/compiler -v
+      - name: Benchmark smoke tests
+        if: matrix.suite == 'benchmarks' && github.event_name == 'pull_request'
+        run: >-
+          PYTHONPATH="$PWD/benchmarks" python -m unittest -v
+          tests.benchmarks.test_benchmark_exports
+          tests.benchmarks.test_compiler_benchmark
+          tests.benchmarks.test_inductor_reference_runner
+          tests.benchmarks.test_inductor_reference_store
+          tests.benchmarks.test_numerical_ipc
+          tests.benchmarks.test_packed_offload_bundle
+          tests.benchmarks.test_qualification_bundle_export
+          tests.benchmarks.test_vae_diagnostics
+          tests.benchmarks.test_vae_packed_offload_benchmark.PackedOffloadInstalledCPUTests.test_real_resident_native_cpu_envelope_forward_backward_update_and_cleanup
+      - name: Full benchmark suite
+        if: matrix.suite == 'benchmarks' && github.event_name != 'pull_request'
+        run: PYTHONPATH="$PWD/benchmarks" python -m unittest discover -s tests/benchmarks -t . -v
+      - name: Core CPU tests
+        if: matrix.suite == 'core'
+        run: |
+          for group in opt cuda execution optimization training metrics memory observability application onboarding scheduling; do
+            python -m unittest discover -s "tests/$group" -v
           done
-      - run: python -m build
+      - if: matrix.suite == 'core'
+        run: python -m build
       - uses: actions/upload-artifact@v4
+        if: matrix.suite == 'core'
         with:
           name: packages
           path: dist/*
+  cpu:
+    if: ${{ always() }}
+    needs: cpu-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all CPU suites to pass
+        env:
+          CPU_TEST_RESULT: ${{ needs.cpu-tests.result }}
+        run: test "$CPU_TEST_RESULT" = success
   multiprocessing:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -75,7 +150,8 @@ jobs:
           python-version: '3.11'
       - name: Install matching CPU PyTorch and torchvision wheels
         run: python -m pip install 'torch>=2.4,<3' 'torchvision>=0.19,<1' --index-url https://download.pytorch.org/whl/cpu
-      - run: python -m pip install -e '.[workers]'
+      # Compiler qualification checks the installed package in the parent and ranks.
+      - run: python -m pip install '.[workers]'
       - run: python -m pip check
       - name: Worker, checkpoint and real two/four-rank Gloo tests
         run: |
@@ -108,11 +184,12 @@ jobs:
       DEEPOPT_REQUIRE_CUDA_FP8: '1'
     steps:
       - uses: actions/checkout@v4
-      - run: python -m pip install -e '.[workers,model-tests]'
+      - run: python -m pip install '.[workers,model-tests]'
       - name: Require two FP8-capable GPUs and the Triton descriptor API
         run: |
           python -c 'import torch; from triton.tools.tensor_descriptor import TensorDescriptor; assert torch.cuda.device_count() >= 2; assert all(torch.cuda.get_device_capability(i)[0] >= 9 for i in range(2)); assert torch.cuda.is_bf16_supported(); assert torch.distributed.is_nccl_available()'
       - run: python -m unittest discover -s tests/opt -v
+      - run: python -m unittest discover -s tests/compiler -v
       - run: python -m unittest discover -s tests/execution -v
       - run: python -m unittest discover -s tests/cuda -v
       - run: python -m unittest discover -s tests/distributed -v
@@ -121,3 +198,26 @@ jobs:
         with:
           name: cuda-benchmark
           path: benchmark-cuda.json
+  tilelang:
+    if: vars.DEEPOPT_GPU_CI == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 60
+    env:
+      OMP_NUM_THREADS: '1'
+      DEEPOPT_REQUIRE_TILELANG: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install -e '.[tilelang,dev,model-tests]'
+      - run: python -m pip check
+      - name: Require real NVIDIA FP8 execution
+        run: python -c 'import torch, tilelang; assert torch.cuda.is_available(); assert torch.version.hip is None; assert torch.cuda.get_device_capability() >= (9, 0)'
+      - name: Validate routing, kernels, training and compiler execution
+        run: >-
+          python -m unittest
+          tests.opt.test_kernel_policy
+          tests.opt.test_kernel_backend_integration
+          tests.opt.test_tilelang_primitives
+          tests.opt.test_tilelang_primitives_ir
+          tests.opt.test_tilelang_operations
+          tests.compiler.test_kernel_backends
+          tests.cuda.test_tilelang_backend -v

@@ -55,7 +55,8 @@ def pack_indices(indices, value_count):
     if fake or not indices.numel() or not result.bits:
         return result
     if indices.device.type == "cuda":
-        from ..backends.triton.quantization.activation.indices import pack
+        from deepopt.opt.backends.dispatch import backend_module
+        pack = backend_module('activation_codec', 'quantization.activation.indices').pack
 
         with torch.cuda.device(indices.device):
             pack(indices, result)
@@ -85,7 +86,8 @@ def unpack_indices(packed):
     if not bits:
         return result.zero_()
     if result.device.type == "cuda":
-        from ..backends.triton.quantization.activation.indices import unpack
+        from deepopt.opt.backends.dispatch import backend_module
+        unpack = backend_module('activation_codec', 'quantization.activation.indices').unpack
 
         with torch.cuda.device(result.device):
             unpack(packed, result)

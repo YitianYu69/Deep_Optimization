@@ -1,5 +1,7 @@
 """Native linear autograd with optional packed affine saved activation storage."""
 
+from deepopt.kernel_policy import kernel_forward, kernel_backward
+
 from contextlib import nullcontext
 
 import torch
@@ -7,11 +9,16 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
 from ...quantization.activation import PackedActivation, quantize_pack_activation, dequantize_unpack_activation
+from ._output import restore_fresh_output
 
 
 class _NativeLinearFunction(Function):
     @staticmethod
-    def forward(ctx, x, weight, bias, group_size, backward_enabled, bits=2):
+    @kernel_forward
+    def forward(ctx, x, weight, bias, group_size, backward_enabled, bits=2, bf16_policy=None):
+        from deepopt._bf16_policy import resolve_bf16_policy
+
+        ctx.bf16_policy = resolve_bf16_policy(bf16_policy)
         # The functional entry point suspends DeepOpt dispatch before calling
         # this native operator, while retaining PyTorch's autocast policy.
         output = torch._C._nn.linear(x, weight, bias)
@@ -33,10 +40,11 @@ class _NativeLinearFunction(Function):
         ctx.compute_dtype, ctx.group_size = output.dtype, group_size
         ctx.compression_bits = bits
         ctx.device_type = x.device.type
-        return output
+        return restore_fresh_output(output, lambda values: values)
 
     @staticmethod
     @once_differentiable
+    @kernel_backward
     def backward(ctx, grad_output):
         data, step, minimum, weight = ctx.saved_tensors
         need_dx, need_dw, need_db = ctx.needs_input_grad[:3]
@@ -57,4 +65,4 @@ class _NativeLinearFunction(Function):
                 # Native AMP computes the bias gradient in the projection's
                 # dtype before promoting it to an FP32 master parameter.
                 db = grad.sum(dim=0).to(ctx.bias_dtype)
-        return (dx, dw, db, None, None, None)[:len(ctx.needs_input_grad)]
+        return (dx, dw, db, None, None, None, None)[:len(ctx.needs_input_grad)]

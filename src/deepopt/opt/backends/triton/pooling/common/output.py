@@ -50,6 +50,6 @@ def _cast(input, output, scales, inverse, observations, snapshot, errors,
            OBSERVE: tl.constexpr, SNAPSHOT: tl.constexpr, CHECK: tl.constexpr, MAXIMUM: tl.constexpr, BLOCK: tl.constexpr):
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     valid = index < ROWS * COLS
-    value = tl.load(input + index, valid, other=0).to(tl.float32)
+    value = tl.load(input + index, valid, other=0.0).to(tl.float32)
     _store_value(value, output, scales, inverse, observations, snapshot, errors, index, valid,
                  ROWS, COLS, BR, BC, True, False, OBSERVE, SNAPSHOT, CHECK, MAXIMUM, BLOCK)

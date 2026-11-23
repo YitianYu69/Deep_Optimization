@@ -2,6 +2,7 @@
 
 import importlib.util
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.nn import functional as F
@@ -21,6 +22,18 @@ _CUDA_REASON = (
 
 @unittest.skipIf(_CUDA_REASON, _CUDA_REASON)
 class AttentionCompressionCUDATests(unittest.TestCase):
+    def test_strided_qkv_packing_does_not_materialize_a_matrix(self):
+        from deepopt.opt.quantization.activation import _quantize_pack_strided_activation, quantize_pack_activation
+
+        source = torch.randn(2, 197, 3, 64, device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3)
+        for bits in (1, 2, 4, 8):
+            expected = quantize_pack_activation(source.reshape(-1, 64), 1024, bits=bits)
+            with patch.object(torch.Tensor, "reshape", side_effect=AssertionError("materializing reshape")):
+                actual = _quantize_pack_strided_activation(source, 1024, bits=bits)
+            for a, b in zip((actual.data, actual.step, actual.minimum),
+                            (expected.data, expected.step, expected.minimum)):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+
     def setUp(self):
         torch.manual_seed(372)
 

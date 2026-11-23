@@ -89,10 +89,13 @@ within an epoch. CPU auto without a budget logs a skip; supply
 | Route metrics with different signatures | [metric_routing.py](metrics/metric_routing.py): `python examples/metrics/metric_routing.py` | A custom `Metric`, nested scalar names, prediction mean, and monitoring `quality/absolute/mean` |
 | Observe progress and stop gracefully | [callbacks.py](observability/callbacks.py): `python examples/observability/callbacks.py` | Update/epoch callbacks, stop after epoch two, then continue the same trainer to epoch three |
 
-These recipes create no checkpoint directories. `fit()` displays an epoch bar
-on stderr unless the recipe passes `progress_bar=False`. Callback output belongs
+These recipes create no checkpoint directories. `fit()` displays optimizer steps
+within each epoch on stderr unless the recipe passes `progress_bar=False`.
+Use `progress_bar="epoch"` for a completed-epoch bar. Callback output belongs
 to the recipe; some examples print JSON, while others print ordinary Python
-dictionaries or concise summaries.
+dictionaries or concise summaries. `progress_bar_every_steps=N` controls the
+step bar's reporting cadence; each report includes running loss and all training
+metrics, with validation metrics added after evaluation.
 
 ## Console and configuration-named log files
 
@@ -230,6 +233,47 @@ total target. Optional checkpoint operations run on every rank while the callbac
 coordinates shared writes. Use a fresh output directory for the first saved run.
 
 ## Configured custom recipes
+
+For the supplied ImageNet MBConv VAE, see [the VAE recipe](vae/README.md),
+[training entry point](vae/train_vae.py), [model](vae/mbconv_vae.py),
+[configuration](vae/imagenet.toml), and [four-GPU launcher](vae/run_VAE.sh).
+It calls `Trainer.fit()` directly, preserves the L1-plus-KL objective, and reports
+PSNR, SSIM, and LPIPS. Its configuration controls DDP, BF16, EMA, activation
+compression, beta warmup, and resumable step checkpoints.
+The [custom-project version](vae/train_vae_custom.py) updates the supplied script
+while retaining its `source.models.mbconv_vae_v2` and `source.training.geo_optimizer`
+imports and `SGD_NS_Overshoot` optimizer. It requires that external project and
+adds the same per-update logs; see [progress reporting](vae/README.md#progress-during-a-long-epoch).
+
+The [VAE recipe](vae/README.md) also owns the measurement and diagnostic entry
+points below. They target an installed candidate and write their evidence under
+an explicit output directory; none is part of the base test suite.
+
+| Script | Purpose |
+| --- | --- |
+| [benchmark_vae.py](vae/benchmark_vae.py) | Compare eager/compiled PyTorch BF16 with maximum-speed DeepOpt BF16 training |
+| [benchmark_execution.py](vae/benchmark_execution.py) | Compare installed eager and native compiled VAE training execution |
+| [benchmark_optimization.py](vae/benchmark_optimization.py) | Run pinned native compiler controls in fresh worker processes |
+| [benchmark_parity.py](vae/benchmark_parity.py) | Fresh-process matched VAE AMP comparison across Torch and DeepOpt compilers |
+| [benchmark_packed_offload.py](vae/benchmark_packed_offload.py) | Compare resident, demand and predictive packed saves on one pinned candidate |
+| [benchmark_packed_offload_frontier.py](vae/benchmark_packed_offload_frontier.py) | Run immutable physical-capacity points on one installed candidate |
+| [parity_execution.py](vae/parity_execution.py) | Execute one matched VAE compiler-parity route and retain code/metadata only |
+| [native_execution.py](vae/native_execution.py) | Execute one installed eager or native compiled VAE without a numerical oracle |
+| [memory_comparison.py](vae/memory_comparison.py) | Validate memory-isolation receipts without importing Torch in supervisors |
+| [packed_peak_profile.py](vae/packed_peak_profile.py) | Convert hashed resident CUDA diagnostics into an explicit target peak profile |
+| [diagnostics.py](vae/diagnostics.py) | Run untimed, installed-only diagnostics for the existing VAE benchmark |
+| [diagnostic_localization.py](vae/diagnostic_localization.py) | Bound numerical localization for VAE diagnostics outside timed updates |
+| [diagnostic_operators.py](vae/diagnostic_operators.py) | Checkpoint-free replay of packed multiplication eager/native contracts |
+| [diagnostic_repeatability.py](vae/diagnostic_repeatability.py) | Metadata-only fixed-cotangent probes for the final encoder BlurPool VJP |
+| [diagnostic_reporting.py](vae/diagnostic_reporting.py) | Write small parent receipts with complete diagnostic evidence in separate files |
+| [execution_inventory.py](vae/execution_inventory.py) | Export a compact immutable compiled offload inventory without numerical payloads |
+| [execution_memory.py](vae/execution_memory.py) | Collect staged allocator metadata outside the VAE worker's measured updates |
+| [execution_profile.py](vae/execution_profile.py) | Run separate cold or post-measurement diagnostics, never a timing benchmark |
+| [execution_storage.py](vae/execution_storage.py) | Bound weak physical-storage attribution for diagnostic executions only |
+| [audit_activation_memory.py](vae/audit_activation_memory.py) | Allocation-free MBConv VAE saved-state and visible-tensor metadata audit |
+| [mbconv_vae_v2_torch.py](vae/mbconv_vae_v2_torch.py) | Plain PyTorch copy of the model for standalone Inductor capture |
+| [qualification.py](vae/qualification.py) | Checkpoint-free VAE trajectory oracle that persists no tensor |
+| [test_inductor_vae_v2.py](vae/test_inductor_vae_v2.py) | Compile VAE V2 at a target shape and save generated code beside the script |
 
 Start with the [global configuration example](configured/global_config.py) to
 see precedence and snapshot lifetime without creating run artifacts:

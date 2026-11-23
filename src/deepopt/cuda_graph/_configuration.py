@@ -21,6 +21,6 @@ def _capture_settings(config=None, *, base=_UNSET, device=_UNSET, warmup=_UNSET,
     else:
         runtime_device = runtime.get("device")
         selected_device = runtime_device if isinstance(runtime_device, str) and runtime_device.startswith("cuda") else None
-    options = {"device": selected_device, "warmup": 3, "allow_unused_input": False,
+    options = {"enabled": True, "device": selected_device, "warmup": 3, "allow_unused_input": False,
                "autograd": True, "capture_error_mode": "global", **configured}
     return snapshot, options

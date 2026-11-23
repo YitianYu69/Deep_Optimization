@@ -49,7 +49,8 @@ def pack_boolean_mask(mask: torch.Tensor) -> PackedBooleanMask:
     if isinstance(mask, FakeTensor) or mask.device.type == "meta" or words == 0:
         data = torch.empty((words,), dtype=torch.int32, device=mask.device)
     elif mask.device.type == "cuda":
-        from deepopt.opt.backends.triton.quantization.activation.boolean import pack_boolean_mask as backend_pack
+        from deepopt.opt.backends.dispatch import backend_module
+        backend_pack = backend_module('activation_codec', 'quantization.activation.boolean').pack_boolean_mask
 
         data = backend_pack(mask)
     else:
@@ -70,7 +71,8 @@ def unpack_boolean_mask(packed: PackedBooleanMask) -> torch.Tensor:
     if isinstance(data, FakeTensor) or data.device.type == "meta" or data.numel() == 0:
         return torch.empty(shape, dtype=torch.bool, device=data.device)
     if data.device.type == "cuda":
-        from deepopt.opt.backends.triton.quantization.activation.boolean import unpack_boolean_mask as backend_unpack
+        from deepopt.opt.backends.dispatch import backend_module
+        backend_unpack = backend_module('activation_codec', 'quantization.activation.boolean').unpack_boolean_mask
 
         return backend_unpack(data, shape)
     shifts = torch.arange(32, dtype=torch.int64, device=data.device)

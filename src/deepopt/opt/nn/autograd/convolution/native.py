@@ -1,5 +1,7 @@
 """Native convolutions with independently compressed saved source values."""
 
+from deepopt.kernel_policy import kernel_forward, kernel_backward
+
 from contextlib import nullcontext
 
 import torch
@@ -8,12 +10,14 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
 from ....backends.native.convolution import (
-    native_backward,
+    native_input_bias_gradients,
     native_convolution,
     native_weight_gradient,
 )
-from ....quantization.activation import PackedActivation, quantize_pack_activation, dequantize_unpack_activation
-from ...convolution import restore_matrix, source_matrix
+from ....quantization.activation import (PackedActivation, _quantize_pack_strided_activation,
+    _dequantize_unpack_spatial_activation,quantize_pack_activation,dequantize_unpack_activation)
+from ....backends._shared.activation_codec import convolution_codec
+from ...convolution import source_matrix,restore_matrix
 from ...convolution.geometry import _contiguous, zero_synthetic_padding
 
 
@@ -25,6 +29,7 @@ def _memory_format(x):
 
 class _NativeConvolutionFunction(Function):
     @staticmethod
+    @kernel_forward
     def forward(ctx, x, weight, bias, geometry, compression):
         # Native CPU depthwise convolution has an inference-only Winograd path.
         # Keep training algorithm selection while preventing an inner autograd
@@ -38,12 +43,14 @@ class _NativeConvolutionFunction(Function):
         with amp, torch.enable_grad(), torch._C._AutoDispatchBelowAutograd():
             output = native_convolution(x, weight, bias, geometry)
         need_dx, need_dw = ctx.needs_input_grad[:2]
+        ctx.codec=convolution_codec()
         packed = None
         if need_dw and x.numel():
             # Compress the source values that native AMP actually consumed;
             # retain each input position once, without an unfolded workspace.
-            packed = quantize_pack_activation(source_matrix(x).to(output.dtype),
-                                     compression["group_size"], bits=compression["bits"])
+            packed=(quantize_pack_activation(source_matrix(x).to(output.dtype),compression["group_size"],bits=compression["bits"])
+                    if ctx.codec=="materialized" else _quantize_pack_strided_activation(x.movedim(1,-1),
+                        compression["group_size"],bits=compression["bits"],source_dtype=output.dtype))
         ctx.save_for_backward(
             packed.data if packed is not None else None,
             packed.step if packed is not None else None,
@@ -60,6 +67,7 @@ class _NativeConvolutionFunction(Function):
 
     @staticmethod
     @once_differentiable
+    @kernel_backward
     def backward(ctx, grad_output):
         data, step, minimum, weight = ctx.saved_tensors
         need_dx, need_dw, need_db = ctx.needs_input_grad[:3]
@@ -70,18 +78,11 @@ class _NativeConvolutionFunction(Function):
         with disabled_autocast:
             grad = grad_output.to(ctx.compute_dtype)
             if need_dx or need_db:
-                # Forward layout controls native backward kernel selection.
-                # The values of this temporary are never read by dX or db.
-                dummy_input = torch.empty(geometry.input_shape, dtype=ctx.compute_dtype,
-                                          device=grad.device, memory_format=ctx.input_memory_format)
-                gradient_weight = (weight.to(ctx.compute_dtype) if need_dx else
-                                   torch.empty(geometry.weight_shape, dtype=ctx.compute_dtype,
-                                               device=grad.device, memory_format=ctx.weight_memory_format))
-                dx, _, db = native_backward(
-                    grad, dummy_input, gradient_weight, geometry, (need_dx, False, need_db),
-                    bias_sizes=(geometry.out_channels,) if need_db else None,
+                dx, _, db = native_input_bias_gradients(
+                    grad, weight.to(ctx.compute_dtype) if need_dx else None, geometry,
+                    (need_dx, False, need_db), input_memory_format=ctx.input_memory_format,
+                    weight_memory_format=ctx.weight_memory_format,
                 )
-                del dummy_input, gradient_weight
                 if need_dx:
                     dx = _contiguous(dx.to(ctx.input_dtype), ctx.input_memory_format)
                 if need_db:
@@ -92,8 +93,10 @@ class _NativeConvolutionFunction(Function):
                 else:
                     packed = PackedActivation(data, step, minimum, geometry.input_matrix_shape,
                                               ctx.group_size, bits=ctx.bits)
-                    activation = restore_matrix(dequantize_unpack_activation(packed, dtype=ctx.compute_dtype),
-                                                geometry.input_shape, ctx.input_memory_format)
+                    activation=(restore_matrix(dequantize_unpack_activation(packed,dtype=ctx.compute_dtype),
+                                    geometry.input_shape,ctx.input_memory_format) if ctx.codec=="materialized" else
+                                _dequantize_unpack_spatial_activation(packed, geometry.input_shape,
+                                    dtype=ctx.compute_dtype, memory_format=ctx.input_memory_format))
                     zero_synthetic_padding(activation, geometry)
                 dw = native_weight_gradient(activation, grad, geometry,
                                             weight_memory_format=ctx.weight_memory_format)

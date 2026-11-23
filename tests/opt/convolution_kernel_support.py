@@ -60,6 +60,8 @@ class KernelLanguage:
 
     @staticmethod
     def load(pointer, mask=True, other=0.0):
+        if pointer.storage.dtype in (torch.float8_e4m3fn,torch.float8_e5m2) and type(other) is int:
+            raise AssertionError("FP8 masked loads require a floating fill on the target Triton stack")
         indices, mask = torch.broadcast_tensors(torch.as_tensor(pointer.offset).long(), torch.as_tensor(mask))
         if ((indices[mask] < 0) | (indices[mask] >= pointer.storage.numel())).any():
             raise AssertionError("unmasked out-of-bounds kernel load")
@@ -102,7 +104,7 @@ def kernel_namespace():
                  "range": lambda *args: (torch.tensor(value, dtype=torch.int32)
                                          for value in range(*map(int, args)))}
     package = files("deepopt.opt.backends.triton.convolution")
-    for filename in ("common.py", "forward_impl.py", "backward.py", "weight_gradient_blockwise.py"):
+    for filename in ("common.py", "forward_impl.py", "backward.py", "weight_gradient_blockwise.py", "depthwise.py"):
         tree = ast.parse(package.joinpath(filename).read_text())
         functions = []
         for node in tree.body:

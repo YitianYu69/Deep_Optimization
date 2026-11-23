@@ -31,13 +31,21 @@ def _coordinates(offset, H: tl.constexpr, W: tl.constexpr):
 
 @triton.jit
 def _tile_coordinates(M: tl.constexpr, N: tl.constexpr,
-                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                      GROUP_M: tl.constexpr = 1):
     tiles_m = tl.cdiv(M, BLOCK_M)
     tiles_n = tl.cdiv(N, BLOCK_N)
     pid = tl.program_id(0)
     group = pid // (tiles_m * tiles_n)
     tile = pid % (tiles_m * tiles_n)
-    return group, tile // tiles_n, tile % tiles_n
+    if GROUP_M == 1:
+        return group, tile // tiles_n, tile % tiles_n
+    # Reuse a weight tile across nearby spatial tiles before advancing N.
+    # The final M group can be short; use its actual size when decoding IDs.
+    width = GROUP_M * tiles_n
+    first_m = (tile // width) * GROUP_M
+    group_size = tl.minimum(tiles_m - first_m, GROUP_M)
+    return group, first_m + tile % group_size, (tile % width) // group_size
 
 
 def validate(a, b, out_dtype):

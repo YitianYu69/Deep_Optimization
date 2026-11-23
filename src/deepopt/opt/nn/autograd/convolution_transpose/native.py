@@ -1,5 +1,7 @@
 """Native transposed convolutions with independently compressed saved source values."""
 
+from deepopt.kernel_policy import kernel_forward, kernel_backward
+
 from contextlib import nullcontext
 
 import torch
@@ -8,10 +10,10 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
 from ....backends.native.convolution_transpose import (
-    native_backward,
     native_convolution,
     native_weight_gradient,
 )
+from ....backends.native.convolution import native_input_bias_gradients
 from ....quantization.activation import PackedActivation, quantize_pack_activation, dequantize_unpack_activation
 from ...convolution import restore_matrix, source_matrix
 from ...convolution.geometry import _contiguous
@@ -25,6 +27,7 @@ def _memory_format(x):
 
 class _NativeConvTransposeFunction(Function):
     @staticmethod
+    @kernel_forward
     def forward(ctx, x, weight, bias, geometry, compression):
         # Preserve native training algorithm selection without an inner
         # autograd graph saving full activations or invoking saved-tensor hooks.
@@ -59,6 +62,7 @@ class _NativeConvTransposeFunction(Function):
 
     @staticmethod
     @once_differentiable
+    @kernel_backward
     def backward(ctx, grad_output):
         data, step, minimum, weight = ctx.saved_tensors
         need_dx, need_dw, need_db = ctx.needs_input_grad[:3]
@@ -69,18 +73,11 @@ class _NativeConvTransposeFunction(Function):
         with disabled_autocast:
             grad = grad_output.to(ctx.compute_dtype)
             if need_dx or need_db:
-                # Forward layout controls native backward kernel selection.
-                # The values of this temporary are never read by dX or db.
-                dummy_input = torch.empty(geometry.input_shape, dtype=ctx.compute_dtype,
-                                          device=grad.device, memory_format=ctx.input_memory_format)
-                gradient_weight = (weight.to(ctx.compute_dtype) if need_dx else
-                                   torch.empty(geometry.weight_shape, dtype=ctx.compute_dtype,
-                                               device=grad.device, memory_format=ctx.weight_memory_format))
-                dx, _, db = native_backward(
-                    grad, dummy_input, gradient_weight, geometry, (need_dx, False, need_db),
-                    bias_sizes=(geometry.out_channels,) if need_db else None,
+                dx, _, db = native_input_bias_gradients(
+                    grad, weight.to(ctx.compute_dtype) if need_dx else None, geometry,
+                    (need_dx, False, need_db), input_memory_format=ctx.input_memory_format,
+                    weight_memory_format=ctx.weight_memory_format, transposed=True,
                 )
-                del dummy_input, gradient_weight
                 if need_dx:
                     dx = _contiguous(dx.to(ctx.input_dtype), ctx.input_memory_format)
                 if need_db:

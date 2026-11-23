@@ -17,6 +17,20 @@ class ProcessMetadataWhiteBoxTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {}, clear=True))
         self.enterContext(patch.object(_process, "_owns_group", False))
 
+    def test_collective_error_boundary_tracks_thread_context_and_resets_on_failure(self):
+        self.assertFalse(_process.collective_error_boundary_active())
+        with patch.object(_process, "world_size", return_value=2), \
+                patch.object(_process, "reduce_number", side_effect=lambda value, operation: value), \
+                patch.object(_process.dist, "all_gather_object"):
+            with self.assertRaisesRegex(ValueError, "local failure"):
+                with _process.collective_errors("outer"):
+                    self.assertTrue(_process.collective_error_boundary_active())
+                    with _process.collective_errors("inner"):
+                        self.assertTrue(_process.collective_error_boundary_active())
+                    self.assertTrue(_process.collective_error_boundary_active())
+                    raise ValueError("local failure")
+        self.assertFalse(_process.collective_error_boundary_active())
+
     def test_cpu_without_distributed_build_uses_local_defaults(self):
         with patch.object(_process.dist, "is_available", return_value=False), \
                 patch.object(_process.dist, "is_initialized") as initialized, \

@@ -2,10 +2,10 @@
 Current amax scaling for 2D tensor.
 """
 
-from dataclasses import dataclass 
+from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F 
+import torch.nn.functional as F
 from torch._subclasses.fake_tensor import FakeTensor
 
 from .._execution import finite_checks_enabled
@@ -21,7 +21,7 @@ class ScalingResult:
     scale: torch.Tensor
 
     # Reconstruction: x_hat = q.float() * scale_inv
-    scale_inv: torch.Tensor 
+    scale_inv: torch.Tensor
 
     # None mean tensor-wise; otherwise (block_rows, block_cols)
     block_shape: tuple[int, int] | None
@@ -61,7 +61,8 @@ class AmaxScaling:
             scale = torch.empty(shape, device=x.device, dtype=torch.float32)
             scale_inv = torch.empty_like(scale)
         else:
-            from deepopt.opt.backends.triton.quantization.fp8 import amax_scale
+            from deepopt.opt.backends.dispatch import backend_module
+            amax_scale = backend_module('scaling', 'quantization.fp8').amax_scale
 
             scale, scale_inv = amax_scale(x, fp8_max, self.block_shape, check_finite)
         return ScalingResult(scale=scale, scale_inv=scale_inv, block_shape=self.block_shape)

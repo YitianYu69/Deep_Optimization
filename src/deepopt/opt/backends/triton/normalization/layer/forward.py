@@ -3,8 +3,11 @@
 import triton
 import triton.language as tl
 
-from .common import _parameter, _logical, _destination, _quantize_pack_xhat_rows, _provided_scale, _row_statistics
+from .common import (_parameter, _logical, _destination, _quantize_pack_xhat_rows,
+                     _provided_scale, _row_statistics, _statistics_from_values)
 from ..recenter import _record_error
+from ..activation import _activate
+from .moments import _record_layer_moments
 from ...activation.common import _load
 from ...quantization.fp8 import _scale
 from ...quantization.activation.affine import _affine_quantize_pack, _affine_quantize_pack_with_metadata
@@ -22,21 +25,32 @@ def _row_forward(x, x_inverse, weight, bias, output, mean, inverse, data, steps,
                  COLS: tl.constexpr, CHANNELS: tl.constexpr, C: tl.constexpr, S: tl.constexpr,
                  BR: tl.constexpr, BC: tl.constexpr, SCALE_COLS: tl.constexpr, MAXIMUM: tl.constexpr,
                  OBSERVE: tl.constexpr, SNAPSHOT: tl.constexpr, CHECK: tl.constexpr, STATS_BLOCK: tl.constexpr,
-                 center_shift=None, RECENTER: tl.constexpr = False):
+                 center_shift=None, RECENTER: tl.constexpr = False, REUSE_ROW: tl.constexpr = True,
+                 moment_gain=None, MOMENTS: tl.constexpr = False,
+                 preactivation=None, ACTIVATION: tl.constexpr = "", APPROXIMATE: tl.constexpr = "none",
+                 SAVE_PREACTIVATION: tl.constexpr = False):
     row = tl.program_id(0).to(tl.int64)
     # Reduction order must not depend on codec groups/bits: compression changes
     # only saved backward state, including when group padding needs a fallback.
-    mu, rstd = _row_statistics(x, x_inverse, row, K, SHAPE, META, EPS, STATS_BLOCK)
     group = tl.arange(0, PAD_GROUPS)
     offset = tl.arange(0, PAD)
     position = group[:, None] * GROUP + offset[None, :]
     valid = (position < K) & (offset[None, :] < GROUP)
-    _, value = _load(x, x_inverse, row, position, valid, K, SHAPE, False, META)
+    if REUSE_ROW and GROUP == PAD and PAD_GROUPS * PAD == STATS_BLOCK:
+        flat_position = tl.arange(0, STATS_BLOCK)
+        flat_valid = flat_position < K
+        _, flat = _load(x, x_inverse, row, flat_position, flat_valid, K, SHAPE, False, META)
+        mu, rstd = _statistics_from_values(flat, flat_valid, K, EPS)
+        value = tl.reshape(flat, (PAD_GROUPS, PAD))
+    else:
+        mu, rstd = _row_statistics(x, x_inverse, row, K, SHAPE, META, EPS, STATS_BLOCK)
+        _, value = _load(x, x_inverse, row, position, valid, K, SHAPE, False, META)
     tl.store(mean + row, mu)
     tl.store(inverse + row, rstd)
     h = (value - mu) * rstd
     if COMPRESSED:
-        _quantize_pack_xhat_rows(h, valid, data, steps, minima, row, GROUPS, PAD_GROUPS, PAD, WORDS, BITS, center_shift, RECENTER)
+        _quantize_pack_xhat_rows(h, valid, data, steps, minima, row, GROUPS, PAD_GROUPS, PAD, WORDS, BITS,
+                                 center_shift, RECENTER, moment_gain, MOMENTS)
     y = h
     if HAS_WEIGHT:
         y *= _parameter(weight, position, valid, NORM, W_STRIDES)
@@ -62,7 +76,8 @@ def _row_forward(x, x_inverse, weight, bias, output, mean, inverse, data, steps,
                 tl.store(out_inverse + scale_index, tl.div_rn(1.0, multiplier), valid & origin)
             result = tl.minimum(tl.maximum(y * multiplier, -MAXIMUM), MAXIMUM)
         else:
-            result = y
+            result = _activate(y, output, preactivation, _destination(logical, CHANNELS, C, S), valid,
+                               ACTIVATION, APPROXIMATE, SAVE_PREACTIVATION)
         destination = _destination(logical, CHANNELS, C, S)
         if FP8:
             tl.store(output + destination, result.to(output.dtype.element_ty, fp_downcast_rounding="rtne"), valid)
@@ -94,7 +109,10 @@ def _epilogue(x, x_inverse, weight, bias, mean, inverse, output, data, steps, mi
               COLS: tl.constexpr, CHANNELS: tl.constexpr, C: tl.constexpr, S: tl.constexpr,
               BR: tl.constexpr, BC: tl.constexpr, SCALE_COLS: tl.constexpr, MAXIMUM: tl.constexpr,
               PARTS: tl.constexpr, OBSERVE: tl.constexpr, SNAPSHOT: tl.constexpr, CHECK: tl.constexpr, BLOCK: tl.constexpr,
-              center_shift=None, center_errors=None, M: tl.constexpr = 1, RECENTER: tl.constexpr = False):
+              center_shift=None, center_errors=None, M: tl.constexpr = 1, RECENTER: tl.constexpr = False,
+              moment_gain=None, MOMENTS: tl.constexpr = False,
+                 preactivation=None, ACTIVATION: tl.constexpr = "", APPROXIMATE: tl.constexpr = "none",
+                 SAVE_PREACTIVATION: tl.constexpr = False):
     group, part = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     row = group // GROUPS
     offset = part * BLOCK + tl.arange(0, BLOCK)
@@ -113,7 +131,10 @@ def _epilogue(x, x_inverse, weight, bias, mean, inverse, output, data, steps, mi
             tl.store(minima + group, low)
         word_offset = part * (BLOCK // (32 // BITS)) + tl.arange(0, BLOCK // (32 // BITS))
         tl.store(data + group * WORDS + word_offset, words, word_offset < WORDS)
-        if RECENTER:
+        if MOMENTS:
+            _record_layer_moments(words, step, low, h, valid, center_errors, center_shift, moment_gain,
+                                 row, group % GROUPS * PARTS + part, M, GROUPS * PARTS, BITS, BLOCK)
+        elif RECENTER:
             _record_error(words, step, low, h, valid, center_errors, center_shift,
                           row, group % GROUPS * PARTS + part, M, GROUPS * PARTS, BITS, BLOCK)
     y = h
@@ -127,7 +148,8 @@ def _epilogue(x, x_inverse, weight, bias, mean, inverse, output, data, steps, mi
         tl.store(out_inverse + scale_index, tl.div_rn(1.0, multiplier), valid & origin)
         result = tl.minimum(tl.maximum(y * multiplier, -MAXIMUM), MAXIMUM)
     else:
-        result = y
+        result = _activate(y, output, preactivation, _destination(logical, CHANNELS, C, S), valid,
+                           ACTIVATION, APPROXIMATE, SAVE_PREACTIVATION)
     destination = _destination(logical, CHANNELS, C, S)
     if FP8:
         tl.store(output + destination, result.to(output.dtype.element_ty, fp_downcast_rounding="rtne"), valid)
@@ -147,6 +169,51 @@ def _epilogue(x, x_inverse, weight, bias, mean, inverse, output, data, steps, mi
         if FP8:
             bad = bad | (valid & (~(tl.abs(y) < float("inf")) | (multiplier <= 0) | ~(tl.abs(multiplier) < float("inf"))))
         tl.store(errors + group * PARTS + part, tl.max(bad.to(tl.int32), 0))
+
+
+@triton.jit
+def _linear_output_epilogue(x, x_inverse, weight, bias, mean, inverse, output,
+                             scales, out_inverse, packed, steps, minima, observations, snapshot, errors,
+                             M: tl.constexpr, K: tl.constexpr, SHAPE: tl.constexpr, NORM: tl.constexpr,
+                             META: tl.constexpr, W_STRIDES: tl.constexpr, B_STRIDES: tl.constexpr,
+                             HAS_WEIGHT: tl.constexpr, HAS_BIAS: tl.constexpr,
+                             GROUP: tl.constexpr, WORDS: tl.constexpr, BITS: tl.constexpr,
+                             MAXIMUM: tl.constexpr, OBSERVE: tl.constexpr, SNAPSHOT: tl.constexpr,
+                             CHECK: tl.constexpr, BLOCK: tl.constexpr):
+    # The row prepass already owns xhat/recentering. This grid owns the
+    # consumer's flat groups, including groups that cross normalization rows.
+    group = tl.program_id(0).to(tl.int64)
+    offset = tl.arange(0, BLOCK)
+    index = group * GROUP + offset
+    row, position = index // K, index % K
+    valid = (index < M * K) & (offset < GROUP)
+    _, value = _load(x, x_inverse, row, position, valid, K, SHAPE, False, META)
+    h = (value - tl.load(mean + row, valid, other=0)) * tl.load(inverse + row, valid, other=0)
+    y = h
+    if HAS_WEIGHT:
+        y *= _parameter(weight, position, valid, NORM, W_STRIDES)
+    if HAS_BIAS:
+        y += _parameter(bias, position, valid, NORM, B_STRIDES)
+    multiplier = tl.load(scales)
+    if group == 0:
+        tl.store(out_inverse, tl.div_rn(1.0, multiplier))
+    result = tl.minimum(tl.maximum(y * multiplier, -MAXIMUM), MAXIMUM)
+    rounded = result.to(output.dtype.element_ty, fp_downcast_rounding="rtne")
+    tl.store(output + index, rounded, valid)
+    words, step, minimum = _affine_quantize_pack(rounded.to(tl.float32), valid, BITS, BLOCK)
+    word_offset = tl.arange(0, BLOCK // (32 // BITS))
+    tl.store(packed + group * WORDS + word_offset, words, word_offset < WORDS)
+    tl.store(steps + group, step)
+    tl.store(minima + group, minimum)
+    if OBSERVE:
+        tl.store(observations + group, tl.max(tl.where(valid, tl.abs(y), 0.0), 0))
+    if SNAPSHOT:
+        if group == 0:
+            tl.store(snapshot, multiplier)
+            tl.store(snapshot + 1, tl.div_rn(1.0, multiplier))
+    if CHECK:
+        tl.store(errors + group, tl.max((valid & (~(tl.abs(y) < float("inf"))
+                 | (multiplier <= 0) | ~(tl.abs(multiplier) < float("inf")))).to(tl.int32), 0))
 
 
 @triton.jit

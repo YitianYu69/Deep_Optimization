@@ -1,5 +1,7 @@
 """Shared pooling frontend: native signatures, precision and compression policy."""
 
+from deepopt.kernel_policy import kernel_entry, current_kernel_policy
+
 from math import isfinite
 
 import torch
@@ -13,6 +15,7 @@ FP8 = (torch.float8_e4m3fn, torch.float8_e5m2)
 FLOAT = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
 
+@kernel_entry
 def pooling(kind, x, args, kwargs, *, plan=None, output_dtype=None, output_layout=None, output_scale=None,
             planned_layout=None, scaling_state=None, state_training=True, execution_info=None):
     from ..functional import _prepare_linear_plan
@@ -75,6 +78,14 @@ def pooling(kind, x, args, kwargs, *, plan=None, output_dtype=None, output_layou
             raise ValueError("delayed pooling FP8 output requires a prepared adapter or explicit scale")
         if dtype != scaling_state.dtypes["activation"]:
             raise ValueError("pooling output format differs from its prepared delayed state")
+    if (spec.family == "adaptive_average" and all(size == 1 for size in g.output_spatial)
+            and not isinstance(x, FP8Activation) and dtype == x.dtype and output_scale is None):
+        from ...precision.gradient import capture_gradient
+        from ...quantization.gradient import enabled
+        if not enabled(capture_gradient(x)):
+            from ..autograd.pooling.global_average import GlobalAverageFunction
+            return GlobalAverageFunction.apply(x, g, options, compression["enabled"],
+                                               torch.is_grad_enabled() and x.requires_grad, execution_info)
     samples = None
     if spec.family == "fractional_max":
         samples = options.get("_random_samples")
@@ -87,7 +98,7 @@ def pooling(kind, x, args, kwargs, *, plan=None, output_dtype=None, output_layou
     settings = dict(options=options, dtype=dtype, logical_dtype=logical_dtype, block_shape=blocks,
                     input_block_shape=checked["block_shapes"]["activation"] if training else None,
                     compression=compression, scale=output_scale, samples=samples, need_state=backward and bool(x.numel()),
-                    backend=training["backend"] if training else "triton" if x.device.type == "cuda" else "reference",
+                    backend=training["backend"] if training else current_kernel_policy().backend if x.device.type == "cuda" else "reference",
                     check_finite=finite_checks_enabled() and (dtype in FP8 or compression["enabled"] and spec.family == "power"))
     return PoolFunction.apply(x, g, settings, scaling_state if output_scale is None else None,
                               state_training and torch.is_grad_enabled(), execution_info)

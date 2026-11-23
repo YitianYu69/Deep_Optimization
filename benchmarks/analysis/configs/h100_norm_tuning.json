@@ -1,0 +1,68 @@
+{
+  "settings": {
+    "runtime": {
+      "scope_lifetime": "reused",
+      "numerical_probe": "random_upstream",
+      "norm_kernel_variant": "candidate",
+      "execution": "graph"
+    }
+  },
+  "grid": {
+    "runtime.norm_row_chunk": [
+      1,
+      4,
+      8
+    ],
+    "runtime.norm_max_programs": [
+      128,
+      512
+    ]
+  },
+  "workloads": [
+    {
+      "name": "ln_small",
+      "op": "layer_norm",
+      "shape": [
+        32,
+        197,
+        768
+      ]
+    },
+    {
+      "name": "ln_vit",
+      "op": "layer_norm",
+      "shape": [
+        512,
+        197,
+        768
+      ]
+    },
+    {
+      "name": "ln_wide",
+      "op": "layer_norm",
+      "shape": [
+        32,
+        197,
+        3072
+      ]
+    }
+  ],
+  "tolerances": {
+    "default": {
+      "rtol": 0.05,
+      "atol": 0.01
+    },
+    "gradients": {
+      "rtol": 0.05,
+      "atol": 1e-06,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    },
+    "updates": {
+      "rtol": 0.05,
+      "atol": 1e-07,
+      "max_relative_l2": 0.1,
+      "min_cosine": 0.99
+    }
+  }
+}

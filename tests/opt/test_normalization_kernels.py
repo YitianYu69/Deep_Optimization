@@ -22,6 +22,20 @@ class NormLanguage(KernelLanguage):
     abs = staticmethod(torch.abs)
     rsqrt = staticmethod(torch.rsqrt)
     div_rn = staticmethod(torch.true_divide)
+    full = staticmethod(torch.full)
+    trans = staticmethod(torch.t)
+
+    @staticmethod
+    def load(pointer, mask=True, other=0.0):
+        if torch.as_tensor(pointer.offset).ndim == 0 and torch.as_tensor(mask).ndim:
+            raise AssertionError("a scalar pointer cannot accept a vector mask")
+        if pointer.storage.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and type(other) is int:
+            raise AssertionError("FP8 masked loads need floating-point padding")
+        return KernelLanguage.load(pointer, mask, other)
+
+    @staticmethod
+    def store(pointer, values, mask=True):
+        return KernelLanguage.store(pointer, torch.as_tensor(values), mask)
 
     @staticmethod
     def where(condition, a, b):
@@ -40,8 +54,10 @@ def kernels():
     language = NormLanguage()
     namespace = {"tl": language, "triton": SimpleNamespace(cdiv=language.cdiv), "FP8Activation": FP8Activation, "prod": prod}
     package = files("deepopt.opt.backends.triton")
-    for path in ("quantization/activation/affine.py", "normalization/common.py", "normalization/recenter.py", "normalization/statistics.py",
-                 "normalization/forward.py", "normalization/backward.py"):
+    for path in ("quantization/activation/affine.py", "activation/math.py", "normalization/activation.py",
+                 "normalization/common.py", "normalization/recenter.py", "normalization/statistics.py",
+                 "normalization/layer/common.py", "normalization/small.py", "normalization/forward.py", "normalization/backward.py",
+                 "normalization/channels_last.py"):
         tree = ast.parse(package.joinpath(path).read_text())
         functions = []
         for node in tree.body:

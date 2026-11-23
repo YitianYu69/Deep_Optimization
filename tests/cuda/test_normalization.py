@@ -18,16 +18,47 @@ from tests.cuda.fp8_support import FP8_CUDA_SKIP_REASON
 
 @unittest.skipIf(FP8_CUDA_SKIP_REASON, FP8_CUDA_SKIP_REASON)
 class NormalizationCUDATests(unittest.TestCase):
+    def test_candidate_small_domains_and_shared_batch_gradients_match_baseline(self):
+        from deepopt.opt.backends._shared.normalization import normalization_kernel_scope
+
+        for kind in ("batch", "group"):
+            for bits in (1, 2, 4, 8):
+                raw = torch.randn(2, 4, 5, 7, device="cuda", dtype=torch.bfloat16)
+                gradient = torch.randn_like(raw)
+                weight = torch.tensor([0., -0.5, 1., 2.], device="cuda")
+                results = []
+                for variant in ("baseline", "candidate", "batch_shared", "small_forward"):
+                    x, w, b = raw.clone().requires_grad_(), weight.clone().requires_grad_(), torch.zeros(4, device="cuda", requires_grad=True)
+                    plan = normalization_plan(deepopt.FP8Config(enabled=True, backend="triton"),
+                        activation_compression={"enabled": True, "bits": bits, "group_size": 17, "norm_xhat_recenter": True})
+                    info = {}
+                    with normalization_kernel_scope(variant):
+                        y = (DF.do_batch_norm(x, None, None, w, b, True, plan=plan, _execution_info=info) if kind == "batch" else
+                             DF.do_group_norm(x, 2, w, b, plan=plan, _execution_info=info))
+                    # Backward must keep the saved forward variant after scope exit.
+                    y.backward(gradient)
+                    results.append((y.detach(), x.grad, w.grad, b.grad))
+                    if variant in ("candidate", "small_forward"):
+                        self.assertEqual(info["forward_variant"], "small_fused")
+                    if variant == "batch_shared":
+                        self.assertNotEqual(info.get("forward_variant"), "small_fused")
+                    expected_backward = "shared_batch" if kind == "batch" and variant in ("candidate", "batch_shared") else "separate"
+                    self.assertEqual(info["backward_variant"], expected_backward)
+                for result in results[1:]:
+                    for actual, expected in zip(result, results[0]):
+                        torch.testing.assert_close(actual, expected, rtol=.02, atol=.02)
+
     def setUp(self):
         torch.manual_seed(2049)
 
     def test_bf16_and_fp8_input_forward_and_packed_xhat_backward(self):
         for kind in ("batch", "group"):
-            for fp8 in (False, True):
+            for storage in ("bf16", "e4m3fn", "e5m2"):
+                fp8 = storage != "bf16"
                 for bits in (1, 2, 4, 8):
                     with self.subTest(kind=kind, fp8=fp8, bits=bits):
                         source = torch.randn(2, 4, 5, 7, device="cuda", dtype=torch.bfloat16).requires_grad_()
-                        x = to_fp8_activation(source, block_shape=(4, 4)) if fp8 else source
+                        x = to_fp8_activation(source, block_shape=(4, 4), fp8_dtype=getattr(torch, "float8_" + storage)) if fp8 else source
                         w, bias = torch.randn(4, device="cuda", requires_grad=True), torch.randn(4, device="cuda", requires_grad=True)
                         settings = deepopt.FP8Config(enabled=True, backend="triton")
                         plan = normalization_plan(settings, activation_compression={"enabled": True, "group_size": 17, "bits": bits})

@@ -6,6 +6,7 @@ from functools import update_wrapper
 import torch
 
 from deepopt._config_resolution import _UNSET
+from deepopt._memory_policy import capture_memory_scope, fill_spec
 
 from ._configuration import _capture_settings
 from ._validation import (arguments, autocast_spec, capture_guard, check_arguments,
@@ -30,9 +31,11 @@ class CapturedGraph:
         if capture_error_mode not in ("global", "thread_local", "relaxed"):
             raise ValueError("capture_error_mode must be global, thread_local or relaxed")
         warmup_count(warmup)
+        self.enabled = options["enabled"]
         self.device, self.pool, self.stream = device, pool, stream
         self.capture_error_mode, self.warmup = capture_error_mode, warmup
         self.graph = None
+        self._operation_policy = None
         self._state = "new"
 
     @property
@@ -42,11 +45,17 @@ class CapturedGraph:
     def __enter__(self):
         if self._state != "new":
             raise RuntimeError("Capture contexts are single-use; create a new capture")
+        if not self.enabled:
+            raise RuntimeError("CUDA Graph capture is disabled by runtime.cuda_graph.enabled; "
+                               "use capture_callable or a capture decorator for eager execution")
         self._state = "capturing"
         self._stack = ExitStack()
         try:
+            self._stack.enter_context(capture_memory_scope(self.config))
+            self._fill_policy = fill_spec()
             self.device = cuda_device(self.device)
             self._stack.enter_context(torch.cuda.device(self.device))
+            self._operation_policy = operation_policy_spec()
             self._stack.enter_context(capture_guard())
             if self.stream is not None and self.stream.device != self.device:
                 raise ValueError("Capture stream must belong to the graph's device")
@@ -76,7 +85,11 @@ class CapturedGraph:
     def replay(self):
         if not self.captured:
             raise RuntimeError("Replay requires a successful, open capture")
-        with torch.cuda.device(self.device):
+        with capture_memory_scope(self.config), torch.cuda.device(self.device):
+            if fill_spec() != self._fill_policy:
+                raise ValueError("Allocation filling or deterministic policy changed; recapture the graph")
+            if self._operation_policy is None or operation_policy_spec() != self._operation_policy:
+                raise ValueError("Operation policy changed or is missing; recapture the graph")
             self.graph.replay()
 
     def close(self):
@@ -109,6 +122,7 @@ class CapturedFunction:
         update_wrapper(self, function)
         self.function = function
         self._capture = CapturedGraph(**options)
+        self.enabled = self._capture.enabled
         self.config = self._capture.config
         self._inputs = self._outputs = self._specs = self._autocast = None
         self._operation_policy = None
@@ -149,6 +163,15 @@ class CapturedFunction:
                 raise ValueError("Captured functions must return a CUDA tensor, a tuple of CUDA tensors, or None")
 
     def __call__(self, *args, **kwargs):
+        with capture_memory_scope(self.config):
+            return self._call(*args, **kwargs)
+
+    def _call(self, *args, **kwargs):
+        if not self.enabled:
+            if self._capture._state == "closed":
+                raise RuntimeError("Captured function is closed; create a new decorated function")
+            with torch.no_grad():
+                return self.function(*args, **kwargs)
         if self._capture._state == "new":
             try:
                 self._initialize(args, kwargs)

@@ -1,0 +1,119 @@
+# Packed CPU offload + native DDP. User-facing budgets are decimal GB per rank.
+# The runtime validates these values and never automatically resizes them.
+name = "mbconv_vae_v2_imagenet"
+seed = 42
+
+[training]
+epochs = 80
+batch_size = 192 # Per rank; four GPUs with accumulation_steps=1 give global batch 768.
+learning_rate = 0.001
+accumulation_steps = 1
+optimizer = "custom"
+weight_decay = 0.00001
+momentum = 0.9
+lr_gamma = 1.0
+monitor = "loss"
+monitor_mode = "min"
+checkpoint_every_steps = 200
+scheduler_interval = "epoch"
+
+[training.ema]
+enabled = false
+decay = 0.95
+
+[application.model]
+base_channels = 32
+max_channels = 512
+latent_channels = 4
+blocks_per_stage = 2
+
+[application.data]
+train_dir = "data/imagenet/train"
+val_dir = "data/imagenet/val"
+image_size = 158
+resize_size = 158
+
+[application.metrics]
+lpips = true
+lpips_net_type = "alex"
+
+[schedules.beta]
+type = "linear_warmup"
+start = 0.0
+end = 0.000001
+duration = 10000
+interval = "update"
+
+[runtime]
+bf16_policy = "torch_amp" # Preserves the supplied training precision policy.
+device = "cuda"
+precision = "bf16"
+deterministic = false
+execution_mode = "max_speed"
+checks = false
+fill_uninitialized_memory = false
+non_blocking = true
+
+[runtime.activation_compression]
+enabled = true
+group_size = 1024
+bits = 2
+norm_xhat_recenter = true
+
+[runtime.activation_memory]
+multiply_backward = "packed_streaming"
+pack_reuse = "inherit"
+recompute_modules = []
+
+[runtime.packed_activation_offload]
+version = 2
+enabled = true
+policy = "demand"
+host_pinned_gb = 80 # User-defined per-rank ceiling. 1 GB = 1,000,000,000 bytes.
+host_pageable_gb = 0
+max_live_forwards = 1
+max_backward_tasks = 1
+admission = "error" # Require admission; do not silently keep selected saves on the GPU.
+
+[runtime.kernels]
+backend = "triton"
+
+[runtime.compile]
+enabled = true
+backend = "deepopt"
+fullgraph = true
+dynamic = false
+
+[runtime.compile.options]
+use_native_autodiff = true
+require_full_aot = true
+share_compatible_packs = true
+packed_offload_selection_mode = "peak" # Select supported saves within the configured per-rank budget.
+# Use "all_eligible" to require every eligible packed save; insufficient capacity then raises.
+native_conv_workspace_reuse = "tiled_dx" # Also bounds dX scratch for eligible convolutions.
+native_conv_dx_batch_size = 16
+
+# Launch with torchrun, one process per GPU. These settings tune the active DDP reducer.
+[runtime.ddp]
+find_unused_parameters = false
+broadcast_buffers = true
+gradient_as_bucket_view = true
+bucket_cap_mb = 25.0
+static_graph = false
+validation_sync_buffers = true
+
+# No runtime.cuda_graph table: packed offload does not support CUDA Graph capture.
+
+[experiment_identity]
+recipe = "mbconv-vae-v2-imagenet-v1"
+objective = "l1-mean-plus-beta-kl-sum-per-image-v1"
+
+[loader]
+num_workers = 10
+pin_memory = true
+persistent_workers = true
+drop_last = false
+
+[logging]
+level = "INFO"
+file_level = "DEBUG"

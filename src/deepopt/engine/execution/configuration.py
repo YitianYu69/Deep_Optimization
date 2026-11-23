@@ -30,7 +30,7 @@ def runtime_signature(snapshot):
 
 def execution_config(config=None, *, device=_UNSET, precision=_UNSET, checks=_UNSET,
                      grad_clip_norm=_UNSET, execution_mode=_UNSET, diagnostics=_UNSET,
-                     mode_schedule=_UNSET, non_blocking=_UNSET, fp8=_UNSET,
+                     mode_schedule=_UNSET, non_blocking=_UNSET, fill_uninitialized_memory=_UNSET, fp8=_UNSET,
                      model=None, ddp_options=_UNSET, training_overrides=None):
     """Explicit serializable arguments override a construction snapshot."""
     if device is not _UNSET and device is not None:
@@ -44,6 +44,7 @@ def execution_config(config=None, *, device=_UNSET, precision=_UNSET, checks=_UN
         "checks": checks if type(checks) is bool else _UNSET,
         "execution_mode": execution_mode, "diagnostics": diagnostics,
         "mode_schedule": mode_schedule, "non_blocking": non_blocking,
+        "fill_uninitialized_memory": fill_uninitialized_memory,
     }.items() if value is not _UNSET}
     if fp8 is not _UNSET:
         # Explicit None preserves an already-prepared model's policy; for an
@@ -69,14 +70,27 @@ def execution_config(config=None, *, device=_UNSET, precision=_UNSET, checks=_UN
 
 def prepare_execution_model(model, snapshot, fp8=_UNSET):
     """Reuse matching preparation while keeping parameter objects unchanged."""
+    from deepopt._packed_offload import resolve_owned_packed_offload
+
+    offload = resolve_owned_packed_offload(getattr(model, "_deepopt_packed_activation_offload_policy", None),
+                                         snapshot.get("runtime", {}).get("packed_activation_offload"))
+    if offload.enabled or hasattr(model, "_deepopt_packed_activation_offload_policy"):
+        snapshot.setdefault("runtime", {})["packed_activation_offload"] = offload.as_config()
     settings = resolve_fp8_config(model, fp8, config=snapshot)
     compression = resolve_activation_compression_config(model, config=snapshot)
     model, report = prepare_fp8_model(model, settings, config=snapshot, activation_compression=compression)
+    if hasattr(model, "_deepopt_bf16_policy"):
+        snapshot.setdefault("runtime", {})["bf16_policy"] = model._deepopt_bf16_policy["name"]
+    memory = getattr(model, "_deepopt_activation_memory_plan", None)
+    if memory is not None:
+        snapshot.setdefault("runtime", {})["activation_memory"] = memory.as_config()
     if compression.enabled or hasattr(model, "_deepopt_activation_compression_config"):
         snapshot.setdefault("runtime", {})["activation_compression"] = asdict(compression)
+    if hasattr(model, "_deepopt_attention_config"):
+        snapshot.setdefault("runtime", {})["attention"] = asdict(model._deepopt_attention_config)
     compilation = compile_config_from_dict(snapshot.get("runtime", {}).get("compile", {}))
     if compilation.enabled:
         previous = getattr(model, "_deepopt_compile_config", None)
         if previous != asdict(compilation):
-            compile_model(model, compilation, config=ResolvedConfig())
+            compile_model(model, compilation, config=ResolvedConfig(snapshot))
     return model, settings, report

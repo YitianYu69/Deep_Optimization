@@ -17,9 +17,14 @@ from deepopt.opt.quantization.activation_tensor import to_fp8_activation
 
 
 class Language(ReLULanguage):
+    trans = staticmethod(torch.t)
     floor = staticmethod(torch.floor)
     exp = staticmethod(torch.exp)
     int1 = torch.bool
+
+    @staticmethod
+    def gather(value, indices, axis):
+        return torch.gather(value, axis, indices.long())
 
     @staticmethod
     def full(shape, value, dtype):
@@ -37,7 +42,8 @@ class ActivationKernelTests(unittest.TestCase):
                   "libdevice": SimpleNamespace(erf=torch.erf, tanh=torch.tanh)}
         package = files("deepopt.opt.backends.triton")
         for path in ("quantization/fp8.py", "quantization/activation/affine.py", "activation/common.py",
-                     "activation/math.py", "activation/elementwise_forward.py", "activation/elementwise_backward.py"):
+                     "activation/math.py", "activation/elementwise_forward.py", "activation/elementwise_backward.py",
+                     "activation/channels_last.py"):
             tree = ast.parse(package.joinpath(path).read_text())
             functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.decorator_list
                          and any(isinstance(d, ast.Attribute) and d.attr == "jit" for d in n.decorator_list)]

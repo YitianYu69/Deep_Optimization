@@ -1,0 +1,92 @@
+name = "mbconv_vae_v2_imagenet"
+seed = 42
+
+[training]
+epochs = 80
+batch_size = 24 # Per GPU: 4 GPUs give an effective batch of 96.
+learning_rate = 0.001
+accumulation_steps = 1
+optimizer = "adamw"
+weight_decay = 0.0
+momentum = 0.9
+lr_gamma = 1.0
+monitor = "loss"
+monitor_mode = "min"
+checkpoint_every_steps = 200 # Optimizer updates; enables resumable data loading.
+scheduler_interval = "epoch"
+
+[training.ema]
+enabled = true
+decay = 0.95
+
+[application.model]
+base_channels = 32
+max_channels = 512
+latent_channels = 4
+blocks_per_stage = 2
+
+[application.data]
+train_dir = "data/imagenet/train"
+val_dir = "data/imagenet/val"
+image_size = 256 # Assumed: the original preprocessing was not supplied.
+resize_size = 288
+
+[application.metrics]
+lpips = true
+lpips_net_type = "alex" # Pretrained AlexNet; PSNR and SSIM are always reported.
+
+[schedules.beta]
+type = "linear_warmup"
+start = 0.0
+end = 0.000001
+duration = 10000 # First update uses 0; update 10,000 reaches 1e-6.
+interval = "update"
+
+[runtime]
+bf16_policy = "torch_amp"
+device = "cuda"
+precision = "bf16"
+deterministic = true
+checks = true
+non_blocking = true
+
+[runtime.activation_compression]
+enabled = true
+group_size = 1024
+bits = 2
+norm_xhat_recenter = true
+
+[runtime.compile]
+enabled = false # Your TOML setting; set true to match the launcher's --compile.
+backend = "inductor"
+fullgraph = false
+
+[runtime.compile.options]
+
+[runtime.ddp]
+find_unused_parameters = false
+broadcast_buffers = true
+gradient_as_bucket_view = true
+bucket_cap_mb = 25.0
+static_graph = false
+validation_sync_buffers = true
+
+[runtime.cuda_graph]
+warmup = 3
+allow_unused_input = false
+autograd = true
+capture_error_mode = "global"
+
+[experiment_identity]
+recipe = "mbconv-vae-v2-imagenet-v1"
+objective = "l1-mean-plus-beta-kl-sum-per-image-v1"
+
+[loader]
+num_workers = 10 # Per rank; four GPUs use 40 training workers.
+pin_memory = true
+persistent_workers = true
+drop_last = false
+
+[logging]
+level = "INFO"
+file_level = "DEBUG"

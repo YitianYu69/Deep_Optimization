@@ -2,7 +2,8 @@
 
 from types import SimpleNamespace
 
-from .measurement import measure, profile
+from .measurement import measure, profile, memory_fill_scope
+from .artifacts import profile_detail,trace_directory
 from .workloads import UnsupportedWorkload
 
 
@@ -23,6 +24,8 @@ def run_codec(task, options, directory):
             raise UnsupportedWorkload("CUDA is unavailable")
         torch.cuda.set_device(device)
     torch.manual_seed(options["seed"])
+    torch.use_deterministic_algorithms(options["deterministic"])
+    torch.utils.deterministic.fill_uninitialized_memory=options["fill_uninitialized_memory"]
     op, shape, config = spec["op"], spec["shape"], settings["compression"]
     value = torch.randn(shape, device=device, dtype=torch.bfloat16)
     if op == "boolean_codec":
@@ -53,7 +56,11 @@ def run_codec(task, options, directory):
         if len(shape) not in (4, 5):
             raise UnsupportedWorkload("channels_last requires rank 4 or 5")
         value = value.contiguous(memory_format=torch.channels_last if len(shape) == 4 else torch.channels_last_3d)
-    with deepopt.autocast(device.type, enabled=False, fp8=False, check_finite=settings["runtime"]["check_finite"]):
+    from deepopt.opt.backends._shared.activation_codec import activation_codec_scope
+    runtime=settings["runtime"]
+    with deepopt.autocast(device.type, enabled=False, fp8=False, check_finite=runtime["check_finite"]), \
+         activation_codec_scope(runtime["codec_pack_variant"],groups_per_program=runtime["codec_groups_per_program"],
+                                spatial_layout=runtime["spatial_activation_layout"],num_warps=runtime["codec_num_warps"]):
         packed = pack(value)
         decoded = unpack(packed)
         payload = packed[1] if isinstance(packed, tuple) else packed
@@ -62,17 +69,24 @@ def run_codec(task, options, directory):
             retained.append(packed[0].scale_inv)
         methods = {"pack": lambda: pack(value), "unpack": lambda: unpack(packed),
                    "roundtrip": lambda: unpack(pack(value)), "native_copy": lambda: value.clone()}
-        timings = {key: measure(fn, torch, device, options["warmup"], options["iterations"], options["repeats"])
-                   for key, fn in methods.items()}
-        trace = None
-        if options["profile_steps"]:
-            session = SimpleNamespace(device=device, model=torch.nn.Identity(), reset=lambda: None,
-                                      step=lambda **_: methods["roundtrip"]())
-            trace = profile(session, directory, options["profile_steps"])
+        with memory_fill_scope(runtime["timing_fill_uninitialized_memory"]) as performance_fill:
+            timings = {key: measure(fn, torch, device, options["warmup"], options["iterations"], options["repeats"])
+                       for key, fn in methods.items()}
+            trace = None
+            if options["profile_steps"]:
+                session = SimpleNamespace(device=device, model=torch.nn.Identity(), reset=lambda: None,
+                                          step=lambda **_: methods["roundtrip"]())
+                trace = profile(session,trace_directory(directory,task,options),options["profile_steps"],
+                                detail=profile_detail(task,options),compress=options.get("compress_traces",False))
     expected, restored = value.float(), decoded.float()
     finite = bool(torch.isfinite(restored).all())
     exact = bool(torch.equal(value, decoded)) if op in ("boolean_codec", "index_codec") else None
     return {"status": "ok", "kind": "codec_diagnostic", "timing": timings, "profile": trace, "environment": environment(device),
+            "artifact_errors":[{"phase":"profile","reason":trace["trace_export_error"]}] if trace and trace.get("trace_export_error") else [],
+            "measurement_policy":{"performance_fill_uninitialized_memory":performance_fill,
+                                    "correctness_fill_uninitialized_memory":options["fill_uninitialized_memory"],
+                                    "deterministic_algorithms":options["deterministic"],
+                                    "performance_allocation_filling_active":bool(performance_fill and options["deterministic"])},
             "logical_input_bytes": value.numel() * value.element_size(),
             "physical_input_storage_bytes": value.untyped_storage().nbytes(),
             "packed_payload_and_metadata_bytes": sum(x.numel() * x.element_size() for x in retained),

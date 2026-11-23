@@ -15,6 +15,7 @@ class SavedActivation:
     bits: int = 2
     mask: bool = False
     packed: bool = False
+    recompute: tuple | None = None
 
     @property
     def tensors(self):
@@ -22,10 +23,11 @@ class SavedActivation:
 
     @property
     def metadata(self):
-        return self.group_size, self.block_shape, self.bits, self.mask, self.packed
+        return self.group_size, self.block_shape, self.bits, self.mask, self.packed, self.recompute
 
     @classmethod
     def restore(cls, tensors, metadata):
-        group, block, bits, mask, packed = metadata
+        group, block, bits, mask, packed, *extra = metadata
         return cls(tensors[0], tensors[1] if len(tensors) > 1 else None,
-                   tensors[2] if len(tensors) > 1 else None, group, block, bits, mask, packed)
+                   tensors[2] if len(tensors) > 1 else None, group, block, bits, mask, packed,
+                   extra[0] if extra else None)

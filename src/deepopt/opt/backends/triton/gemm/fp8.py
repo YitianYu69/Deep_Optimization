@@ -2,9 +2,10 @@
 
 import torch
 import inspect
+from functools import lru_cache
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor 
+from triton.tools.tensor_descriptor import TensorDescriptor
 from ..gradient import _gradient_tile
 
 from deepopt.opt.quantization.tensor import QuantizedTensor
@@ -14,12 +15,20 @@ from deepopt.opt.backends.triton.gemm.autotune import (
     AUTOTUNE_KEY, AUTOTUNE_TILES, AUTOTUNE_STAGES, GROUP_SIZE_M_CHOICES, SPLIT_K_CHOICES,
     prune_gemm_configs, split_k_limit, DescriptorKernel,
     grouped_tile_coordinates,
+    fixed_gemm_parameters, gemm_program_grid,
 )
 
 
 _grouped_tile_coordinates = triton.jit(grouped_tile_coordinates)
 _cache_options = ({"cache_results": True}
                   if "cache_results" in inspect.signature(triton.autotune).parameters else {})
+
+
+@lru_cache(maxsize=128)
+def _fixed_config(a_block, b_block, stages):
+    options = fixed_gemm_parameters(a_block, b_block, num_stages=stages)
+    warps, depth = options.pop("num_warps"), options.pop("num_stages")
+    return triton.Config(options, num_warps=warps, num_stages=depth)
 
 
 def _benchmark_gemm(kernel_call, quantiles):
@@ -82,12 +91,14 @@ def _finish_gemm(args, exception=None):
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk,
-                       "NUM_STAGES": stages, "SPLIT_K": split, "GROUP_SIZE_M": group},
+                       "NUM_STAGES": stages, "SPLIT_K": split, "GROUP_SIZE_M": group,
+                       "PERSISTENT": persistent},
                       num_warps=warps, num_stages=stages)
         for bm, bn, bk, warps in AUTOTUNE_TILES
         for stages in AUTOTUNE_STAGES
         for split in SPLIT_K_CHOICES
         for group in GROUP_SIZE_M_CHOICES
+        for persistent in ((False, True) if split == 1 else (False,))
     ],
     key=list(AUTOTUNE_KEY),
     prune_configs_by={"early_config_prune": prune_gemm_configs},
@@ -124,81 +135,106 @@ def _gemm_nt_kernel(
     GRADIENT_FP8: tl.constexpr = False, GRAD_CURRENT: tl.constexpr = False,
     GRAD_BR: tl.constexpr = 1, GRAD_BC: tl.constexpr = 1,
     GRAD_MAXIMUM: tl.constexpr = 448.0, GRAD_OBSERVE: tl.constexpr = False,
+    PERSISTENT: tl.constexpr = False,
 ):
 
-    pid_m, pid_n = _grouped_tile_coordinates(
-        tl.program_id(0), tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N), GROUP_SIZE_M)
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    start_m = pid_m * BLOCK_M
-    start_n = pid_n * BLOCK_N
+    tl.static_assert(not PERSISTENT or (TENSORWISE and SPLIT_K == 1 and not GRADIENT_FP8),
+                     "Persistent GEMM requires tensorwise, unsplit, native-output tiles")
+    first_tile = tl.program_id(0)
+    if PERSISTENT:
+        tile_count = tl.cdiv(M, BLOCK_M) * tl.cdiv(N, BLOCK_N)
+        iterations = tl.cdiv(tile_count - first_tile, NUM_SMS)
+    else:
+        iterations = 1
+    for iteration in range(iterations):
+        tile_id = first_tile + iteration * NUM_SMS
+        pid_m, pid_n = _grouped_tile_coordinates(
+            tile_id, tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N), GROUP_SIZE_M)
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+        start_m = pid_m * BLOCK_M
+        start_n = pid_n * BLOCK_N
 
-    rows = start_m + tl.arange(0, BLOCK_M)
-    cols = start_n + tl.arange(0, BLOCK_N)
+        rows = start_m + tl.arange(0, BLOCK_M)
+        cols = start_n + tl.arange(0, BLOCK_N)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k_tile in tl.range(tl.program_id(1), tl.cdiv(K, BLOCK_K), SPLIT_K, num_stages=NUM_STAGES):
-        start_k = k_tile * BLOCK_K
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_tile in tl.range(tl.program_id(1), tl.cdiv(K, BLOCK_K), SPLIT_K, num_stages=NUM_STAGES):
+            start_k = k_tile * BLOCK_K
 
-        a_tile = a_desc.load([start_m, start_k])
-        b_tile = b_desc.load([start_n, start_k])
+            a_tile = a_desc.load([start_m, start_k])
+            b_tile = b_desc.load([start_n, start_k])
+
+            if TENSORWISE:
+                acc = tl.dot(a_tile, b_tile.T, acc, out_dtype=tl.float32)
+            elif NATIVE_FP8:
+                partial = tl.dot(a_tile, b_tile.T, out_dtype=tl.float32)
+
+                a_scale_offset = (rows // A_BLOCK_ROWS) * A_SCALE_COLS + start_k // A_BLOCK_COLS
+                b_scale_offset = (cols // B_BLOCK_ROWS) * B_SCALE_COLS + start_k // B_BLOCK_COLS
+
+                a_scale_inv = tl.load(a_scale_inv_ptr + a_scale_offset, mask=rows<M, other=0.0)
+                b_scale_inv = tl.load(b_scale_inv_ptr + b_scale_offset, mask=cols<N, other=0.0)
+
+                scaled_partial = (partial * a_scale_inv[:, None]) * b_scale_inv[None, :]
+                acc = acc + scaled_partial
+            else:
+                # Transposing rowwise blocks can make scales vary at every K.
+                # Apply those scales before reduction without requantizing FP8.
+                ks = start_k + tl.arange(0, BLOCK_K)
+                a_scale_offset = ((rows // A_BLOCK_ROWS)[:, None] * A_SCALE_COLS
+                                  + (ks // A_BLOCK_COLS)[None, :])
+                b_scale_offset = ((cols // B_BLOCK_ROWS)[:, None] * B_SCALE_COLS
+                                  + (ks // B_BLOCK_COLS)[None, :])
+                a_scales = tl.load(a_scale_inv_ptr + a_scale_offset,
+                                   mask=(rows[:, None] < M) & (ks[None, :] < K), other=0.0)
+                b_scales = tl.load(b_scale_inv_ptr + b_scale_offset,
+                                   mask=(cols[:, None] < N) & (ks[None, :] < K), other=0.0)
+                a_values = a_tile.to(tl.float32) * a_scales
+                b_values = b_tile.to(tl.float32) * b_scales
+                acc = tl.dot(a_values, b_values.T, acc, out_dtype=tl.float32,
+                             input_precision="tf32x3")
 
         if TENSORWISE:
-            acc = tl.dot(a_tile, b_tile.T, acc, out_dtype=tl.float32)
-        elif NATIVE_FP8:
-            partial = tl.dot(a_tile, b_tile.T, out_dtype=tl.float32)
+            a_scale_inv = tl.load(a_scale_inv_ptr)
+            b_scale_inv = tl.load(b_scale_inv_ptr)
+            acc = (acc * a_scale_inv) * b_scale_inv
 
-            a_scale_offset = (rows // A_BLOCK_ROWS) * A_SCALE_COLS + start_k // A_BLOCK_COLS
-            b_scale_offset = (cols // B_BLOCK_ROWS) * B_SCALE_COLS + start_k // B_BLOCK_COLS
+        if HAS_BIAS and SPLIT_K == 1:
+            cols = start_n + tl.arange(0, BLOCK_N)
+            bias = tl.load(bias_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+            acc = acc + bias[None, :]
 
-            a_scale_inv = tl.load(a_scale_inv_ptr + a_scale_offset, mask=rows<M, other=0.0)
-            b_scale_inv = tl.load(b_scale_inv_ptr + b_scale_offset, mask=cols<N, other=0.0)
-
-            scaled_partial = (partial * a_scale_inv[:, None]) * b_scale_inv[None, :]
-            acc = acc + scaled_partial
+        if SPLIT_K == 1:
+            if GRADIENT_FP8:
+                valid = (rows[:, None] < M) & (cols[None, :] < N)
+                acc = _gradient_tile(acc, rows, cols, valid, gradient_scale, gradient_inverse, gradient_observations,
+                                     M, N, BLOCK_M, BLOCK_N, GRAD_BR, GRAD_BC, GRAD_MAXIMUM, GRAD_CURRENT, GRAD_OBSERVE)
+            if GRADIENT_FP8:
+                c_desc.store([start_m, start_n], acc.to(OUTPUT_DTYPE, fp_downcast_rounding="rtne"))
+            else:
+                c_desc.store([start_m, start_n], acc.to(OUTPUT_DTYPE))
         else:
-            # Transposing rowwise blocks can make scales vary at every K.
-            # Apply those scales before reduction without requantizing FP8.
-            ks = start_k + tl.arange(0, BLOCK_K)
-            a_scale_offset = ((rows // A_BLOCK_ROWS)[:, None] * A_SCALE_COLS
-                              + (ks // A_BLOCK_COLS)[None, :])
-            b_scale_offset = ((cols // B_BLOCK_ROWS)[:, None] * B_SCALE_COLS
-                              + (ks // B_BLOCK_COLS)[None, :])
-            a_scales = tl.load(a_scale_inv_ptr + a_scale_offset,
-                               mask=(rows[:, None] < M) & (ks[None, :] < K), other=0.0)
-            b_scales = tl.load(b_scale_inv_ptr + b_scale_offset,
-                               mask=(cols[:, None] < N) & (ks[None, :] < K), other=0.0)
-            a_values = a_tile.to(tl.float32) * a_scales
-            b_values = b_tile.to(tl.float32) * b_scales
-            acc = tl.dot(a_values, b_values.T, acc, out_dtype=tl.float32,
-                         input_precision="tf32x3")
-    
-    if TENSORWISE:
-        a_scale_inv = tl.load(a_scale_inv_ptr)
-        b_scale_inv = tl.load(b_scale_inv_ptr)
-        acc = (acc * a_scale_inv) * b_scale_inv
+            # Each CTA owns its partial tile; every valid element is overwritten on
+            # every invocation. No clearing or nondeterministic atomics are needed.
+            addresses = (tl.program_id(1) * M * OUTPUT_STRIDE
+                         + rows[:, None] * OUTPUT_STRIDE + cols[None, :])
+            tl.store(partials_ptr + addresses, acc, mask=(rows[:, None] < M) & (cols[None, :] < N))
 
-    if HAS_BIAS and SPLIT_K == 1:
-        cols = start_n + tl.arange(0, BLOCK_N)
-        bias = tl.load(bias_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
-        acc = acc + bias[None, :]
-    
-    if SPLIT_K == 1:
-        if GRADIENT_FP8:
-            valid = (rows[:, None] < M) & (cols[None, :] < N)
-            acc = _gradient_tile(acc, rows, cols, valid, gradient_scale, gradient_inverse, gradient_observations,
-                                 M, N, BLOCK_M, BLOCK_N, GRAD_BR, GRAD_BC, GRAD_MAXIMUM, GRAD_CURRENT, GRAD_OBSERVE)
-        if GRADIENT_FP8:
-            c_desc.store([start_m, start_n], acc.to(OUTPUT_DTYPE, fp_downcast_rounding="rtne"))
-        else:
-            c_desc.store([start_m, start_n], acc.to(OUTPUT_DTYPE))
-    else:
-        # Each CTA owns its partial tile; every valid element is overwritten on
-        # every invocation. No clearing or nondeterministic atomics are needed.
-        addresses = (tl.program_id(1) * M * OUTPUT_STRIDE
-                     + rows[:, None] * OUTPUT_STRIDE + cols[None, :])
-        tl.store(partials_ptr + addresses, acc, mask=(rows[:, None] < M) & (cols[None, :] < N))
 
+
+@triton.jit
+def _pack_transposed_rows(source_ptr, target_ptr, ROWS: tl.constexpr, COLS: tl.constexpr,
+                          PADDED_COLS: tl.constexpr, STRIDE_M: tl.constexpr, STRIDE_N: tl.constexpr,
+                          TILE: tl.constexpr):
+    # Read contiguous source columns, then exchange lanes for contiguous output
+    # stores. The generic flat gather scatters reads for transposed FP8 views.
+    rows = tl.program_id(0).to(tl.int64) * TILE + tl.arange(0, TILE)
+    cols = tl.program_id(1).to(tl.int64) * TILE + tl.arange(0, TILE)
+    values = tl.load(source_ptr + rows[None, :] * STRIDE_M + cols[:, None] * STRIDE_N,
+                     (rows[None, :] < ROWS) & (cols[:, None] < COLS), other=0.0)
+    tl.store(target_ptr + rows[:, None] * PADDED_COLS + cols[None, :], tl.trans(values),
+             (rows[:, None] < ROWS) & (cols[None, :] < PADDED_COLS))
 
 
 @triton.jit
@@ -211,26 +247,32 @@ def _pack_rows(source_ptr, target_ptr, ROWS, COLS, PADDED_COLS, STRIDE_M, STRIDE
     tl.store(target_ptr + offsets, values, mask=offsets < ROWS * PADDED_COLS)
 
 
-def _pack_fp8_rows(data: torch.Tensor, block_k: int) -> torch.Tensor:
+def _pack_fp8_rows(data: torch.Tensor, block_k: int, *, implementation="auto") -> torch.Tensor:
     """
     Make FP8 rows contiguous and pad K with zeros
     """
 
     rows, cols = data.shape
+    if implementation not in ("auto", "flat", "tiled"):
+        raise ValueError("FP8 row packing implementation must be auto, flat, or tiled")
     padded_cols = triton.cdiv(cols, block_k) * block_k
 
     if (data.stride(1) == 1 and data.stride(0) >= cols
             and data.stride(0) % block_k == 0 and data.data_ptr() % 16 == 0):
         return data
-    
+
     packed = torch.empty(
         (rows, padded_cols),
         device=data.device, dtype=data.dtype
     )
     # One strided copy/padding kernel writes every byte; aligned copies need
     # neither a preliminary zero-fill nor a separate torch copy launch.
-    _pack_rows[(triton.cdiv(rows * padded_cols, 1024),)](
-        data, packed, rows, cols, padded_cols, *data.stride(), BLOCK=1024)
+    if implementation == "tiled" or (implementation == "auto" and data.stride(0) == 1 and min(rows, cols) >= 32):
+        _pack_transposed_rows[(triton.cdiv(rows, 32), triton.cdiv(padded_cols, 32))](
+            data, packed, rows, cols, padded_cols, *data.stride(), TILE=32, num_warps=4)
+    else:
+        _pack_rows[(triton.cdiv(rows * padded_cols, 1024),)](
+            data, packed, rows, cols, padded_cols, *data.stride(), BLOCK=1024)
     return packed
 
 
@@ -244,6 +286,7 @@ def gemm_nt(
     out_dtype: torch.dtype = torch.float32,
     bias: torch.Tensor | None = None,
     num_stages: int | str = "auto",
+    autotune: bool = True,
     gradient_output=None,
 ) -> torch.Tensor:
 
@@ -254,9 +297,11 @@ def gemm_nt(
     dequantize tiles to FP32 before a TF32x3 dot, retaining the stored FP8
     values and their scales without additional FP8 rounding.
     """
-    
+
+    if type(autotune) is not bool:
+        raise ValueError("autotune must be a boolean")
     if gradient_output is not None and not gradient_output.can_fuse(a.data, bm=64, bn=32):
-        value = gemm_nt(a, b, out_dtype=torch.float32, bias=bias, num_stages=num_stages)
+        value = gemm_nt(a, b, out_dtype=torch.float32, bias=bias, num_stages=num_stages, autotune=autotune)
         return gradient_output.convert(value, matrix=True)
     if gradient_output is not None:
         out_dtype = gradient_output.dtype
@@ -274,7 +319,7 @@ def gemm_nt(
         raise ValueError("Operands must have the same reduction dimension")
     if num_stages != "auto" and (type(num_stages) is not int or num_stages not in AUTOTUNE_STAGES):
         raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
-    
+
     output_types = {
         torch.float32 : tl.float32,
         torch.bfloat16 : tl.bfloat16,
@@ -287,7 +332,7 @@ def gemm_nt(
 
     m, k = a.data.shape
     n, _ = b.data.shape
-    
+
     if bias is not None:
         if bias.device != a.data.device:
             raise ValueError("Bias must be on the operands' device")
@@ -326,7 +371,13 @@ def gemm_nt(
                                 str(bias.dtype) if bias is not None else None)
         padded_n = plan.output_stride
         cache_key = plan.cache_key + ("torch.float32",) * 3 if gradient_output is not None else plan.cache_key
-        cached = selected_config(_gemm_nt_kernel, cache_key)
+        cached = (selected_config(_gemm_nt_kernel, cache_key) if autotune else
+                  _fixed_config(a.block_shape, b.block_shape, num_stages))
+        capture_baseline = bool(cached is None and torch.cuda.is_current_stream_capturing())
+        if capture_baseline:
+            # A cold graph must never synchronize or launch an autotuning
+            # benchmark. This call's fixed choice is not a measured winner.
+            cached = _fixed_config(a.block_shape, b.block_shape, num_stages)
         bm, bn, bk = ((cached.kwargs[name] for name in ("BLOCK_M", "BLOCK_N", "BLOCK_K"))
                       if cached is not None else (64, 64, 32))
         # Fresh descriptors bind this call's storage; cached layouts retain no
@@ -342,7 +393,8 @@ def gemm_nt(
 
         bias_arg = output_storage if bias is None else bias.contiguous()
         def grid(meta):
-            return (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]), meta["SPLIT_K"])
+            return gemm_program_grid(m, n, meta["BLOCK_M"], meta["BLOCK_N"],
+                                     meta["SPLIT_K"], num_sms, meta.get("PERSISTENT", False))
 
         launch_args = {**plan.arguments, "OUTPUT_DTYPE": output_types[out_dtype], **extra}
         # A dummy FP32 pointer keeps the implicit dtype key identical with and
@@ -360,13 +412,25 @@ def gemm_nt(
                 raise RuntimeError("Triton winner is missing from the per-key autotune cache")
         else:
             launch_selected(_gemm_nt_kernel, cached, positional, launch_args, grid(cached.kwargs))
-        _gemm_nt_kernel.cache[cache_key] = cached
+        if autotune and not capture_baseline:
+            _gemm_nt_kernel.cache[cache_key] = cached
         if cached.kwargs["SPLIT_K"] > 1:
             _finish_gemm({**launch_args, **cached.kwargs,
                           "partials_ptr": partials, "output_ptr": output_storage,
                           "bias_ptr": bias_arg, "M": m, "N": n})
+        from deepopt.opt.backends._shared.gemm_diagnostics import note_gemm_launch, gemm_launch_is_recording
+        if gemm_launch_is_recording():
+            note_gemm_launch(
+                kind="triton_tma", schedule="persistent" if cached.kwargs.get("PERSISTENT", False) else "nonpersistent",
+                tile=tuple(cached.kwargs[name] for name in ("BLOCK_M", "BLOCK_N", "BLOCK_K")),
+                warps=cached.num_warps, stages=cached.num_stages, split_k=cached.kwargs["SPLIT_K"],
+                group_size_m=cached.kwargs["GROUP_SIZE_M"], grid=grid(cached.kwargs), autotune=autotune,
+                selection="capture_baseline" if capture_baseline else "measured" if autotune else "fixed",
+                operand_copy_bytes=sum(p.numel() * p.element_size() for p, q in ((a_packed, a.data), (b_packed, b.data)) if p is not q),
+                scratch_bytes=partials.numel() * partials.element_size() if splits > 1 else 0,
+            )
         if gradient_output is not None:
             gradient_output.observation_count = (triton.cdiv(m, cached.kwargs["BLOCK_M"]) * triton.cdiv(n, cached.kwargs["BLOCK_N"])
                                                  if cached.kwargs["SPLIT_K"] == 1 else triton.cdiv(m * n, 256))
-    
+
     return gradient_output.wrap(output) if gradient_output is not None else output

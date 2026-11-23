@@ -9,12 +9,33 @@ biases have that complete suffix shape, including multidimensional shapes.
 Statistics and CUDA backward reductions use FP32; CPU FP64 provides a numerical
 oracle. FP8 describes stored activation/gradient values, not the statistics.
 
-Set `runtime.activation_compression.norm_xhat_recenter = true` to enable
-[fused mean correction](README.md#compressed-xhat-mean-correction) for decoded
-xhat. Row packing finishes the shift inline; chunked packing reduces bounded
-error/count partials. Every xhat-consuming backward path loads original rstd
-and applies the same shift, including weight-only backward and FP8 dx paths.
-The default is off; outputs and codec payloads stay unchanged.
+Whenever activation compression is enabled, LayerNorm **always** centers decoded
+xhat and restores the second moment measured from the original pre-affine xhat.
+This includes `norm_xhat_recenter = false`; that option controls BatchNorm and
+GroupNorm. There is no LayerNorm correction switch.
+
+For each row, the correction is
+`z = decoded - mean(decoded)` and
+`corrected = z * sqrt(mean(original_xhat**2) / max(mean(z**2), 1e-12))`.
+A constant decoded row reconstructs zeros because its direction is unrecoverable.
+Measuring the target during forward respects the module's actual epsilon and
+avoids cancellation in `1 - eps * rstd**2` near zero variance.
+
+Row packing computes these statistics in registers with no extra launch. Wide
+rows use bounded partial counts, means, centered M2 and original squared sums,
+then deterministic merges. The saved correction uses two FP32 values per row
+(mean and gain), without a dense xhat copy. Both input-gradient and affine-weight
+reductions use exactly this corrected representation, including weight-only,
+fused/tiled, and FP8 dx paths. Forward outputs and packed payloads are unchanged.
+
+Execution reports expose `layer_norm_xhat_moment_correction`, `moment_state_bytes`
+(gain bytes, in addition to `recenter_state_bytes`), `moment_launches` and
+`moment_scratch_bytes`. Bias-only backward and inference save no correction state.
+Changing-value CUDA graph replay updates both statistics on the device.
+
+Compression-enabled checkpoints carry a numerical recipe version. Exact resume
+rejects older or missing recipes before loading state; use the original library
+to continue an old run, or load model weights to start a new run.
 
 ## Functional and module APIs
 

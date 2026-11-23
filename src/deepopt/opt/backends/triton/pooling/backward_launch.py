@@ -5,11 +5,12 @@ from math import prod
 import torch
 import triton
 
-from .window.backward import _backward as _input_gradient
+from .window.backward import _backward as _input_gradient,_max_pool3x3_backward
 from .common.launch import kernel_geometry, candidate_count, can_inline
 from ....nn.activation.geometry import ReLUGeometry, tensor_arguments
 from ....quantization.indices import PackedIndices
 from ....quantization.activation import PackedActivation
+from ..._shared.pooling import resnet_maxpool
 
 
 def backward(gradient, g, **options):
@@ -39,13 +40,23 @@ def _backward(gradient, g, *, routing, coefficient, factor, samples, coefficient
         br_a = bc_a = 0
         group, words, bits = 1, 1, 2
     fused = out is not None and can_inline(rows, cols, out.block_shape, out.scale, out.checked)
+    specialized=resnet_maxpool(g)
+    block=128 if specialized else 32
     if fused:
-        out.allocate(rows, cols, gradient.device, triton.cdiv(rows * cols, 32))
+        out.allocate(rows, cols, gradient.device, triton.cdiv(rows * cols, block))
     dtype = out.dtype if fused else torch.float32 if out is not None else input_dtype
     values = torch.empty(target.matrix_shape, device=gradient.device, dtype=dtype)
     br, bc = (out.block_shape or (rows, cols)) if out is not None else (1, 1)
     candidates = candidate_count(g)
-    _input_gradient[(triton.cdiv(values.numel(), 32),)](
+    if specialized:
+        _max_pool3x3_backward[(triton.cdiv(values.numel(),block),)](
+            dy,dy_inverse,route,values,out.scale if fused and out.scale is not None else dy,out.inverse if fused else dy,
+            out.observations if fused and out.observations is not None else dy,g.shape,g.output_shape,dy_meta,
+            target.layout=="channels",g.layout=="channels",values.numel(),*g.input_spatial[-2:],*g.output_spatial[-2:],route_bits,
+            rows,cols,br,bc,fused,fused and out.scale is None,fused and out.observations is not None,
+            torch.finfo(out.dtype).max if fused else 0.,block,num_warps=4,enable_fp_fusion=False)
+    else:
+        _input_gradient[(triton.cdiv(values.numel(), 32),)](
         dy, dy_inverse, route, a, step, low, factor if factor is not None else dy,
         samples.contiguous() if samples is not None else dy, values,
         out.scale if fused and out.scale is not None else dy, out.inverse if fused else dy,
@@ -57,7 +68,7 @@ def _backward(gradient, g, *, routing, coefficient, factor, samples, coefficient
         fused and out.observations is not None, False, torch.finfo(out.dtype).max if fused else 0.0,
         min(128, triton.next_power_of_2(candidates)), num_warps=4, enable_fp_fusion=False)
     info = dict(backward_launches=1, backward_workspace_dtype="torch.float32" if out is not None and not fused else None,
-                deterministic_strategy="input_owned_gather")
+                deterministic_strategy="input_owned_gather",backward_variant="max_pool3x3" if specialized else "generic")
     if execution_info is not None:
         execution_info.update(info)
     if out is not None:

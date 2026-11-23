@@ -47,6 +47,77 @@ class DistributedExampleBlackBoxTests(unittest.TestCase):
             self.assertEqual(payload["distributed"]["world_size"], 2)
             self.assertEqual(len(payload["distributed"]["ranks"]), 2)
 
+    def test_step_progress_renders_only_on_rank_zero_with_real_ddp_updates(self):
+        code = '''
+import gc
+import json
+from unittest.mock import patch
+
+import torch
+from torch import nn
+from torchmetrics import MeanSquaredError
+import tqdm.auto
+
+from deepopt import Trainer, initialize_distributed, shutdown_distributed
+
+
+def run(context):
+    model = nn.Linear(1, 1, bias=False).to(context.device)
+    nn.init.ones_(model.weight)
+    trainer = Trainer(model, torch.optim.SGD(model.parameters(), lr=0.1),
+                      device=context.device, loss_fn=nn.functional.mse_loss,
+                      accumulation_steps=2, metrics={"mse": MeanSquaredError()})
+    batches = [(torch.full((2, 1), float(context.global_rank + 1)), torch.zeros(2, 1))] * 3
+    real_tqdm, created, reports, epochs = tqdm.auto.tqdm, [], [], []
+
+    def progress(**options):
+        created.append(options)
+        bar = real_tqdm(**options)
+        original = bar.set_postfix
+
+        def postfix(values, **kwargs):
+            reports.append(dict(values))
+            return original(values, **kwargs)
+
+        bar.set_postfix = postfix
+        return bar
+
+    with patch("tqdm.auto.tqdm", side_effect=progress):
+        trainer.fit(batches, epochs=1, progress_bar_every_steps=2,
+                    callbacks=[lambda _, row: epochs.append(row)])
+    assert len(created) == (1 if context.is_main_process else 0)
+    if created:
+        assert created[0]["total"] == 2
+        assert created[0]["unit"] == "step"
+        assert reports[0]["train/loss"] == 1.875
+        assert reports[0]["train/mse"] == 1.875
+        assert reports[0]["optimizer_step"] == 2
+    assert trainer.state.optimizer_steps == 2
+    assert epochs[0]["train"]["loss"] == 1.875
+    assert epochs[0]["train"]["mse"] == 1.875
+    torch.testing.assert_close(model.weight, torch.full_like(model.weight, 0.25))
+    print(json.dumps({"rank": context.global_rank, "bars": len(created),
+                      "steps": trainer.state.optimizer_steps}), flush=True)
+
+
+context = initialize_distributed("cpu")
+try:
+    run(context)
+finally:
+    gc.collect()
+    shutdown_distributed()
+'''
+        environment = {**os.environ, "PYTHONPATH": str(ROOT / "src"),
+                       "OMP_NUM_THREADS": "1", "DEEPOPT_LOGGING_LEVEL": "WARNING"}
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "step_progress.py"
+            script.write_text(code)
+            result = run_torchrun([str(script)], env=environment, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = sorted((json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")),
+                      key=lambda row: row["rank"])
+        self.assertEqual(rows, [{"rank": 0, "bars": 1, "steps": 2}, {"rank": 1, "bars": 0, "steps": 2}])
+
     def test_documented_fp8_ddp_core_snippet(self):
         documentation = (ROOT / "docs/fp8/README.md").read_text(encoding="utf-8")
         section = documentation.split("## Train with the DDP core", 1)[1].split("\n## ", 1)[0]

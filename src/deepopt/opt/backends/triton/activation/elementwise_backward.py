@@ -5,6 +5,7 @@ import triton.language as tl
 
 from .common import _load
 from ..quantization.fp8 import _scale
+from .math import _evaluate
 
 
 @triton.jit
@@ -40,7 +41,8 @@ def _activation_backward(data, inverse, saved, steps, minima, output, scale, out
                          GROUP: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr, WORDS: tl.constexpr,
                          BITS: tl.constexpr, MASK: tl.constexpr, PACKED: tl.constexpr,
                          FP8: tl.constexpr, CURRENT: tl.constexpr, OBR: tl.constexpr, OBC: tl.constexpr,
-                         OBSERVE: tl.constexpr, MAXIMUM: tl.constexpr, BLOCK: tl.constexpr):
+                         OBSERVE: tl.constexpr, MAXIMUM: tl.constexpr, BLOCK: tl.constexpr,
+                         RECOMPUTE: tl.constexpr = False, KIND: tl.constexpr = "gelu", APPROXIMATE: tl.constexpr = "none"):
     pid = tl.program_id(0).to(tl.int64)
     offset = tl.arange(0, BLOCK)
     if FP8 and CURRENT:
@@ -54,8 +56,12 @@ def _activation_backward(data, inverse, saved, steps, minima, output, scale, out
     logical = (row // S * C + col) * S + row % S if CHANNELS else row * COLS + col
     saved_index = ((logical // (C * S) * S + logical % S) * C + logical // S % C
                    if SAVED_CHANNELS else logical)
-    coefficient = _coefficient(saved, steps, minima, saved_index, valid, SAVED_COLS,
-                               GROUP, BR, BC, WORDS, BITS, MASK, PACKED)
+    if RECOMPUTE:
+        original = tl.load(saved + saved_index, valid, other=0).to(tl.float32)
+        _, coefficient = _evaluate(original, KIND, APPROXIMATE)
+    else:
+        coefficient = _coefficient(saved, steps, minima, saved_index, valid, SAVED_COLS,
+                                   GROUP, BR, BC, WORDS, BITS, MASK, PACKED)
     _, dy = _load(data, inverse, row, col, valid, COLS, SHAPE, CHANNELS, META)
     dx = tl.where(coefficient != 0, dy, 0.0) if MASK else dy * coefficient
     dx = tl.where(valid, dx, 0.0)

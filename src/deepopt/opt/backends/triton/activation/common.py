@@ -34,7 +34,7 @@ def _address(row, col, COLS: tl.constexpr, SHAPE: tl.constexpr, CHANNELS: tl.con
 def _load(data, inverse, row, col, valid, COLS: tl.constexpr, SHAPE: tl.constexpr,
           CHANNELS: tl.constexpr, META: tl.constexpr):
     address, sr, sc = _address(row, col, COLS, SHAPE, CHANNELS, META)
-    raw = tl.load(data + address, valid, other=0).to(tl.float32)
+    raw = tl.load(data + address, valid, other=0.0).to(tl.float32)
     if META[0] > 0:
         scale = tl.load(inverse + sr // META[8] * META[10] + sc // META[9] * META[11], valid, other=0)
         return raw, raw * scale

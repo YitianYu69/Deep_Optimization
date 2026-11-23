@@ -1,12 +1,15 @@
-include README.md LICENSE pyproject.toml
+include README.md LICENSE pyproject.toml AGENTS.md
 recursive-include src *.py
 recursive-include src/deepopt/configs *.toml
 recursive-include tests *.py *.md
 recursive-include docs *.md
 recursive-include examples *.py *.md
+include examples/vae/*.toml examples/vae/packed_memory_tiled16.json examples/vae/run_VAE.sh
 recursive-include configs *.toml
 recursive-include benchmarks *.py *.md
+include benchmarks/analysis/configs/*.json benchmarks/analysis/*.sh
 recursive-include scripts *.py
+include scripts/*.sh
 prune build
 prune dist
 prune logs
@@ -18,4 +21,8 @@ prune .git
 prune .mypy_cache
 prune .ruff_cache
 prune .pytest_cache
+prune compiler_references
+include compiler_references/inductor/README.md
+prune torch_compile_debug
+prune examples/vae/inductor_vae_v2_b16_224_*
 global-exclude __pycache__ *.py[cod] *.pt *.pth *.log .DS_Store

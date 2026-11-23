@@ -140,7 +140,8 @@ def environment(args):
               "torch_git": torch.version.git_version, "cuda": torch.version.cuda,
               "hip": torch.version.hip, "cuda_available": torch.cuda.is_available(), "packages": {},
               "environment_flags": {key: os.environ.get(key) for key in
-                                    ("CUBLAS_WORKSPACE_CONFIG", "TRITON_DEFAULT_FP_FUSION", "TRITON_CACHE_DIR")}}
+                                    ("CUBLAS_WORKSPACE_CONFIG", "TRITON_DEFAULT_FP_FUSION", "TRITON_CACHE_DIR",
+                                     "PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")}}
     for name in ("deepopt", "torchao", "triton"):
         try:
             module = importlib.import_module(name)
@@ -157,6 +158,13 @@ def environment(args):
         properties = torch.cuda.get_device_properties(args.device)
         result.update(gpu=properties.name, capability=list(torch.cuda.get_device_capability(args.device)),
                       total_memory_bytes=properties.total_memory, multiprocessors=properties.multi_processor_count)
+        result["gpu_uuid"] = str(getattr(properties, "uuid", "unavailable"))
+        try:
+            identity = subprocess.run(["nvidia-smi", "--query-gpu=uuid,driver_version", "--format=csv,noheader"],
+                                      capture_output=True, text=True, timeout=5)
+            result["driver_identity"] = identity.stdout.strip() if identity.returncode == 0 else "unavailable"
+        except (OSError, subprocess.TimeoutExpired):
+            result["driver_identity"] = "unavailable"
     return result
 
 
@@ -739,7 +747,14 @@ def run_case(session, args, directory, row=None, checkpoint=lambda: None):
 def worker(payload):
     args = argparse.Namespace(**payload["settings"])
     directory = Path(payload["directory"])
-    report = {"report_version": REPORT_VERSION, "run_id": payload["run_id"], "status": "running", "cases": []}
+    previous = {}
+    if args.resume and (directory / "result.json").is_file():
+        try:
+            previous = json.loads((directory / "result.json").read_text())
+        except (ValueError, OSError):
+            pass
+    report = {"report_version": REPORT_VERSION, "run_id": payload["run_id"], "status": "running", "cases": [],
+              "resume_key": payload.get("resume_key")}
     if args.deterministic:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     report["environment"] = env = environment(args)
@@ -776,32 +791,65 @@ def worker(payload):
                           "format": args.format, "optimizer_updates": args.optimizer_updates,
                           "deepopt_backward_backend": args.backward_backend,
                           "accumulation": args.accumulation, "workload": "forward_backward_adamw" if args.optimizer_updates else "forward_backward_fixed_weights"}
-    for case in cases(args, batch):
-        print(f"Running {implementation}/{policy}/b{batch}/{case['projection']}", flush=True)
-        row = {**case, "status": "running"}
-        report["cases"].append(row)
-        checkpoint = lambda: write_json(directory / "result.json", report)
-        checkpoint()
-        try:
-            session = Session(args, implementation, policy, case, torch)
-            run_case(session, args, directory, row, checkpoint)
-        except Exception as error:
-            row.update(status="error", error=repr(error), traceback=traceback.format_exc())
-        finally:
-            if "session" in locals():
-                del session
-            gc.collect()
-            torch.cuda.empty_cache()
+    with packing_policy(args, implementation):
+        retained = {}
+        if (previous.get("resume_key") == payload.get("resume_key")
+                and environment_signature(previous) == environment_signature(report)):
+            retained = {row["projection"]: row for row in previous.get("cases", []) if reusable_case(row, args, directory)}
+        report["cases"] = [{**row, "resumed": True} for row in retained.values()]
+        for case in cases(args, batch):
+            if case["projection"] in retained:
+                write_json(directory / "result.json", report)
+                continue
+            print(f"Running {implementation}/{policy}/b{batch}/{case['projection']}", flush=True)
+            row = {**case, "status": "running"}
+            report["cases"].append(row)
+            checkpoint = lambda: write_json(directory / "result.json", report)
+            checkpoint()
+            try:
+                session = Session(args, implementation, policy, case, torch)
+                run_case(session, args, directory, row, checkpoint)
+            except Exception as error:
+                row.update(status="error", error=repr(error), traceback=traceback.format_exc())
+            finally:
+                if "session" in locals():
+                    del session
+                gc.collect()
+                torch.cuda.empty_cache()
+            write_json(directory / "result.json", report)
+        report["status"] = "ok" if all(row["status"] == "ok" for row in report["cases"]) else "partial"
         write_json(directory / "result.json", report)
-    report["status"] = "ok" if all(row["status"] == "ok" for row in report["cases"]) else "partial"
-    write_json(directory / "result.json", report)
 
 
 def environment_signature(job):
     env = job.get("environment", {})
-    return ([env.get(key) for key in ("torch", "cuda", "gpu", "capability")],
+    return ([env.get(key) for key in ("torch", "cuda", "gpu", "capability", "gpu_uuid", "driver_identity")],
+            {key: env.get("environment_flags", {}).get(key) for key in
+             ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")},
             {name: (value.get("version"), value.get("source", {}).get("sha256"))
              for name, value in env.get("packages", {}).items()})
+
+
+def reusable_case(row, args, directory=Path(".")):
+    if row.get("status") != "ok":
+        return False
+    trace = (row.get("profile") or {}).get("trace")
+    return not (args.profile_steps and args.trace) or bool(trace and (directory / trace).is_file())
+
+
+@contextmanager
+def packing_policy(args, implementation):
+    if not implementation.startswith("deepopt") or args.packing == "auto":
+        yield
+        return
+    module = _deepopt_module("deepopt.opt.backends.triton.gemm.fp8", "deepopt.opt.backends.triton.fp8")
+    original = module._pack_fp8_rows
+
+    def pack(data, block_k):
+        return original(data, block_k, implementation=args.packing)
+
+    with patch.object(module, "_pack_fp8_rows", new=pack):
+        yield
 
 
 def fp32_products_observed(row):
@@ -876,6 +924,14 @@ def save_report(directory, report):
 def bundle(directory, run_id):
     destination = Path(str(directory) + ".zip")
     paths = [directory / "summary.json", directory / "summary.csv", *(directory / run_id).rglob("*")]
+    try:
+        report = json.loads((directory / "summary.json").read_text())
+    except (ValueError, OSError):
+        report = {}
+    for job in report.get("results", []):
+        relative = Path(job.get("artifacts", "__missing__"))
+        if not relative.is_absolute() and ".." not in relative.parts:
+            paths.extend((directory / relative).rglob("*"))
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in paths:
             if path.is_file():
@@ -909,6 +965,12 @@ def run(args):
         return result
 
     report["preflight"] = launch({"check": True}, directory / run_id / "preflight")
+    identity = {"settings": {k:v for k,v in settings.items() if k != "resume"},
+                "script": report["script_sha256"], "environment": environment_signature(report["preflight"]),
+                "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+    if report["preflight"].get("environment", {}).get("driver_identity", "unavailable") in (None, "", "unavailable"):
+        identity["unverified_run_nonce"] = run_id
+    resume_key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     save_report(directory, report)
     for name, item in report["preflight"].get("environment", {}).get("packages", {}).items():
         if item["status"] != "ok":
@@ -918,9 +980,10 @@ def run(args):
             for implementation in args.implementations:
                 for policy in args.math_policies:
                     for batch in args.batches:
-                        destination = directory / run_id / f"{implementation}-{policy}-b{batch}"
+                        destination = directory / "jobs" / resume_key / f"{implementation}-{policy}-b{batch}"
                         print(f"Starting {implementation} / {policy} / batch {batch}; log: {destination / 'worker.log'}", flush=True)
-                        payload = {"implementation": implementation, "math_policy": policy, "batch": batch}
+                        payload = {"implementation": implementation, "math_policy": policy, "batch": batch,
+                                   "resume_key": resume_key}
                         if args.cold_cache:
                             with tempfile.TemporaryDirectory(prefix="deepopt-linear-cache-") as cache, patch.dict(os.environ, TRITON_CACHE_DIR=cache):
                                 result = launch(payload, destination)
@@ -954,6 +1017,7 @@ def parser():
     result.add_argument("--num-stages", choices=("auto", "1", "2", "3", "4", "5"), default="3")
     result.add_argument("--backward-backend", choices=("inherit", "native_fast", "native_precise"), default="inherit",
                         help="DeepOpt dX/dW executor; forward stays Triton. Native policies change accumulation.")
+    result.add_argument("--packing", choices=("auto", "flat", "tiled"), default="auto", help="Explicit FP8 layout A/B control; flat/tiled need the updated library")
     result.add_argument("--history-length", type=int, default=1024)
     result.add_argument("--amax-algorithm", choices=("max", "most_recent"), default="max")
     result.add_argument("--margin", type=int, default=0)
@@ -977,8 +1041,21 @@ def parser():
     result.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=True)
     result.add_argument("--cold-cache", action="store_true", help="Isolate Triton disk caches; default reuses the installed environment's cache.")
     result.add_argument("--check", action="store_true", help="Only inspect dependencies/CUDA; no benchmark kernels run.")
+    result.add_argument("--resume", action="store_true", help="Reuse completed matching projections; retry incomplete/failed projections")
     result.add_argument("--_worker", help=argparse.SUPPRESS)
     return result
+
+
+def _lease_cli(args, argv=None):
+    if __name__ != "__main__" or not getattr(args, "device", "cuda:0").startswith("cuda"):
+        return None
+    import runpy
+    bootstrap = Path(__file__).with_name("_gpu_lease.py")
+    if not bootstrap.is_file():
+        bootstrap = Path(__file__).resolve().parents[1] / "_gpu_lease.py"
+    if not bootstrap.is_file():
+        raise SystemExit("Keep _gpu_lease.py and analysis/ beside GPU benchmark programs")
+    return runpy.run_path(str(bootstrap))["ensure"](__file__, argv, getattr(args, "device", "cuda:0"))
 
 
 def main():
@@ -1003,6 +1080,9 @@ def main():
             or not math.isfinite(args.weight_decay) or args.weight_decay < 0):
         command.error("Invalid shapes, measurement counts, recipe or optimizer settings")
     args.num_stages = args.num_stages if args.num_stages == "auto" else int(args.num_stages)
+    lease_code = _lease_cli(args)
+    if lease_code is not None:
+        return lease_code
     report = run(args)
     if (not report["preflight"].get("environment", {}).get("cuda_available")
             or (args.check and report["preflight"]["status"] != "ok")
@@ -1011,4 +1091,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

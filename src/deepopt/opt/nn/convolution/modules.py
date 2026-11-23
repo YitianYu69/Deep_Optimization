@@ -43,7 +43,13 @@ class _DOConv(CachedWeightModule):
     def forward(self, input):
         padding = self.padding
         if self.padding_mode != "zeros":
-            input = F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode)
+            compression = self.plan.get("fp8_training", self.plan)["activation_compression"]
+            if compression["enabled"]:
+                from ..functional import do_pad
+
+                input = do_pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode)
+            else:
+                input = F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode)
             padding = (0,) * self.rank
         self.last_execution = {}
         function = (do_conv1d, do_conv2d, do_conv3d)[self.rank - 1]

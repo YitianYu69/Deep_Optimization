@@ -176,7 +176,8 @@ class UnifiedLinearTests(unittest.TestCase):
         original = deepcopy(plan)
         config["runtime"]["activation_compression"]["group_size"] = 1
         self.assertEqual(plan, original)
-        self.assertEqual(plan, {"fp8": False, "activation_compression": {
+        self.assertEqual(plan, {"fp8": False, "bf16_policy": {"name": "torch_amp", "version": 1},
+                                "activation_compression": {
             "enabled": True, "group_size": 17, "bits": 2, "attention_bits": None, "norm_xhat_recenter": False}})
         for _ in range(2):
             def call(x, weight, bias):

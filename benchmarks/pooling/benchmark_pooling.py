@@ -11,6 +11,14 @@ from statistics import median
 from time import perf_counter
 
 
+OPERATIONS = tuple(
+    f"{prefix}{rank}d"
+    for rank in (1, 2, 3)
+    for prefix in ("max_pool", "avg_pool", "adaptive_max_pool", "adaptive_avg_pool", "lp_pool", "max_unpool",
+                   *(("fractional_max_pool",) if rank > 1 else ()))
+)
+
+
 def dimensions(text):
     try:
         result = tuple(int(v) for v in text.lower().split("x"))
@@ -21,21 +29,9 @@ def dimensions(text):
     return result
 
 
-def main():
-    import torch
-    from torch import nn
-    import deepopt
-    from deepopt.opt.nn import functional as D
-    from deepopt.opt.nn.pooling.spec import SPECS, MODULE_SPECS
-    from deepopt.opt.nn.pooling.geometry import geometry
-    from deepopt.opt.policy import prepare_fp8_model
-    from deepopt.opt.precision import precision_report
-    from deepopt.opt.quantization.activation_tensor import to_fp8_activation, dequantize_activation
-    from deepopt.opt.scaling.delayed import DelayedScalingState
-    from deepopt.opt._execution import finite_check_scope
-
+def parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--op", choices=tuple(SPECS), default="max_pool2d")
+    parser.add_argument("--op", choices=OPERATIONS, default="max_pool2d")
     parser.add_argument("--shape", type=dimensions)
     parser.add_argument("--kernel-size", type=dimensions, default=(2,))
     parser.add_argument("--stride", type=dimensions)
@@ -58,26 +54,67 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--autotune", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--time-budget", type=float, default=2.0, help="Warm timing target per variant in seconds; 0 uses exhaustive counts")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--deepopt-backend", choices=("triton", "tilelang", "mixed"), default="triton")
+    parser.add_argument("--deepopt-kernel-policy", type=json.loads, default={},
+                        help="JSON runtime.kernels policy; its backend must match --deepopt-backend")
+    parser.add_argument("--qualify-tilelang", action="store_true", help="Opt into independent deterministic isolated pooling qualification")
+    parser.add_argument("--compression", choices=("off", "on", "both"), default="both")
     parser.add_argument("--seed", type=int, default=14)
     parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    arguments = parser()
+    args = arguments.parse_args()
+    if args.qualify_tilelang and (args.pipeline != "none" or args.scaling_recipe != "current"
+            or not args.op.startswith(("max_pool", "avg_pool", "adaptive_max_pool", "adaptive_avg_pool"))):
+        arguments.error("--qualify-tilelang requires isolated current-scaling deterministic max/average pooling")
+    rank = int(args.op[-2])
+    if args.shape is not None and len(args.shape) != rank + 2:
+        arguments.error("--shape must be batched N,C followed by the operation's spatial dimensions")
+    if min(args.group_size, args.iterations, args.repeats) <= 0 or args.warmup < 0:
+        arguments.error("counts must be positive; warmup may be zero")
+    if args.fp8_block is not None and len(args.fp8_block) != 2:
+        arguments.error("--fp8-block requires two dimensions")
+    if args.execution != "eager" and not args.device.startswith("cuda"):
+        arguments.error("graph timing requires a CUDA device")
+    if args.execution != "eager" and args.scaling_recipe == "delayed":
+        arguments.error("delayed scaling requires eager full-step execution")
+    if args.scaling_recipe == "delayed" and args.fp8_block is not None:
+        arguments.error("delayed scaling requires tensorwise blocks")
+    if args.return_indices and not args.op.startswith(("max_pool", "adaptive_max_pool", "fractional_max_pool")):
+        arguments.error("--return-indices requires maximum pooling")
+
+    from deepopt._benchmarking import BenchmarkBackend, timing_plan_from_cost
+    try:
+        selection = BenchmarkBackend.from_args(args)
+        timing_plan_from_cost(args, 0.0)
+    except (TypeError, ValueError) as error:
+        arguments.error(str(error))
+    with selection.scope():
+        return run(args, arguments, selection)
+
+
+def run(args, arguments, selection):
+    kernel_config = selection.config
+    import torch
+    from torch import nn
+    import deepopt
+    from deepopt.opt.nn import functional as D
+    from deepopt.opt.nn.pooling.spec import SPECS, MODULE_SPECS
+    from deepopt.opt.nn.pooling.geometry import geometry
+    from deepopt.opt.policy import prepare_fp8_model
+    from deepopt.opt.precision import precision_report
+    from deepopt.opt.quantization.activation_tensor import to_fp8_activation, dequantize_activation
+    from deepopt.opt.scaling.delayed import DelayedScalingState
+    from deepopt.opt._execution import finite_check_scope
+
     spec = SPECS[args.op]
     shape = args.shape or (8, 32) + (16,) * spec.rank
-    if len(shape) != spec.rank + 2:
-        parser.error("--shape must be batched N,C followed by the operation's spatial dimensions")
-    if min(args.group_size, args.iterations, args.repeats) <= 0 or args.warmup < 0:
-        parser.error("counts must be positive; warmup may be zero")
-    if args.fp8_block is not None and len(args.fp8_block) != 2:
-        parser.error("--fp8-block requires two dimensions")
-    if args.execution != "eager" and not args.device.startswith("cuda"):
-        parser.error("graph timing requires a CUDA device")
-    if args.execution != "eager" and args.scaling_recipe == "delayed":
-        parser.error("delayed scaling requires eager full-step execution")
-    if args.scaling_recipe == "delayed" and args.fp8_block is not None:
-        parser.error("delayed scaling requires tensorwise blocks")
-    if args.return_indices and "max" not in spec.family:
-        parser.error("--return-indices requires maximum pooling")
     device = torch.device(args.device)
     if device.type not in ("cpu", "cuda") or device.type == "cuda" and (not torch.cuda.is_available() or torch.version.hip):
         raise SystemExit("Pooling measurements require CPU or NVIDIA CUDA")
@@ -147,13 +184,14 @@ def main():
 
     template = Network().to(device)
     gradient = torch.randn(g.output_shape, device=device, dtype=torch.bfloat16)
-    cfg = deepopt.FP8Config(enabled=True, backend="triton" if device.type == "cuda" else "reference",
+    cfg = deepopt.FP8Config(enabled=True, backend=selection.fp8_backend(device), autotune=args.autotune,
                             intercept_linear=False, backward_precision="auto", activation_dtype=args.fp8_format,
                             grad_dtype="e5m2", scaling_recipe=args.scaling_recipe,
                             block_shapes={"activation": args.fp8_block, "weight": None, "grad": None})
     report = dict(deepopt=dict(version=version("deep-optimization"), path=str(Path(deepopt.__file__).resolve())),
-                  torch=torch.__version__, device=str(device), input_shape=list(raw.shape),
-                  configuration={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                  torch=torch.__version__, device=str(device), input_shape=list(raw.shape), kernel_backend=selection.metadata(device),
+                  configuration={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+                                 if not (k == "qualify_tilelang" and not v) and not (k == "compression" and v == "both")},
                   notes=["Full steps time input FP8 preparation, pooling/RNG, compression, output scales/casts, backward and gradient clearing.",
                          "Native FP8-input baselines include dense reconstruction; optimized kernels decode locally.",
                          "Native CPU pooling and native fractional pooling use an explicit FP32 oracle; CPU timings do not establish CUDA speed.",
@@ -167,42 +205,59 @@ def main():
                 tensor.grad.zero_()
 
     def measure(step):
-        for _ in range(args.warmup):
+        from deepopt._benchmarking import plan_timing
+        if getattr(args, "qualify_tilelang", False):
+            from deepopt._tilelang_benchmarking import qualified_timing_plan
+            plan_timing = qualified_timing_plan
+        began = perf_counter()
+        plan = plan_timing(step, args, synchronize=lambda: torch.cuda.synchronize(device) if device.type == "cuda" else None)
+        for _ in range(plan.warmup):
             step()
         gc.collect()
+        baseline = None
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+            if getattr(args, "qualify_tilelang", False):
+                baseline = torch.cuda.memory_allocated(device)
             torch.cuda.reset_peak_memory_stats(device)
         wall, events = [], []
-        for _ in range(args.repeats):
+        for _ in range(plan.repeats):
             if device.type == "cuda":
                 first, last = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 torch.cuda.synchronize(device); first.record()
             start = perf_counter()
-            for _ in range(args.iterations):
+            for _ in range(plan.iterations):
                 step()
             if device.type == "cuda":
                 last.record(); last.synchronize()
-                events.append(first.elapsed_time(last) / args.iterations)
-            wall.append((perf_counter() - start) * 1000 / args.iterations)
-        return dict(wall_ms=wall, wall_ms_median=median(wall), cuda_stream_ms=events,
-                    peak_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None)
+                events.append(first.elapsed_time(last) / plan.iterations)
+            wall.append((perf_counter() - start) * 1000 / plan.iterations)
+        result = dict(wall_ms=wall, wall_ms_median=median(wall), cuda_stream_ms=events,
+                    peak_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+                    sampling=plan.sampling(perf_counter() - began))
+        if baseline is not None:
+            result["memory"] = {"baseline_allocated_bytes": baseline,
+                                "incremental_peak_allocated_bytes": max(0, result["peak_allocated_bytes"] - baseline)}
+        return result
 
     def timings(step):
         result = {}
         if args.execution in ("eager", "both"):
             result["eager"] = measure(step)
         if args.execution in ("graph", "both"):
+            from deepopt._benchmarking import capture_warmup_steps
+            capture_steps = capture_warmup_steps(args)
             stream = torch.cuda.Stream(device=device)
             stream.wait_stream(torch.cuda.current_stream(device))
             with torch.cuda.stream(stream):
-                for _ in range(max(3, args.warmup)):
+                for _ in range(capture_steps):
                     step()
             torch.cuda.current_stream(device).wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 live = step()
             result["graph"] = measure(graph.replay)
+            result["graph"]["capture_warmup_steps"] = capture_steps
             del live, graph
         return result
 
@@ -251,9 +306,10 @@ def main():
         profile_phases = False
         report["results"].append(dict(implementation="native", input=storage, timing=timing, eager_phase_profile=dict(phases.result)))
         del native_step, native, source
-        for compressed in (False, True):
+        selected_compression = {"off": (False,), "on": (True,), "both": (False, True)}[getattr(args, "compression", "both")]
+        for compressed in selected_compression:
             compression = dict(enabled=compressed, bits=args.bits, group_size=args.group_size)
-            model, _ = prepare_fp8_model(deepcopy(template), cfg, activation_compression=compression)
+            model, _ = prepare_fp8_model(deepcopy(template), cfg, config=kernel_config, activation_compression=compression)
             source = raw.detach().clone().requires_grad_()
             for output_type in args.outputs if args.pipeline == "none" else ("planned",):
                 output_dtype = torch.bfloat16 if output_type == "bf16" else getattr(torch, "float8_" + args.fp8_format)
@@ -267,7 +323,7 @@ def main():
                 def step(source=source, model=model):
                     clear(source, model)
                     with deepopt.fp8_scaling_scope(), deepopt.autocast(device.type, dtype=torch.bfloat16, fp8=cfg,
-                            activation_compression=compression, cache_enabled=False, check_finite=False):
+                            activation_compression=compression, cache_enabled=False, check_finite=False, config=kernel_config):
                         if profile_phases:
                             phases.start()
                         value = to_fp8_activation(source, fp8_dtype=getattr(torch, "float8_" + args.fp8_format), block_shape=args.fp8_block) if storage == "fp8" else source
@@ -302,6 +358,7 @@ def main():
                 collect_indices = True
                 with torch.autograd.graph.saved_tensors_hooks(save, lambda tensor: tensor):
                     sample = step()
+                qualified_dx = source.grad.detach().cpu().clone() if getattr(args, "qualify_tilelang", False) else None
                 actual_indices = last_indices[0]
                 execution = dict(info) if args.pipeline == "none" else model.pool.execution_info
                 errors = None
@@ -337,16 +394,30 @@ def main():
                     output_finite=bool(torch.isfinite(dequantize_activation(sample).float()).all()),
                     errors=errors, execution=execution,
                     precision_plan=precision_report(model)))
+                if getattr(args, "qualify_tilelang", False):
+                    from deepopt._tilelang_benchmarking import qualify_pooling
+                    began = perf_counter()
+                    represented = to_fp8_activation(source.detach(), fp8_dtype=getattr(torch, "float8_" + args.fp8_format),
+                        block_shape=args.fp8_block) if storage == "fp8" else source.detach()
+                    validation = qualify_pooling(sample, source, represented, gradient, args.op, options,
+                        compressed=compressed, compression_errors=errors, actual_indices=actual_indices, actual_dx=qualified_dx)
+                    report["results"][-1].update(validation=validation, qualification_wall_seconds=perf_counter() - began,
+                                                 status="ok" if validation["status"] == "passed" else "error")
                 del sample
             del step, model, source
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+    if getattr(args, "qualify_tilelang", False):
+        report["qualification_status"] = "passed" if all(row.get("validation", {}).get("status") == "passed"
+            for row in report["results"] if row["implementation"] == "deepopt") else "failed"
     text = json.dumps(report, indent=2, allow_nan=False)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(text + "\n")
     print(text)
+    if report.get("qualification_status") == "failed":
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

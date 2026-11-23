@@ -15,8 +15,9 @@ deepopt/
 epochs, process groups, checkpoint counters, diagnostics, or loss reductions.
 Constructing a core does not initialize CUDA. `deepopt.cuda_graph_core` is a
 convenience instance that reads configuration when creating each capture handle;
-use `CUDAGraphCore(device)` to select a device explicitly. CUDA is required at capture time; there is no
-silent CPU fallback.
+use `CUDAGraphCore(device)` to select a device explicitly. Enabled capture
+requires CUDA. Set `runtime.cuda_graph.enabled = false` to select eager
+execution explicitly for model/callable handles and decorators.
 
 ## Configuration and capture snapshots
 
@@ -24,11 +25,26 @@ Capture defaults belong in `runtime.cuda_graph`:
 
 ```toml
 [runtime.cuda_graph]
+enabled = true  # Set false to run callable/decorator handles eagerly.
 warmup = 5
 allow_unused_input = false
 autograd = true
 capture_error_mode = "global"
 ```
+
+`enabled` defaults to `true` to preserve existing explicit capture calls.
+With `enabled = false`, `capture_model`, `capture_callable`, and capture
+decorators skip graph setup and warmup. Each handle invocation calls the
+original function, accepts ordinary eager arguments and shapes, and reports
+`captured = false` and `graph = None`. Model forwards are left unchanged.
+Autograd handles preserve the caller's gradient mode; inference handles and
+decorators still run under `no_grad`. `close()` remains available, and
+`core.warmup()` does no work while disabled. This also works on CPU.
+
+Raw `with core.capture()` blocks require `enabled = true`: their Python body
+cannot be rerun automatically by `replay()`. A disabled raw context raises
+before entering its body. Use a callable handle or decorator for a workload
+that should switch between eager execution and replay using only configuration.
 
 An ordinary `CUDAGraphCore(config=None)` captures the loaded defaults at
 construction. `config=` accepts partial overrides or a full experiment/file
@@ -42,8 +58,9 @@ The shared `cuda_graph_core` convenience object resolves current defaults for
 each new handle. Once a handle/decorator is created, its configuration is fixed,
 including before a decorator's first invocation. Later `load_config()` calls do
 not alter existing captures. The core's `.config` property returns a copy. Loading configuration
-does not initialize CUDA or perform capture; the hardware requirements below
-still apply. See [shared configuration](../runs/README.md).
+does not initialize CUDA or perform capture. Close an existing capture and
+create a new handle to change its enabled setting.
+See [shared configuration](../runs/README.md).
 
 ## Run a complete example
 

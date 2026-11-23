@@ -11,6 +11,7 @@ from torch import nn
 from torch.utils.data import TensorDataset
 
 from deepopt import Trainer
+from deepopt._packed_offload import PackedActivationOffloadPolicy
 from deepopt.config import reset_config
 from deepopt.data.resumable import ResumableDataLoader
 from deepopt.engine.checkpointing.checkpoint import (
@@ -77,7 +78,11 @@ class RestoreValidationTests(unittest.TestCase):
         normalized = _resume_config_for_comparison(config)
         self.assertEqual(config, before)
         self.assertEqual(normalized["training"], {"custom_objective": {"weights": [1, 2]}})
-        self.assertEqual(normalized["runtime"], {"custom_runtime": {"version": 3}})
+        self.assertEqual(normalized["runtime"], {"custom_runtime": {"version": 3},
+            "bf16_policy": {"name": "torch_amp", "version": 1},
+            "activation_memory": {"version": 1, "multiply_backward": "inherit", "pack_reuse": "inherit",
+                "reduction_scratch_bytes": 8388608, "recompute_modules": []},
+            "packed_activation_offload": PackedActivationOffloadPolicy().as_dict()})
         self.assertEqual(normalized["application"], config["application"])
         self.assertEqual(normalized["extension"], config["extension"])
         normalized["extension"]["values"].append(4)

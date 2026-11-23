@@ -1,5 +1,7 @@
 """LayerNorm argument, precision and independent xhat compression policies."""
 
+from deepopt.kernel_policy import kernel_entry, current_kernel_policy
+
 from math import isfinite
 
 import torch
@@ -13,6 +15,7 @@ FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
 
+@kernel_entry
 def layer_norm(x, normalized_shape, weight=None, bias=None, eps=1e-5, *, plan=None,
                output_dtype=None, output_layout=None, output_scale=None, planned_layout=None,
                scaling_state=None, state_training=True, execution_info=None):
@@ -35,9 +38,13 @@ def layer_norm(x, normalized_shape, weight=None, bias=None, eps=1e-5, *, plan=No
         selected = {"fp8": False, "activation_compression": compression or {}}
     else:
         selected = active if active is not None else plan
-        if selected is not None and compression is not None:
+        if (selected is not None and compression is not None
+                and compression != selected["fp8_training"]["activation_compression"]):
             selected = {**selected, "fp8_training": {**selected["fp8_training"], "activation_compression": compression}}
     checked = _prepare_linear_plan(selected or {"fp8": False, "activation_compression": compression or {}})
+    from .policy import capture_normalization_policy, normalization_output_dtype, validate_normalization_backend
+
+    bf16_policy = capture_normalization_policy(x, checked)
     training = checked.get("fp8_training")
     compression = (training or checked)["activation_compression"]
     native_dtype = x.dtype if x.dtype not in FP8_DTYPES else torch.bfloat16
@@ -59,6 +66,7 @@ def layer_norm(x, normalized_shape, weight=None, bias=None, eps=1e-5, *, plan=No
     configured = training["out_dtype"] if training else None
     dtype = output_dtype if output_dtype is not None else configured or (
         training["fp8_dtypes"]["activation"] if training and planned_layout is not None else logical_dtype)
+    dtype = normalization_output_dtype(x, bf16_policy, dtype, explicit=output_dtype)
     if dtype not in (*FLOAT_DTYPES, *FP8_DTYPES):
         raise ValueError("LayerNorm output_dtype must be a supported floating-point dtype")
     fp8 = dtype in FP8_DTYPES
@@ -80,16 +88,32 @@ def layer_norm(x, normalized_shape, weight=None, bias=None, eps=1e-5, *, plan=No
         raise ValueError("Delayed LayerNorm FP8 output requires a prepared adapter or explicit output_scale")
     if fp8 and scaling_state is not None and output_scale is None and dtype != scaling_state.dtypes["activation"]:
         raise ValueError("LayerNorm output format must match its prepared delayed scales; use matching settings or explicit output_scale")
-    if not training and not compression["enabled"] and not isinstance(x, FP8Activation) and x.dtype not in FP8_DTYPES and output_dtype is None and output_scale is None:
+    if not x.numel() and not fp8 and not isinstance(x, FP8Activation):
+        # Empty calls have no normalized values to encode and no statistics
+        # dependency. Avoid zero-width CUDA launches and zero codec groups.
+        if execution_info is not None:
+            execution_info.update(backend="native_empty", compression=False, saved_state_bytes=0,
+                                  norm_xhat_recenter=False, layer_norm_xhat_moment_correction=False,
+                                  moment_state_bytes=0, recenter_state_bytes=0, recenter_rstd_bytes=0,
+                                  recenter_extra_rstd_bytes=0, recenter_launches=0, recenter_scratch_bytes=0)
+        source = x.to(dtype)
+        cast_affine = amp or dtype != native_dtype
+        gamma = weight.to(dtype) if cast_affine and weight is not None else weight
+        beta = bias.to(dtype) if cast_affine and bias is not None else bias
+        with torch.autocast(x.device.type, enabled=False):
+            return F.layer_norm(source, suffix, gamma, beta, eps)
+    if not bf16_policy.storage_enabled and not training and not compression["enabled"] and not isinstance(x, FP8Activation) and x.dtype not in FP8_DTYPES and output_dtype is None and output_scale is None:
         return F.layer_norm(x, suffix, weight, bias, eps)
     from ..autograd.normalization.layer import LayerNormFunction
 
     backward = torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (x, weight, bias))
     need_xhat = backward and (x.requires_grad or weight is not None and weight.requires_grad)
-    options = {"dtype": dtype, "logical_dtype": logical_dtype, "block_shape": blocks,
+    backend = training["backend"] if training else current_kernel_policy().backend if x.device.type == "cuda" else "reference"
+    validate_normalization_backend(bf16_policy, backend, x.device.type)
+    options = {"dtype": dtype, "logical_dtype": logical_dtype, "block_shape": blocks, "bf16_policy": bf16_policy,
                "backward_enabled": backward,
                "compression": compression, "scale": output_scale,
-               "backend": training["backend"] if training else "triton" if x.device.type == "cuda" else "reference",
+               "backend": backend,
                "check_finite": finite_checks_enabled() and (fp8 or compression["enabled"] and need_xhat)}
     return LayerNormFunction.apply(x, weight, bias, geometry, options, scaling_state if output_scale is None else None,
                                    state_training and torch.is_grad_enabled(), execution_info)

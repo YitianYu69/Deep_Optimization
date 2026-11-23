@@ -25,9 +25,16 @@ class PrecisionPolicy:
     def configure(self, *, fp8=None, config=None):
         self.fp8, self.config = fp8, config
         from deepopt.opt.policy import normalize_activation_compression_config
+        from deepopt._bf16_policy import resolve_bf16_policy
 
         compression = normalize_activation_compression_config(config=config)
-        if self.precision == "fp32" and self.fp8 is None and not compression.enabled:
+        bf16_policy = resolve_bf16_policy((config or {}).get("runtime", {}).get("bf16_policy"))
+        if bf16_policy.storage_enabled and self.precision != "bf16":
+            raise ValueError("bf16_storage requires precision=bf16")
+        attention = (config or {}).get("runtime", {}).get("attention", {}).get("backend", "native")
+        kernels = (config or {}).get("runtime", {}).get("kernels", {})
+        if (self.precision == "fp32" and self.fp8 is None and not compression.enabled
+                and attention == "native" and kernels.get("backend", "inherit") == "inherit"):
             self._context = nullcontext()
             return
         from deepopt.opt._autocast import autocast

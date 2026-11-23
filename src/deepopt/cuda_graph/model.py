@@ -1,11 +1,13 @@
 """Model/function graph capture; training and DDP remain eager orchestrators."""
 
 from contextlib import nullcontext
+from copy import deepcopy
 
 import torch
 from torch import nn
 
 from deepopt._config_resolution import _UNSET
+from deepopt._memory_policy import capture_memory_scope, fill_spec
 
 from ._configuration import _capture_settings
 from ._validation import (arguments, autocast_spec, capture_guard, check_arguments,
@@ -16,12 +18,51 @@ from .capture import CapturedFunction
 def _storage_signature(model):
     # Hold actual tensors elsewhere too: removed storage must not be reused and
     # accidentally pass an address check.
-    return tuple((name, id(t), t.data_ptr(), tensor_spec(t))
-                 for name, t in (*model.named_parameters(), *model.named_buffers()))
+    from deepopt._bf16_policy import resolve_bf16_policy
+
+    policies = []
+    for name, module in model.named_modules():
+        owned = getattr(module, "_deepopt_bf16_policy", None)
+        plan = getattr(module, "plan", None)
+        if owned is not None:
+            policy = resolve_bf16_policy(owned)
+            policies.append((name, "owned", policy))
+        if isinstance(plan, dict) and "bf16_policy" in plan:
+            policies.append((name, "plan", resolve_bf16_policy(plan["bf16_policy"])))
+        for marker in ("_deepopt_bf16_primitive_recipe", "_deepopt_attention_recipe_version", "_deepopt_activation_memory_plan"):
+            if hasattr(module, marker):
+                policies.append((name, marker, getattr(module, marker)))
+        if isinstance(plan, dict):
+            # Prepared plans are recursively immutable; replacing a plan is
+            # an explicit numerical-policy change, even at the same shape.
+            policies.append((name, "numerical_plan_identity", id(plan)))
+    tensors = tuple((name, id(t), t.data_ptr(), tensor_spec(t))
+                    for name, t in (*model.named_parameters(), *model.named_buffers()))
+    return tensors + (("bf16_policy", tuple(policies)),)
 
 
 def _modes(model):
     return tuple((id(module), module.training) for module in model.modules())
+
+
+def _policy_description(amp, operation, fill):
+    """Host metadata only: diagnostics must never read/synchronize CUDA tensors."""
+    names = ("fp8", "activation_compression", "linear_interception", "convolution_interception",
+             "normalization_interception", "pooling_interception", "attention_backend", "kernel_policy", "activation_memory", "bf16_recipe", "bf16_policy")
+    def portable(value):
+        if hasattr(value, "as_dict"):
+            return portable(value.as_dict())
+        if value is None or isinstance(value, (str, bool, int, float)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): portable(v) for k, v in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [portable(v) for v in value]
+        if isinstance(value, torch.Tensor):
+            return {"dtype": str(value.dtype), "shape": list(value.shape), "device": str(value.device)}
+        return str(value)
+    return {"autocast": portable(amp), **dict(zip(names, map(portable, operation))),
+            "fill_uninitialized_memory": portable(fill)}
 
 
 def _own_backward_gradients(outputs):
@@ -61,6 +102,7 @@ class CapturedCallable:
     uses PyTorch's forward/backward graph pair. Inference mode exposes a native
     graph through .graph. close() releases the capture and restores a module's
     original forward; close only after outstanding backward work has completed.
+    Disabled handles call eagerly without changing the module's forward.
     """
 
     def __init__(self, function, sample_args, *, device=_UNSET, warmup=_UNSET, allow_unused_input=_UNSET,
@@ -74,18 +116,28 @@ class CapturedCallable:
         warmup_count(warmup)
         if type(allow_unused_input) is not bool or type(autograd) is not bool:
             raise ValueError("allow_unused_input and autograd must be booleans")
-        if autograd and torch.is_inference_mode_enabled():
-            raise ValueError("Autograd capture cannot run under inference_mode; use autograd=False")
+        self.enabled = options["enabled"]
         model = function if isinstance(function, nn.Module) else None
         modules = tuple(model.modules()) if model is not None else ()
+        if any(getattr(m.forward, "_deepopt_cuda_capture", False) for m in modules):
+            raise ValueError("Model is already captured; close the existing capture first")
+        self.function, self.model, self.autograd = function, model, autograd
+        self._closed = False
+        self._graphed = None
+        self._statistics = {"forward_replays": 0, "eager_mode_fallbacks": 0, "eager_autocast_fallbacks": 0,
+                            "eager_memory_policy_fallbacks": 0}
+        self._fallback_diagnostics = {}
+        if not self.enabled:
+            self.device = device
+            return
+        if autograd and torch.is_inference_mode_enabled():
+            raise ValueError("Autograd capture cannot run under inference_mode; use autograd=False")
         from deepopt.opt.scaling.delayed import DelayedScalingState
 
         if any(isinstance(module, DelayedScalingState) for module in modules):
             raise ValueError("Delayed scaling requires eager preprocessing; full training CUDA capture is unsupported")
         if any(isinstance(m, nn.parallel.DistributedDataParallel) for m in modules):
             raise ValueError("Capture the model before constructing DDPCore or DistributedDataParallel")
-        if any(getattr(m.forward, "_deepopt_cuda_capture", False) for m in modules):
-            raise ValueError("Model is already captured; close the existing capture first")
         self.device = cuda_device(device)
         self._specs = arguments(sample_args, self.device)
         self._tensors = tuple(model.parameters()) + tuple(model.buffers()) if model is not None else ()
@@ -102,18 +154,16 @@ class CapturedCallable:
                 raise ValueError("Remove module hooks before capture; attach external observers after capture")
         if autograd and not any(t.requires_grad for t in (*sample_args, *self._tensors)):
             raise ValueError("Autograd capture needs differentiable inputs or parameters; use autograd=False")
-        self.function, self.model, self.autograd = function, model, autograd
         self._original = model.forward if model is not None else function
         self._had_forward = model is not None and "forward" in model.__dict__
         self._signature = _storage_signature(model) if model is not None else None
         self._modes = _modes(model) if model is not None else None
         self._autocast = autocast_spec()
         self._operation_policy = operation_policy_spec()
-        self._closed = False
-        self._graphed = None
-        self._statistics = {"forward_replays": 0, "eager_mode_fallbacks": 0, "eager_autocast_fallbacks": 0}
         try:
-            with torch.cuda.device(self.device), torch.enable_grad() if autograd else torch.no_grad():
+            with capture_memory_scope(self.config), torch.cuda.device(self.device), \
+                    torch.enable_grad() if autograd else torch.no_grad():
+                self._fill_policy = fill_spec()
                 # Native warmup runs real forwards. Preserve module buffers
                 # (e.g. BatchNorm counters) and default RNG state across setup.
                 buffers = [(b, b.detach().clone()) for b in model.buffers()] if model is not None else []
@@ -145,11 +195,11 @@ class CapturedCallable:
                 self._graphed.close()
             raise
 
-        def forward(*args, **kwargs):
+        def replay_forward(*args, **kwargs):
             if self._closed:
                 raise RuntimeError("Callable capture is closed")
             if model is not None and _storage_signature(model) != self._signature:
-                raise RuntimeError("Model parameters or buffers changed storage/metadata; close and recapture")
+                raise RuntimeError("Model parameters, buffers or BF16 policy changed storage/metadata; close and recapture")
             # A graph must not silently serve a different train/eval/precision
             # path. Such calls run the original callable eagerly instead.
             mode_changed = model is not None and _modes(model) != self._modes
@@ -158,7 +208,18 @@ class CapturedCallable:
                 fallback = "eager_mode_fallbacks"
             elif autocast_spec() != self._autocast or operation_policy_spec() != self._operation_policy:
                 fallback = "eager_autocast_fallbacks"
+            elif fill_spec() != self._fill_policy:
+                fallback = "eager_memory_policy_fallbacks"
             if fallback is not None:
+                if fallback not in self._fallback_diagnostics:
+                    expected = _policy_description(self._autocast, self._operation_policy, self._fill_policy)
+                    actual = _policy_description(autocast_spec(), operation_policy_spec(), fill_spec())
+                    if mode_changed:
+                        expected["module_modes"] = list(self._modes)
+                        actual["module_modes"] = list(_modes(model))
+                    changed = {key: {"captured": expected[key], "current": actual[key]}
+                               for key in expected if expected[key] != actual[key]}
+                    self._fallback_diagnostics[fallback] = changed
                 with nullcontext() if autograd else torch.no_grad():
                     outputs = self._original(*args, **kwargs)
                 self._statistics[fallback] += 1
@@ -169,6 +230,10 @@ class CapturedCallable:
                 outputs = _own_backward_gradients(outputs) if autograd else outputs
             self._statistics["forward_replays"] += 1
             return outputs
+
+        def forward(*args, **kwargs):
+            with capture_memory_scope(self.config):
+                return replay_forward(*args, **kwargs)
 
         forward._deepopt_cuda_capture = True
         self._installed = forward
@@ -184,7 +249,24 @@ class CapturedCallable:
 
     @property
     def captured(self):
-        return not self._closed
+        return self.enabled and not self._closed
+
+    @property
+    def fallback_diagnostics(self):
+        """First host policy mismatch per fallback category, without GPU reads.
+
+        Details are collected once per reason, so repeated evaluation fallbacks
+        do not add serialization work to the training loop. The returned value
+        is independently owned; existing statistics counters remain unchanged.
+        """
+        return deepcopy(self._fallback_diagnostics)
+
+    @property
+    def capture_policy(self):
+        """Portable capture policy without tensor reads, or None when disabled."""
+        if not self.enabled:
+            return None
+        return _policy_description(self._autocast, self._operation_policy, self._fill_policy)
 
     @property
     def statistics(self):
@@ -196,6 +278,7 @@ class CapturedCallable:
         scopes as well as native AMP. Counts
         describe dispatch, not completed GPU execution or backward replays.
         The returned snapshot stays available after close().
+        Disabled eager handles leave all capture counters at zero.
         """
         return self._statistics.copy()
 
@@ -207,6 +290,9 @@ class CapturedCallable:
     def __call__(self, *args, **kwargs):
         if self._closed:
             raise RuntimeError("Callable capture is closed")
+        if not self.enabled:
+            with capture_memory_scope(self.config), nullcontext() if self.autograd else torch.no_grad():
+                return self.function(*args, **kwargs)
         if self.model is not None:
             return self.model(*args, **kwargs)
         return self._installed(*args, **kwargs)
@@ -215,6 +301,9 @@ class CapturedCallable:
 
     def close(self):
         if self._closed:
+            return
+        if not self.enabled:
+            self._closed = True
             return
         if self.model is not None and self.model.forward is not self._installed:
             raise RuntimeError("Model forward was replaced after capture; refusing to overwrite it")

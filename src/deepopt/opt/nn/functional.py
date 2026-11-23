@@ -1,5 +1,7 @@
 """Functional projections with plan-selected precision and saved activations."""
 
+from deepopt.kernel_policy import kernel_entry
+
 import torch
 from contextlib import nullcontext
 from functools import lru_cache
@@ -7,7 +9,7 @@ from torch.nn import functional as F
 
 from ..precision.gradient import gradient_entry
 
-from .._autocast import (_get_activation_compression, _get_bf16_compression,
+from .._autocast import (_get_activation_compression, _get_bf16_compression, _get_attention_backend,
                         _get_fp8_plan, _linear_arguments, _suspend_fp8_interception)
 from deepopt.opt.scaling.amax import AmaxScaling
 from deepopt.opt.nn.autograd.linear import _DOLinearFunction
@@ -32,10 +34,39 @@ _OPERANDS = (
 )
 
 
+@torch.compiler.disable
+@kernel_entry
+def do_mul(input, other, *, plan=None, _execution_info=None):
+    """Multiply unchanged forward values with optional saved-coefficient packing."""
+    from .binary import multiply
+
+    return multiply(input, other, plan=plan, execution_info=_execution_info)
+
+
+mul = multiply = do_mul
+
+
+@torch.compiler.disable
+@kernel_entry
+def do_pad(input, pad, mode="constant", value=None):
+    """Pad with an exact first-order adjoint that retains only geometry."""
+    from .padding import padding
+
+    with _suspend_fp8_interception():
+        return padding(input, pad, mode, value)
+
+
+pad = do_pad
+
+
 class _FrozenPlan(dict):
     """Owned immutable dictionaries retain the public dict/equality contract."""
 
     def __init__(self, values):
+        # dataclasses.asdict reconstructs dict subclasses from an iterator of
+        # key/value pairs. Accept the ordinary dict constructor contract while
+        # continuing to own and recursively freeze nested policy dictionaries.
+        values = dict(values)
         dict.__init__(self, ((name, _FrozenPlan(value) if isinstance(value, dict) else value)
                             for name, value in values.items()))
 
@@ -55,6 +86,13 @@ class _ValidatedFP8Plan(_FrozenPlan):
     def __init__(self, values):
         super().__init__(values)
         training = self["fp8_training"]
+        from deepopt.kernel_policy import resolve_kernel_policy
+        self.kernel_policy = None
+        if "kernel_policy" in training or training["backend"] in ("triton", "tilelang", "mixed"):
+            options = training.get("kernel_policy")
+            if options is None and training["backend"] == "mixed":
+                options = "mixed"
+            self.kernel_policy = resolve_kernel_policy(options, fp8_backend=training["backend"])
         self.delayed_signature = (tuple(training["fp8_dtypes"][role] for role in _OPERANDS),
                                   tuple(training["delayed_scaling"][name] for name in
                                         ("history_length", "amax_algorithm", "margin", "reduce_amax")))
@@ -63,9 +101,15 @@ class _ValidatedFP8Plan(_FrozenPlan):
 class _ValidatedNativePlan(_FrozenPlan):
     """A native projection and its independent saved-activation policy."""
 
+    def __init__(self, values):
+        super().__init__(values)
+        from deepopt.kernel_policy import resolve_kernel_policy
+        self.kernel_policy = resolve_kernel_policy(self["kernel_policy"]) if "kernel_policy" in self else None
+
 
 @torch.compiler.disable
 @gradient_entry("relu")
+@kernel_entry
 def do_relu(input, inplace=False, *, plan=None, output_dtype=None, output_layout=None, output_scale=None,
             _scaling_state=None, _state_training=True, _planned=False, _execution_info=None):
     """ReLU with fused precision conversion and an exact bool/one-bit backward mask.
@@ -86,6 +130,7 @@ relu = do_relu
 
 
 @torch.compiler.disable
+@kernel_entry
 def _activation(kind, input, inplace=False, *, approximate="none", plan=None, output_dtype=None,
                 output_layout=None, output_scale=None, _scaling_state=None, _state_training=True,
                 _planned=False, _execution_info=None):
@@ -160,10 +205,21 @@ def validate_linear_plan(plan: dict) -> dict:
         return validate_fp8_plan(plan)
     if plan["fp8"] is not False:
         raise ValueError("Native linear plans require fp8=False; use linear_plan() to build an FP8 plan")
-    if set(plan) - {"fp8", "activation_compression"}:
+    if set(plan) - {"fp8", "activation_compression", "kernel_policy", "bf16_policy", "activation_memory"}:
         raise ValueError("Unknown fields in native linear plan")
     compression = activation_compression_config_from_dict(plan.get("activation_compression", {}))
-    return {"fp8": False, "activation_compression": asdict(compression)}
+    result = {"fp8": False, "activation_compression": asdict(compression)}
+    from deepopt._bf16_policy import resolve_bf16_policy
+    result["bf16_policy"] = resolve_bf16_policy(plan.get("bf16_policy")).as_dict()
+    if "kernel_policy" in plan:
+        from deepopt.kernel_policy import resolve_kernel_policy
+        result["kernel_policy"] = resolve_kernel_policy(plan["kernel_policy"]).as_dict()
+    if "activation_memory" in plan:
+        from deepopt._activation_memory import validate_activation_memory_execution
+        from deepopt.kernel_policy import plan_kernel_policy
+        result["activation_memory"] = validate_activation_memory_execution(
+            plan["activation_memory"], kernel_policy=plan_kernel_policy(result)).as_dict()
+    return result
 
 
 def _prepare_linear_plan(plan):
@@ -175,10 +231,11 @@ def _prepare_linear_plan(plan):
 
 
 @lru_cache(maxsize=32, typed=True)
-def _native_compression_plan(group_size, bits=2, attention_bits=None, norm_xhat_recenter=False):
+def _native_compression_plan(group_size, bits=2, attention_bits=None, norm_xhat_recenter=False,
+                             *, enabled=True, bf16_policy="torch_amp"):
     """Reuse scoped native policies without resolving configuration per call."""
-    return _prepare_linear_plan({"fp8": False, "activation_compression": {
-        "enabled": True, "group_size": group_size, "bits": bits, "attention_bits": attention_bits,
+    return _prepare_linear_plan({"fp8": False, "bf16_policy": bf16_policy, "activation_compression": {
+        "enabled": enabled, "group_size": group_size, "bits": bits, "attention_bits": attention_bits,
         "norm_xhat_recenter": norm_xhat_recenter,
     }})
 
@@ -197,7 +254,7 @@ def validate_fp8_plan(plan: dict) -> dict:
 
     if not isinstance(plan, dict):
         raise TypeError("plan must be a dictionary")
-    if set(plan) != {"fp8_training", "block_shapes"}:
+    if set(plan) - {"fp8_training", "block_shapes", "activation_memory"} or not {"fp8_training", "block_shapes"} <= set(plan):
         raise ValueError("plan must contain exactly 'fp8_training' and 'block_shapes'")
 
     training = plan["fp8_training"]
@@ -210,7 +267,10 @@ def validate_fp8_plan(plan: dict) -> dict:
         "fp8_dtypes",
         "backend",
         "num_stages",
-        "out_dtype", "scaling_recipe", "delayed_scaling", "backward_backend", "activation_compression", "backward_precision"
+        "autotune",
+        "out_dtype", "scaling_recipe", "delayed_scaling", "backward_backend", "activation_compression", "backward_precision",
+        "convolution_policy",
+        "kernel_policy",
     }
 
     if "fp8_dtypes" not in training:
@@ -247,12 +307,15 @@ def validate_fp8_plan(plan: dict) -> dict:
         AmaxScaling(block_shape=block_shapes[operand])
 
     backend = training.get("backend", "reference")
-    if backend not in ("reference", "triton"):
+    if backend not in ("reference", "triton", "tilelang", "mixed", "inherit"):
         raise ValueError(
-            "backend must be 'reference' or 'triton'"
+            "backend must be reference, triton, tilelang, mixed, or inherit"
         )
 
     num_stages = training.get("num_stages", "auto")
+    autotune = training.get("autotune", True)
+    if type(autotune) is not bool:
+        raise ValueError("autotune must be a boolean")
 
     if num_stages != "auto" and (type(num_stages) is not int or num_stages not in (1, 2, 3, 4, 5)):
         raise ValueError("num_stages must be 'auto', 1, 2, 3, 4, or 5")
@@ -267,38 +330,57 @@ def validate_fp8_plan(plan: dict) -> dict:
         raise ValueError("Delayed scaling requires tensorwise block_shapes")
     backward_backend = training.get("backward_backend", "inherit")
     backward_precision = training.get("backward_precision", "native")
+    convolution_policy = training.get("convolution_policy", "strict")
+    if convolution_policy not in ("strict", "native_spatial", "depthwise"):
+        raise ValueError("convolution_policy must be strict, native_spatial or depthwise")
     if backward_precision not in ("native", "auto"):
         raise ValueError("backward_precision must be native or auto")
     if backward_backend not in ("inherit", "native_fast", "native_precise"):
         raise ValueError("backward_backend must be inherit, native_fast, or native_precise")
-    if backward_backend != "inherit" and (backend != "triton" or any(shape is not None for shape in block_shapes.values())):
-        raise ValueError("Native FP8 backward requires backend=triton and tensorwise block_shapes")
+    if backward_backend != "inherit" and (backend == "reference" or any(shape is not None for shape in block_shapes.values())):
+        raise ValueError("Native FP8 backward requires a custom backend and tensorwise block_shapes")
     if out_dtype is not None:
         if (not isinstance(out_dtype, torch.dtype) or out_dtype not in _FLOAT_DTYPES):
             raise ValueError(
                 "out_dtype must be FP32, BF16, FP16, or None"
             )
 
-    return {
+    result = {
         "fp8_training": {
             "fp8_dtypes": dict(fp8_dtypes),
             "backend": backend,
             "num_stages": num_stages,
+            "autotune": autotune,
             "out_dtype": out_dtype,
             "scaling_recipe": recipe,
             "delayed_scaling": asdict(delayed),
             "backward_backend": backward_backend,
             "backward_precision": backward_precision,
+            "convolution_policy": convolution_policy,
             "activation_compression": asdict(compression),
         },
         "block_shapes": dict(block_shapes),
     }
+    if "kernel_policy" in training or backend == "inherit":
+        from deepopt.kernel_policy import resolve_kernel_policy
+        selected = resolve_kernel_policy(training.get("kernel_policy"),
+                                         fp8_backend=backend if backend != "inherit" else None)
+        result["fp8_training"]["kernel_policy"] = selected.as_dict()
+        if backend == "inherit":
+            result["fp8_training"]["backend"] = selected.backend
+    if "activation_memory" in plan:
+        from deepopt._activation_memory import validate_activation_memory_execution
+        from deepopt.kernel_policy import plan_kernel_policy
+        result["activation_memory"] = validate_activation_memory_execution(
+            plan["activation_memory"], kernel_policy=plan_kernel_policy(result)).as_dict()
+    return result
 
 
 
 
 @torch.compiler.disable
 @gradient_entry("linear")
+@kernel_entry
 def do_linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
     *,
@@ -320,6 +402,10 @@ def do_linear(
 
 def _do_linear(x, weight, bias, *, plan, weight_cache, scaling_state=None, state_training=True):
     from ..quantization.activation_tensor import FP8Activation, dequantize_activation
+    from ..precision.bf16 import invocation_bf16_policy
+
+    bf16_policy = (invocation_bf16_policy(plan, x)
+                   if isinstance(x, torch.Tensor) and x.device.type in ("cpu", "cuda") else None)
 
     if isinstance(x, FP8Activation) and x._activation_layout != "last" and x.ndim != 2:
         x = dequantize_activation(x)
@@ -327,13 +413,13 @@ def _do_linear(x, weight, bias, *, plan, weight_cache, scaling_state=None, state
     # ownership inside an outer FP8 scope. There is one numerical entry point.
     if isinstance(plan, dict) and "fp8" in plan:
         native = _prepare_linear_plan(plan)
-        return _native_linear(x, weight, bias, native["activation_compression"])
+        return _native_linear(x, weight, bias, native["activation_compression"], bf16_policy=bf16_policy)
     active_plan = _get_fp8_plan(x.device.type) if isinstance(x, torch.Tensor) else None
     compression = _get_activation_compression(x.device.type) if isinstance(x, torch.Tensor) else None
     if active_plan is False:
         arguments = _linear_arguments((x, weight, bias), {})
         compression = _get_bf16_compression(x) if arguments is not None else None
-        return _native_linear(x, weight, bias, compression)
+        return _native_linear(x, weight, bias, compression, bf16_policy=bf16_policy)
     if active_plan is not None:
         if compression is None:
             # An FP8 scope can override numerical projection settings while
@@ -346,7 +432,7 @@ def _do_linear(x, weight, bias, *, plan, weight_cache, scaling_state=None, state
     elif plan is None:
         arguments = _linear_arguments((x, weight, bias), {})
         compression = _get_bf16_compression(x) if arguments is not None else None
-        return _native_linear(x, weight, bias, compression)
+        return _native_linear(x, weight, bias, compression, bf16_policy=bf16_policy)
     checked_plan = _prepare_fp8_plan(plan)
     if compression is not None and checked_plan["fp8_training"]["activation_compression"] != compression:
         checked_plan = _prepare_fp8_plan({
@@ -388,8 +474,8 @@ def _do_linear(x, weight, bias, *, plan, weight_cache, scaling_state=None, state
     if bias is not None:
         if tuple(bias.shape) != (weight.shape[0],):
             raise ValueError("Bias must have shape [out_features]")
-    if training["backend"] == "triton" and x.device.type != "cuda":
-        raise ValueError("The Triton backend require CUDA")
+    if training["backend"] != "reference" and x.device.type != "cuda":
+        raise ValueError(f"The {training['backend'].capitalize()} backend requires CUDA")
 
     out_dtype = training["out_dtype"]
     if out_dtype is None:
@@ -419,7 +505,7 @@ def _do_linear(x, weight, bias, *, plan, weight_cache, scaling_state=None, state
         )
 
 
-def _native_linear(x, weight, bias, compression):
+def _native_linear(x, weight, bias, compression, *, bf16_policy=None):
     from ..quantization.activation_tensor import dequantize_activation
 
     x = dequantize_activation(x)
@@ -444,7 +530,7 @@ def _native_linear(x, weight, bias, compression):
     from .autograd.native_linear import _NativeLinearFunction
 
     return _NativeLinearFunction.apply(x, weight, bias, compression["group_size"], True,
-                                       compression.get("bits", 2))
+                                       compression.get("bits", 2), bf16_policy)
 
 
 def compressed_linear(x, weight, bias=None, *, group_size=512):
@@ -452,28 +538,35 @@ def compressed_linear(x, weight, bias=None, *, group_size=512):
     return do_linear(x, weight, bias, plan=_native_compression_plan(group_size))
 
 
-def _attention_compression(query, key, value, *, plan=None, attn_mask=None):
+def _attention_compression_settings(query, key, value, *, plan=None, attn_mask=None):
     """Resolve the independent Q/K/V policy without changing projection plans."""
     if not torch.is_grad_enabled() or not all(isinstance(t, torch.Tensor) for t in (query, key, value)):
-        return nullcontext()
+        return None
     requires_backward = (any(t.requires_grad for t in (query, key, value))
                          or isinstance(attn_mask, torch.Tensor) and attn_mask.requires_grad)
     if (not requires_backward
             or any(t.is_nested or t.layout != torch.strided or t.dtype not in _FLOAT_DTYPES
                    for t in (query, key, value))):
-        return nullcontext()
+        return None
     compression = _get_activation_compression(query.device.type)
-    if isinstance(plan, dict) and "fp8" in plan:
+    if compression is None and isinstance(plan, dict) and "fp8" in plan:
         compression = _prepare_linear_plan(plan)["activation_compression"]
     elif compression is None:
         selected = plan if plan is not None else _get_fp8_plan(query.device.type)
         if selected is not None and selected is not False:
             compression = _prepare_fp8_plan(selected)["fp8_training"]["activation_compression"]
     if compression is None or not compression["enabled"]:
+        return None
+    return compression
+
+
+def _attention_compression(query, key, value, *, plan=None, attn_mask=None):
+    compression = _attention_compression_settings(query, key, value, plan=plan, attn_mask=attn_mask)
+    if compression is None:
         return nullcontext()
-    bits = compression.get("attention_bits")
-    if bits is None:
-        bits = max(4, compression.get("bits", 2))
+    from deepopt._attention_policy import effective_attention_bits
+
+    bits = effective_attention_bits(compression)
     from ..quantization.attention import AttentionCompression
 
     return AttentionCompression(query, key, value, group_size=compression["group_size"], bits=bits,
@@ -482,19 +575,40 @@ def _attention_compression(query, key, value, *, plan=None, attn_mask=None):
 
 @torch.compiler.disable
 def do_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
-                                    is_causal=False, *, scale=None, enable_gqa=False, plan=None):
+                                    is_causal=False, *, scale=None, enable_gqa=False, plan=None, attention_backend=None):
     """Keep native SDPA forward/backward, optionally packing its saved Q/K/V.
 
     Q/K/V default to at least four bits; an explicit attention_bits overrides
     that floor. Probabilities, masks, outputs and kernel statistics stay exact.
     """
+    if isinstance(plan, dict) and "activation_memory" in plan:
+        from deepopt._activation_memory import invocation_activation_memory, validate_activation_memory_execution
+        from deepopt.kernel_policy import plan_kernel_policy
+
+        memory = invocation_activation_memory(plan, query.device.type)
+        validate_activation_memory_execution(memory, kernel_policy=plan_kernel_policy(plan))
     kwargs = dict(attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
     if scale is not None:
         kwargs["scale"] = scale
     if enable_gqa is not False:
         kwargs["enable_gqa"] = enable_gqa
-    with _suspend_fp8_interception(), _attention_compression(query, key, value, plan=plan, attn_mask=attn_mask):
-        return F.scaled_dot_product_attention(query, key, value, **kwargs)
+    backend = attention_backend if attention_backend is not None else _get_attention_backend(query.device.type) or "native"
+    if backend not in ("native", "flash_attn_2"):
+        raise ValueError("attention_backend must be native or flash_attn_2")
+    with _suspend_fp8_interception():
+        if backend == "flash_attn_2":
+            from .attention_backend import flash_attention_2
+
+            compression = _attention_compression_settings(query, key, value, plan=plan, attn_mask=attn_mask)
+            return flash_attention_2(query, key, value, compression=compression, **kwargs)
+        with _attention_compression(query, key, value, plan=plan, attn_mask=attn_mask):
+            output = F.scaled_dot_product_attention(query, key, value, **kwargs)
+        from .attention_backend import notify_attention
+
+        notify_attention(query, key, value, output, backend="native_sdpa",
+                         compression=_attention_compression_settings(query, key, value, plan=plan, attn_mask=attn_mask),
+                         autograd_node=type(output.grad_fn).__name__, dropout_p=dropout_p, scale=scale)
+        return output
 
 
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,

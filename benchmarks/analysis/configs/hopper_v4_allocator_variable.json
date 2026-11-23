@@ -1,0 +1,32 @@
+{
+  "settings": {
+    "runtime": {
+      "execution": "eager",
+      "binding": "prepared",
+      "scope_lifetime": "reused",
+      "optimizer": "adamw",
+      "lr": 0.0001,
+      "timing_fill_uninitialized_memory": false
+    }
+  },
+  "workloads": [
+    {
+      "name": "varying_mlp",
+      "op": "model",
+      "shape": [
+        16,
+        197,
+        768
+      ],
+      "factory": "analysis.example_model:build_variable_mlp",
+      "factory_kwargs": {
+        "batch_sizes": [
+          16,
+          32,
+          31,
+          33
+        ]
+      }
+    }
+  ]
+}
